@@ -147,6 +147,15 @@ class TRTEdgeLLMTTSConfig:
 
     # Streaming.
     streaming_profile: str = "continuous_playback"
+    # Per-stream chunk-frame overrides (None -> streaming_profile-derived
+    # default). These were the EDGE_LLM_TTS_FIRST_CHUNK_FRAMES / _CHUNK_FRAMES /
+    # _ADAPTIVE_CHUNKS / _MAX_CHUNK_FRAMES / _CHUNK_GROWTH_FRAMES env reads in
+    # the pre-migration backend; the product config-builder wires them.
+    first_chunk_frames: Optional[int] = None
+    chunk_frames: Optional[int] = None
+    adaptive_chunks: Optional[bool] = None
+    max_chunk_frames: Optional[int] = None
+    chunk_growth_frames: Optional[int] = None
 
     # product_explicit_kv mode paths (only used when backend_mode is that).
     product_model_base: str = "/home/harvest/voice_test/models/qwen3-tts"
@@ -968,11 +977,32 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "seed": int(kwargs.get("seed", self._config.seed)),
             "stream": True,
             "stream_only": True,
-            "first_chunk_frames": kwargs.get("first_chunk_frames", default_first_chunk_frames),
-            "chunk_frames": kwargs.get("chunk_frames", default_chunk_frames),
-            "adaptive_chunks": kwargs.get("adaptive_chunks", default_adaptive_chunks),
-            "max_chunk_frames": kwargs.get("max_chunk_frames", default_max_chunk_frames),
-            "chunk_growth_frames": kwargs.get("chunk_growth_frames", default_chunk_growth_frames),
+            # Precedence: per-call kwargs > config override (deploy) > profile default.
+            "first_chunk_frames": kwargs.get(
+                "first_chunk_frames",
+                default_first_chunk_frames if self._config.first_chunk_frames is None
+                else self._config.first_chunk_frames,
+            ),
+            "chunk_frames": kwargs.get(
+                "chunk_frames",
+                default_chunk_frames if self._config.chunk_frames is None
+                else self._config.chunk_frames,
+            ),
+            "adaptive_chunks": kwargs.get(
+                "adaptive_chunks",
+                default_adaptive_chunks if self._config.adaptive_chunks is None
+                else self._config.adaptive_chunks,
+            ),
+            "max_chunk_frames": kwargs.get(
+                "max_chunk_frames",
+                default_max_chunk_frames if self._config.max_chunk_frames is None
+                else self._config.max_chunk_frames,
+            ),
+            "chunk_growth_frames": kwargs.get(
+                "chunk_growth_frames",
+                default_chunk_growth_frames if self._config.chunk_growth_frames is None
+                else self._config.chunk_growth_frames,
+            ),
             "chunk_format": "pcm_s16le",
             "chunk_transport": "base64",
         }

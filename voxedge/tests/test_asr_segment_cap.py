@@ -104,3 +104,18 @@ def test_partial_includes_committed_segments():
     partial, is_final = s.get_partial()
     assert not is_final
     assert partial.startswith("alpha")  # committed prefix carried into partials
+
+
+def test_rotate_uses_partial_when_worker_rotates_on_finalize():
+    """B5 (codex): if the worker returns 'segment_rotation' instead of 'final'
+    on the forced last=True chunk, _rotate_segment commits the latest partial
+    rather than silently dropping the segment."""
+    cfg = TRTEdgeLLMASRConfig(segment_cap_sec=5.5)
+    be = _MockBackend(cfg, finals=[])
+    s = _TRTEdgeLLMStreamingASRStream(be)
+    s._partial_text = "partial words"
+    # Worker rotates (no 'final') on the forced finalize; _final_text stays "".
+    s._send_chunk = lambda *, last: {"event": "segment_rotation", "carryover_sec": 1.0}
+    s._begin = lambda: None
+    s._rotate_segment()
+    assert s._committed_text == "partial words"

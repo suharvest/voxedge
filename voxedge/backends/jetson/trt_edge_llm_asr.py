@@ -1064,8 +1064,14 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         the engine KV cap. Clean cut — no audio carryover — so there is no
         boundary re-transcription / duplication (the trade-off is a possible
         word split at the cut, far better than the current total failure)."""
-        self._send_chunk(last=True)  # sets _final_text, marks _closed=True
-        seg = (self._final_text or "").strip()
+        resp = self._send_chunk(last=True)  # normally 'final' -> sets _final_text
+        # Robustness: if the worker returns 'segment_rotation' for this forced
+        # finalize (instead of 'final'), _final_text is NOT set — fall back to
+        # the latest partial so this segment's text is not silently dropped.
+        if resp.get("event") == "final":
+            seg = (self._final_text or "").strip()
+        else:
+            seg = (self._partial_text or "").strip()
         if seg:
             self._committed_text = (
                 (self._committed_text + " " + seg).strip()
