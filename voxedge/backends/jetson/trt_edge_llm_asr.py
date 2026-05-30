@@ -130,6 +130,18 @@ class TRTEdgeLLMASRConfig:
     stream_chunk_sec: float = 0.5
     stream_unfixed_chunks: int = 2
     stream_unfixed_tokens: int = 5
+    # Proactive long-audio segment cap (seconds). The qwen3_asr_worker prefills
+    # the cumulative audio every chunk; the engine KV cache overflows at ~6.2s
+    # (prefill_failed, max_kv 256/128). Rotate to a fresh worker segment once the
+    # accumulated audio reaches this length so each prefill stays under the cap.
+    # Clean cut (no audio carryover) -> no boundary re-transcription/duplication;
+    # the trade-off is a possible word split at the boundary (far better than the
+    # current total failure on >6.2s audio). 0 / negative disables it (legacy
+    # single-segment behaviour). Only audio LONGER than the cap is affected —
+    # short utterances take the unchanged single-segment path.
+    # NEEDS on-device verification (7.5 / 12.9 / 20s + short-audio latency
+    # unchanged) before being relied on in production.
+    segment_cap_sec: float = 5.5
     mel_settings_path: str = ""
     mel_filters_path: str = ""
 
@@ -979,6 +991,12 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         self._samples_since_hop = 0
         self._partial_text = ""
         self._final_text = ""
+        # Text committed from earlier segments after a proactive long-audio
+        # rotation (see _maybe_rotate_segment). Empty for the common short-audio
+        # single-segment case.
+        self._committed_text = ""
+        _cap = float(getattr(backend._config, "segment_cap_sec", 0.0) or 0.0)
+        self._segment_cap_samples = int(_cap * self._sample_rate) if _cap > 0 else 0
         self._detected_language: Optional[str] = None
         self._cancelled = False
         self._closed = False
@@ -1031,6 +1049,37 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             return resp
         raise RuntimeError(f"unexpected ASR streaming worker event: {resp}")
 
+    def _join_committed(self, tail: str) -> str:
+        """Concatenate text committed from earlier rotated segments with the
+        current segment's text. For the common single-segment case
+        (_committed_text == "") this just returns ``tail`` stripped."""
+        tail = (tail or "").strip()
+        if self._committed_text and tail:
+            return (self._committed_text + " " + tail).strip()
+        return (self._committed_text or tail).strip()
+
+    def _rotate_segment(self) -> None:
+        """Proactive long-audio cap: finalize the current segment, commit its
+        text, then start a fresh worker session so the next prefill stays under
+        the engine KV cap. Clean cut — no audio carryover — so there is no
+        boundary re-transcription / duplication (the trade-off is a possible
+        word split at the cut, far better than the current total failure)."""
+        self._send_chunk(last=True)  # sets _final_text, marks _closed=True
+        seg = (self._final_text or "").strip()
+        if seg:
+            self._committed_text = (
+                (self._committed_text + " " + seg).strip()
+                if self._committed_text else seg
+            )
+        # Clean cut + fresh worker session (resets the worker-side KV cache).
+        self._audio_accum = np.zeros(0, dtype=np.float32)
+        self._samples_since_hop = 0
+        self._partial_text = ""
+        self._final_text = ""
+        self._closed = False
+        self._session_id = uuid.uuid4().hex
+        self._begin()
+
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if self._cancelled or self._closed:
             return
@@ -1046,6 +1095,13 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             ).astype(np.float32)
         self._audio_accum = np.concatenate([self._audio_accum, samples])
         self._samples_since_hop += len(samples)
+        # Proactive long-audio rotation: cut to a fresh segment before the worker
+        # prefill overflows the engine KV cache (~6.2s). Only fires for audio
+        # longer than the cap; short utterances never reach this branch and take
+        # the unchanged single-segment path below.
+        if self._segment_cap_samples and len(self._audio_accum) >= self._segment_cap_samples:
+            self._rotate_segment()
+            return
         while self._samples_since_hop >= self._hop_samples:
             self._send_chunk(last=False)
             self._samples_since_hop -= self._hop_samples
@@ -1055,13 +1111,13 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
 
     def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled or self._closed:
-            return self._final_text, self._detected_language
+            return self._join_committed(self._final_text), self._detected_language
         if len(self._audio_accum) == 0:
             self._backend._worker_request({"event": "end", "id": self._session_id})
             self._closed = True
-            return "", self._detected_language
+            return self._join_committed(""), self._detected_language
         self._send_chunk(last=True)
-        return self._final_text, self._detected_language
+        return self._join_committed(self._final_text), self._detected_language
 
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
@@ -1098,5 +1154,5 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
 
     def get_partial(self) -> tuple[str, bool]:
         if self._closed:
-            return self._final_text, True
-        return self._partial_text, False
+            return self._join_committed(self._final_text), True
+        return self._join_committed(self._partial_text), False
