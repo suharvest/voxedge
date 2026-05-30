@@ -278,6 +278,12 @@ class SherpaASRBackend(ASRBackend):
         return self._offline_recognizer is not None or self._online_recognizer is not None
 
     def preload(self) -> None:
+        # Fail fast with a friendly message naming the extra when the sherpa
+        # runtime is missing — otherwise the lazy import below surfaces as an
+        # opaque "not available" log and both recognizers silently stay None.
+        from voxedge.backends._deps import check_sherpa_deps
+
+        check_sherpa_deps()
         try:
             self._online_recognizer = self._load_online_recognizer()
             logger.info("Sherpa streaming ASR loaded")
@@ -310,7 +316,9 @@ class SherpaASRBackend(ASRBackend):
         if self._offline_recognizer is None:
             raise RuntimeError("Offline recognizer not loaded; call preload() first")
 
-        import soundfile as sf
+        from voxedge.backends._deps import require
+
+        sf = require("soundfile", extra="sherpa")
 
         data, sample_rate = sf.read(io.BytesIO(audio_bytes))
 

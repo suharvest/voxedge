@@ -167,6 +167,12 @@ class SherpaTTSBackend(TTSBackend):
         return self._ready
 
     def preload(self) -> None:
+        # Fail fast with a friendly message naming the extra when sherpa-onnx
+        # is missing (the lazy import in _load_model would otherwise raise an
+        # opaque ModuleNotFoundError).
+        from voxedge.backends._deps import check_sherpa_deps
+
+        check_sherpa_deps()
         self._load_model()
         self._warmup()
         self._ready = True

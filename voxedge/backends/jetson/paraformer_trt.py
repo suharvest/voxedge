@@ -63,6 +63,13 @@ class ParaformerTRTConfig:
     dec_engine: Optional[str] = None
     tokens_path: Optional[str] = None
     preroll_ms: int = 100
+    # Bounded concurrency ceiling. Each ASRStream builds its own per-stream TRT
+    # execution contexts + device buffers (_ParaformerCtxBundle), so an
+    # unbounded cap let a client burst open arbitrarily many streams and OOM the
+    # device. Conservative default 2 — MUST be tuned per device VRAM. Override
+    # via env PARAFORMER_MAX_CONCURRENT (product build_paraformer_trt_config) or
+    # profile asr_max_slots.
+    max_concurrent: int = 2
 
     def __post_init__(self) -> None:
         import os.path as _p
@@ -78,6 +85,7 @@ class ParaformerTRTConfig:
         if self.tokens_path is None:
             self.tokens_path = _p.join(d, "tokens.txt")
         self.preroll_ms = max(0, int(self.preroll_ms))
+        self.max_concurrent = max(1, int(self.max_concurrent))
 
 
 # Streaming parameters — match sherpa-onnx training distribution.
@@ -618,10 +626,13 @@ class ParaformerTRTBackend(ASRBackend):
     def concurrency_capability(self) -> ConcurrencyCapability:
         # Per-stream _ParaformerCtxBundle: each ASRStream owns its own enc/dec
         # TRT execution contexts + buffer cache. Backend holds shared engines
-        # only; concurrency scales with open streams, bounded by VRAM.
+        # only; concurrency scales with open streams, bounded by VRAM. A bounded
+        # cap (config.max_concurrent, default 2) prevents a burst of streams
+        # from OOMing the device — must be tuned per device VRAM.
+        cap = max(1, int(self._config.max_concurrent))
         return ConcurrencyCapability(
-            supports_parallel=True,
-            max_concurrent=None,
+            supports_parallel=cap > 1,
+            max_concurrent=cap,
             is_stateful=True,
             requires_exclusive_device=True,
             scaling_mode="multi_runtime_per_slot",
@@ -666,14 +677,13 @@ class ParaformerTRTBackend(ASRBackend):
 
     def preload(self) -> None:
         import os
-        try:
-            import tensorrt  # noqa: F401
-            from cuda import cudart  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "TensorRT + CUDA Python not available; paraformer_trt requires "
-                "a CUDA/TensorRT runtime"
-            ) from exc
+        from voxedge.backends._deps import require
+
+        # Jetson CUDA/TensorRT runtime — aarch64-only, ships from L4T / the
+        # engine repo (documented under the ``jetson`` extra). Fail fast with a
+        # friendly message naming the extra when absent.
+        require("tensorrt", extra="jetson", package="tensorrt")
+        require("cuda", extra="jetson", package="cuda-python")
 
         for label, path in [("encoder engine", self._config.enc_engine),
                             ("decoder engine", self._config.dec_engine)]:

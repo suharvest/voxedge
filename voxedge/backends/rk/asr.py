@@ -386,6 +386,12 @@ class RKASRBackend(ASRBackend):
         )
 
     def __init__(self, config: Optional[RKASRConfig] = None):
+        # Fail fast with a friendly message naming the extra when the RK
+        # runtime is missing (this aarch64-only wheel is never present on a
+        # Mac / x86_64 dev box).
+        from voxedge.backends._deps import check_rk_deps
+
+        check_rk_deps()
         from rkvoice_stream import create_asr
 
         self._config = config or RKASRConfig()
