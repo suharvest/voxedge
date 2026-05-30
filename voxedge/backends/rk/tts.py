@@ -87,19 +87,39 @@ class RKTTSBackend(TTSBackend):
         )
 
     def __init__(self, config: Optional[RKTTSConfig] = None):
-        # Fail fast with a friendly message naming the extra when the RK
-        # runtime is missing (this aarch64-only wheel is never present on a
-        # Mac / x86_64 dev box).
+        # Lazy init (matches the Jetson backends' lifecycle): __init__ only
+        # stores config — the heavy ``rkvoice_stream.create_tts()`` NPU init is
+        # deferred to ``preload()``. This keeps construction cheap so the
+        # capability resolver / health wiring can build the object without
+        # triggering NPU init or requiring the aarch64-only ``voxedge[rk]``
+        # extra (a Mac / x86_64 dev box can construct but not preload). The
+        # BackendManager always calls ``preload()`` after the factory, so the
+        # runtime methods below still see a live ``_inner``.
+        self._config = config or RKTTSConfig()
+        self._inner = None
+        # Sensible cached defaults until ``preload()`` populates the real
+        # values from the inner backend (also the post-unload fallback so
+        # status queries don't crash on ``self._inner is None``).
+        self._cached_name = "rk:unknown"
+        self._cached_sample_rate = 0
+
+    def _ensure_inner(self) -> None:
+        """Create the rkvoice-stream inner backend (NPU init) on first use.
+
+        Deferred out of ``__init__`` so construction stays cheap. Idempotent:
+        a second call is a no-op once ``_inner`` exists. The friendly
+        dependency check (naming the ``rk`` extra) runs here — the aarch64-only
+        wheel is never present on a Mac / x86_64 dev box, so we only require it
+        at the moment NPU init is actually needed.
+        """
+        if self._inner is not None:
+            return
         from voxedge.backends._deps import check_rk_deps
 
         check_rk_deps()
         from rkvoice_stream import create_tts
 
-        self._config = config or RKTTSConfig()
         self._inner = create_tts()
-        # Cache metadata at construction time so post-unload status queries
-        # (manager.status() / health checks) don't crash on
-        # ``self._inner is None``.
         try:
             self._cached_name = f"rk:{self._inner.name}"
         except Exception:
@@ -137,8 +157,10 @@ class RKTTSBackend(TTSBackend):
         return self._inner.is_ready()
 
     def preload(self) -> None:
-        if self._inner is None:
-            raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
+        # Lazy first-load: build the inner backend (NPU init) here rather than
+        # in __init__. After ``unload()`` this re-creates it, which matches the
+        # BackendManager reload contract (factory → preloader).
+        self._ensure_inner()
         self._inner.preload()
 
     def unload(self) -> None:

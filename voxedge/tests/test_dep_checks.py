@@ -96,21 +96,26 @@ def test_sherpa_tts_backend_preload_friendly_error(monkeypatch):
     assert "voxedge[sherpa]" in str(ei.value)
 
 
-def test_rk_asr_backend_init_friendly_error(monkeypatch):
+def test_rk_asr_backend_preload_friendly_error(monkeypatch):
+    # Lazy lifecycle (consistent with sherpa/jetson above): construction is
+    # cheap and does NOT require the rk runtime; the friendly error surfaces at
+    # preload() when NPU init is actually attempted.
     from voxedge.backends.rk.asr import RKASRBackend, RKASRConfig
 
     _patch_import_fail(monkeypatch, "rkvoice_stream")
+    backend = RKASRBackend(RKASRConfig())  # cheap; no rkvoice_stream needed
     with pytest.raises(ImportError) as ei:
-        RKASRBackend(RKASRConfig())
+        backend.preload()
     assert "voxedge[rk]" in str(ei.value)
 
 
-def test_rk_tts_backend_init_friendly_error(monkeypatch):
+def test_rk_tts_backend_preload_friendly_error(monkeypatch):
     from voxedge.backends.rk.tts import RKTTSBackend, RKTTSConfig
 
     _patch_import_fail(monkeypatch, "rkvoice_stream")
+    backend = RKTTSBackend(RKTTSConfig())  # cheap; no rkvoice_stream needed
     with pytest.raises(ImportError) as ei:
-        RKTTSBackend(RKTTSConfig())
+        backend.preload()
     assert "voxedge[rk]" in str(ei.value)
 
 

@@ -386,19 +386,39 @@ class RKASRBackend(ASRBackend):
         )
 
     def __init__(self, config: Optional[RKASRConfig] = None):
-        # Fail fast with a friendly message naming the extra when the RK
-        # runtime is missing (this aarch64-only wheel is never present on a
-        # Mac / x86_64 dev box).
+        # Lazy init (matches the Jetson backends' lifecycle): __init__ only
+        # stores config — the heavy ``rkvoice_stream.create_asr()`` NPU init is
+        # deferred to ``preload()``. Keeps construction cheap so the capability
+        # resolver / health wiring can build the object without triggering NPU
+        # init or requiring the aarch64-only ``voxedge[rk]`` extra. The
+        # BackendManager always calls ``preload()`` after the factory, so the
+        # runtime methods below still see a live ``_inner``.
+        self._config = config or RKASRConfig()
+        self._inner = None
+        self._platform = self._config.platform
+        # Sensible cached defaults until ``preload()`` populates the real
+        # values (also the post-unload fallback so status queries don't crash
+        # on ``self._inner is None``).
+        self._cached_name = "rk:unknown"
+        self._cached_sample_rate = 0
+        self._cached_capabilities: set[ASRCapability] = set()
+
+    def _ensure_inner(self) -> None:
+        """Create the rkvoice-stream inner backend (NPU init) on first use.
+
+        Deferred out of ``__init__`` so construction stays cheap. Idempotent.
+        The friendly dependency check (naming the ``rk`` extra) runs here — the
+        aarch64-only wheel is never present on a Mac / x86_64 dev box, so we
+        only require it at the moment NPU init is actually needed.
+        """
+        if self._inner is not None:
+            return
         from voxedge.backends._deps import check_rk_deps
 
         check_rk_deps()
         from rkvoice_stream import create_asr
 
-        self._config = config or RKASRConfig()
         self._inner = create_asr()
-        self._platform = self._config.platform
-        # Cache metadata at construction time so post-unload status queries
-        # don't crash on ``self._inner is None``.
         try:
             self._cached_name = f"rk:{self._inner.name}"
         except Exception:
@@ -448,8 +468,10 @@ class RKASRBackend(ASRBackend):
         return self._inner.is_ready()
 
     def preload(self) -> None:
-        if self._inner is None:
-            raise RuntimeError("RKASRBackend not loaded (was unloaded)")
+        # Lazy first-load: build the inner backend (NPU init) here rather than
+        # in __init__. After ``unload()`` this re-creates it, matching the
+        # BackendManager reload contract (factory → preloader).
+        self._ensure_inner()
         self._inner.preload()
 
     def unload(self) -> None:
