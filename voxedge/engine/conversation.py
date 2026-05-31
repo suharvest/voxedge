@@ -33,21 +33,26 @@ LLM closed loop (spec §4): when an ``llm`` backend is provided the asr_final
 text is fed to the LLM and its text deltas drive the TTS sentence buffer
 (equivalent to prod's CLIENT_TEXT path, app/main.py:2953-2960). With no LLM
 the engine is a pure ASR↔TTS pass-through plus a direct CLIENT_TEXT→TTS path.
-``tool_registry`` is accepted and a hook is reserved for the tool-calling
-continuation, but the full ToolRunner loop is a later phase.
+When a ``tool_registry`` is supplied the asr_final text instead drives the
+server-side multi-turn LLM↔tool pump (``Session._llm_turn_with_tools``, spec
+§2/§4); with ``tool_registry=None`` (the default) that path is never taken and
+the LLM call is byte-identical to before the tool migration (Phase 1 contract).
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import struct
 import threading
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
 
 from voxedge.backends.base import ASRBackend, LLMBackend, TTSBackend, VADBackend
+from voxedge.engine.tool_registry import ToolContext
 from voxedge.engine.asr_session_manager import (
     ASRSessionManager,
     ASRSessionUnavailable,
@@ -99,6 +104,17 @@ SERVER_ERROR = "error"
 
 VAD_EVENT_SPEECH_START = "speech_start"
 VAD_EVENT_SPEECH_END = "speech_end"
+
+
+@dataclass
+class _ToolCallAcc:
+    """Accumulator for one tool_call's streamed deltas (per OpenAI index slot).
+
+    Mirrors agent/openvoicestream_agent/tools/runner.py:41-49."""
+
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
 
 
 # ── lightweight sentence buffer (regex fallback, mirrors v2v.py path) ──
@@ -644,12 +660,20 @@ class Session:
         text deltas into the TTS sentence buffer — equivalent to prod's
         CLIENT_TEXT path (app/main.py:2953-2960).
 
-        TODO(phase-2): when ``tool_registry`` is set, run the ToolRunner
-        continuation loop (spec §4 step 3) instead of the plain text stream.
+        When the engine was constructed with a ``tool_registry`` (spec §4),
+        the LLM call runs the server-side multi-turn tool pump
+        (:meth:`_llm_turn_with_tools`) instead of the plain text stream. With
+        ``tool_registry=None`` (the default) this method's behavior is
+        byte-identical to before the tool migration (Phase 1 hard contract).
         """
         if self._llm_be is None or not text.strip():
             return
         if self._tts_buffer is None:
+            return
+        if self.engine.tool_registry is not None:
+            await self._llm_turn_with_tools(
+                [{"role": "user", "content": text}]
+            )
             return
         messages = [{"role": "user", "content": text}]
         try:
@@ -657,12 +681,168 @@ class Session:
                 if ev.kind == "text" and ev.text:
                     for sentence in self._tts_buffer.add(ev.text):
                         await self._tts_q.put(sentence)
-                # TODO(phase-2): ev.kind == "tool_call_delta" → ToolRunner.
+                # tool_call_delta is only reachable via the tool_registry path
+                # above; with no registry the engine never sends a tools schema
+                # so the backend never emits tool calls.
             for sentence in self._tts_buffer.flush():
                 await self._tts_q.put(sentence)
             self.state["tts_flush"] = True
         except Exception:
             logger.exception("voxedge LLM stream failed")
+
+    async def _enqueue_tts_text(self, chunk: str) -> None:
+        """Push assistant text into the TTS sentence buffer (same path LLM
+        text deltas take in :meth:`_on_asr_final`)."""
+        if not chunk or self._tts_buffer is None:
+            return
+        for sentence in self._tts_buffer.add(chunk):
+            await self._tts_q.put(sentence)
+
+    async def _llm_turn_with_tools(self, messages: list[dict[str, Any]]) -> None:
+        """Server-side multi-turn LLM ↔ tool pump (spec §2/§4).
+
+        Ported in shape from the agent runner
+        (agent/openvoicestream_agent/tools/runner.py:116-443) but self-
+        contained: it owns the local ``messages`` list (no agent ``Session``
+        dependency) and streams assistant text into the engine TTS buffer
+        instead of an SLV client.
+
+        Loop (≤ ``engine.max_tool_rounds`` iterations):
+          1. Stream ``llm.stream_events(messages, tools=schema)``.
+          2. Text events → TTS sentence buffer.
+          3. Accumulate ``tool_call_delta`` events per OpenAI tool-call index.
+          4. finish_reason != "tool_calls" (or no tool calls) → done.
+          5. Else: append assistant(tool_calls), dispatch each handler
+             (local path), append role:"tool" results, re-request the LLM.
+
+        Only invoked when ``tool_registry`` is non-None, so the no-tool path
+        in :meth:`_on_asr_final` is unaffected (Phase 1 contract).
+        """
+        registry = self.engine.tool_registry
+        tools_schema = registry.list_openai_tools() or None
+        ctx = ToolContext(
+            session_id=getattr(self.transport, "session_id", None),
+            conversation=self,
+        )
+        max_rounds = self.engine.max_tool_rounds
+        try:
+            for _round in range(max_rounds):
+                text_chunks: list[str] = []
+                tool_accs: dict[int, _ToolCallAcc] = {}
+                finish_reason: Optional[str] = None
+                preamble_fired: set[str] = set()  # tool names already spoken
+
+                async for ev in self._llm_be.stream_events(
+                    messages, tools=tools_schema
+                ):
+                    if ev.kind == "text" and ev.text:
+                        text_chunks.append(ev.text)
+                        await self._enqueue_tts_text(ev.text)
+                    elif ev.kind == "tool_call_delta":
+                        idx = ev.tool_call_index if ev.tool_call_index is not None else 0
+                        slot = tool_accs.setdefault(idx, _ToolCallAcc())
+                        if ev.tool_call_id:
+                            slot.id = ev.tool_call_id
+                        if ev.name:
+                            slot.name = ev.name
+                            # Early-fire the per-tool preamble as soon as the
+                            # tool name is known (lowest voice latency).
+                            if ev.name not in preamble_fired:
+                                tool = registry.get(ev.name)
+                                pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
+                                if pre:
+                                    preamble_fired.add(ev.name)
+                                    await self._emit_preamble(pre)
+                        if ev.arguments:
+                            slot.arguments += ev.arguments
+                    elif ev.kind == "finish":
+                        finish_reason = ev.finish_reason
+
+                # No tool call → terminal text answer. Flush + done.
+                if not tool_accs or finish_reason != "tool_calls":
+                    final_text = "".join(text_chunks)
+                    if final_text:
+                        messages.append({"role": "assistant", "content": final_text})
+                    for sentence in self._tts_buffer.flush():
+                        await self._tts_q.put(sentence)
+                    self.state["tts_flush"] = True
+                    return
+
+                # Commit assistant(tool_calls) to the local message list.
+                preamble_content = "".join(text_chunks) or None
+                tc_payload: list[dict[str, Any]] = [
+                    {
+                        "id": acc.id or f"call_{idx}",
+                        "type": "function",
+                        "function": {
+                            "name": acc.name,
+                            "arguments": acc.arguments or "{}",
+                        },
+                    }
+                    for idx, acc in sorted(tool_accs.items())
+                ]
+                messages.append({
+                    "role": "assistant",
+                    "content": preamble_content,
+                    "tool_calls": tc_payload,
+                })
+
+                # Dispatch each tool sequentially (local path). Remote dispatch
+                # (dispatch_mode="remote") is Phase 2 — for now a remote tool
+                # falls through registry.dispatch which has no local fn and
+                # returns the standard error dict, keeping the loop recoverable.
+                for tc in tc_payload:
+                    tname = tc["function"]["name"]
+                    # Fallback preamble: fire here if the streamed name delta
+                    # never triggered the early path above (e.g. backend sent
+                    # the whole tool_call in one finish chunk).
+                    if tname and tname not in preamble_fired:
+                        tool = registry.get(tname)
+                        pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
+                        if pre:
+                            preamble_fired.add(tname)
+                            await self._emit_preamble(pre)
+                    args_raw = tc["function"]["arguments"]
+                    try:
+                        args = json.loads(args_raw or "{}")
+                    except json.JSONDecodeError:
+                        result: dict[str, Any] = {
+                            "success": False,
+                            "error": f"invalid arguments JSON: {args_raw!r}",
+                        }
+                    else:
+                        result = await registry.dispatch(tname, args, ctx)
+                    content = json.dumps(result, ensure_ascii=False)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": content,
+                    })
+                # loop: re-request the LLM with the tool results appended.
+
+            # Iteration cap hit — flush whatever was spoken and finish.
+            logger.warning("voxedge tool loop hit max_tool_rounds=%d", max_rounds)
+            for sentence in self._tts_buffer.flush():
+                await self._tts_q.put(sentence)
+            self.state["tts_flush"] = True
+        except Exception:
+            logger.exception("voxedge LLM tool loop failed")
+            try:
+                for sentence in self._tts_buffer.flush():
+                    await self._tts_q.put(sentence)
+                self.state["tts_flush"] = True
+            except Exception:
+                logger.exception("voxedge tool-loop flush after error failed")
+
+    async def _emit_preamble(self, preamble_text: str) -> None:
+        """Speak a tool preamble (e.g. "好的。") via the TTS buffer.
+
+        TODO(phase-2): if the TTS buffer / app grows a dedicated preamble
+        interface (immediate flush, bypass sentence buffering for lowest
+        latency), route through it. For now the preamble goes through the same
+        sentence buffer as assistant text — correct, just not latency-tuned.
+        """
+        await self._enqueue_tts_text(preamble_text)
 
     # ══════════════════════════════════════════════════════════════════
     # tts_out_task  ← app/main.py:3207-3432
@@ -923,8 +1103,12 @@ class ConversationEngine:
     Args:
         backends: dict with keys ``asr`` / ``tts`` / ``vad`` / ``llm``; any
             subset. ASR-only, TTS-only, or full loop all valid.
-        tool_registry: reserved for the tool-calling continuation (spec §4);
-            wired in a later phase.
+        tool_registry: optional :class:`~voxedge.engine.tool_registry.ToolRegistry`.
+            When provided, ``_on_asr_final`` runs the server-side multi-turn
+            LLM↔tool pump (``_llm_turn_with_tools``, spec §2/§4). When ``None``
+            (the default) the engine's LLM path is byte-identical to before the
+            tool migration (Phase 1 hard contract: tool_registry=None = no-op).
+        max_tool_rounds: iteration cap for the tool pump (spec §2, default 5).
         multi_utterance: keep the session alive across turns (True) vs
             single-shot (False).
         timeouts: optional dict of wall-clock watchdog knobs (seconds),
@@ -968,6 +1152,7 @@ class ConversationEngine:
         backends: dict[str, Any],
         *,
         tool_registry: Optional[Any] = None,
+        max_tool_rounds: int = 5,
         multi_utterance: bool = False,
         timeouts: Optional[dict] = None,
         silence_ms: int = 400,
@@ -981,6 +1166,7 @@ class ConversationEngine:
     ):
         self.backends = backends
         self.tool_registry = tool_registry
+        self.max_tool_rounds = max_tool_rounds
         self.multi_utterance = multi_utterance
         self.timeouts = timeouts or {}
         self.silence_ms = silence_ms
