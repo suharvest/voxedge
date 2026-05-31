@@ -141,15 +141,19 @@ class ASRBackend(ABC):
     def unload(self) -> None:
         """Release GPU/NPU resources. Default no-op."""
 
-    def concurrency_capability(self) -> Any:
+    def concurrency_capability(self) -> "ConcurrencyCapability":
         """Describe runtime concurrency properties (N, mode).
 
-        In the production code this is a classmethod returning a typed
-        ``ConcurrencyCapability`` read from a profile dict. In voxedge it is
-        an instance method (no profile/env coupling) returning a plain dict
-        ``{"max_concurrency": int, "mode": str}``. Default is conservative.
+        Instance method (no profile/env coupling). Returns a typed
+        ``ConcurrencyCapability`` — the same type concrete backends override
+        with and the capability resolver aggregates via ``.max_concurrent``.
+        Default is conservative (serialized, single-slot) so backends that do
+        not override stay N=1-safe and still resolve cleanly.
         """
-        return {"max_concurrency": 1, "mode": "serialized"}
+        # Local import: a top-level one would trigger voxedge.engine.__init__
+        # (which imports conversation -> backends.base) and deadlock the import.
+        from voxedge.engine.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability.default()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -258,9 +262,10 @@ class TTSBackend(ABC):
     def unload(self) -> None:
         """Release GPU/NPU resources. Default no-op."""
 
-    def concurrency_capability(self) -> Any:
+    def concurrency_capability(self) -> "ConcurrencyCapability":
         """See :meth:`ASRBackend.concurrency_capability`."""
-        return {"max_concurrency": 1, "mode": "serialized"}
+        from voxedge.engine.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability.default()
 
 
 # ═══════════════════════════════════════════════════════════════════════
