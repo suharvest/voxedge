@@ -179,6 +179,49 @@ def test_register_tool_programmatic():
     assert tools[0]["function"]["parameters"]["properties"]["n"]["type"] == "integer"
 
 
+def test_description_lives_only_on_function_not_parameters():
+    """Regression: the tool-level description must be emitted ONCE at
+    function.description and NEVER duplicated inside parameters. The advertise
+    path used to merge description into the schema, so list_openai_tools
+    emitted it twice — a 12-tool prompt then overflowed the edge-llm 3000-token
+    cap (input_too_long, every command 400). See cutover 3b-i."""
+    r = ToolRegistry()
+
+    # Explicit description arg (server-loop advertise path).
+    register_tool(
+        r,
+        "dance",
+        {"type": "object", "properties": {}},
+        lambda ctx=None: {},
+        dispatch_mode="remote",
+        description="Make the arm perform a dance routine.",
+    )
+    # Legacy/foreign schema that leaked a root description into parameters.
+    register_tool(
+        r,
+        "wave",
+        {
+            "type": "object",
+            "description": "leaked tool description",
+            "properties": {"hand": {"type": "string", "description": "which hand"}},
+        },
+        lambda hand="left", ctx=None: {},
+        dispatch_mode="remote",
+    )
+
+    tools = {t["function"]["name"]: t["function"] for t in r.list_openai_tools()}
+
+    # Explicit description surfaces at function-level, absent from parameters.
+    assert tools["dance"]["description"] == "Make the arm perform a dance routine."
+    assert "description" not in tools["dance"]["parameters"]
+
+    # Leaked root description is stripped from parameters but preserved as the
+    # tool description; nested property descriptions are left intact.
+    assert tools["wave"]["description"] == "leaked tool description"
+    assert "description" not in tools["wave"]["parameters"]
+    assert tools["wave"]["parameters"]["properties"]["hand"]["description"] == "which hand"
+
+
 def test_builtins_register():
     r = ToolRegistry()
     register_builtins(r)

@@ -493,8 +493,6 @@ class Session:
                 continue
             schema = fn_block.get("parameters") or {"type": "object", "properties": {}}
             description = fn_block.get("description", "")
-            if isinstance(schema, dict) and description and "description" not in schema:
-                schema = {**schema, "description": description}
             registry.register(
                 name,
                 schema,
@@ -504,6 +502,7 @@ class Session:
                 completion_text=str(entry.get("completion_text", "")),
                 response_mode=str(entry.get("response_mode", "await")),
                 dispatch_mode="remote",
+                description=description,
             )
             registered.append(name)
         sys_prompt = payload.get("system_prompt")

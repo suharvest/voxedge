@@ -212,15 +212,23 @@ class ToolRegistry:
         completion_text: str = "",
         response_mode: str = "await",
         dispatch_mode: DispatchMode = "local",
+        description: str = "",
     ) -> None:
         """Programmatic (non-decorator) registration (spec §2 ``register_tool``).
 
         ``schema`` is the OpenAI-style ``parameters`` JSON Schema for the
         handler (the ``{"type":"object","properties":{...}}`` object — NOT the
         full ``{"type":"function","function":{...}}`` wrapper). ``description``
-        is taken from the handler docstring when absent from the schema.
+        is taken from the explicit ``description`` arg, then a root
+        ``schema["description"]`` (legacy), then the handler docstring.
+
+        The tool-level description lives ONLY on ``Tool.description`` (emitted
+        at ``function.description`` by :meth:`list_openai_tools`); it is NEVER
+        left inside ``parameters`` — duplicating it there double-counts every
+        description in the LLM prompt and can overflow the edge-llm token cap.
         """
-        description = schema.get("description", "") if isinstance(schema, dict) else ""
+        if not description and isinstance(schema, dict):
+            description = schema.get("description", "") or ""
         if not description:
             description = (getattr(handler, "__doc__", "") or "").strip()
         parameters = schema
@@ -232,6 +240,11 @@ class ToolRegistry:
                 description = description or fn_block.get("description", "")
             else:
                 parameters = {"type": "object", "properties": {}}
+        # Strip any root tool-level description that leaked into the parameters
+        # schema (OpenAI spec: description belongs at function.description, NOT
+        # parameters.description). Keep nested property descriptions intact.
+        if isinstance(parameters, dict) and "description" in parameters:
+            parameters = {k: v for k, v in parameters.items() if k != "description"}
         self._tools[name] = Tool(
             name=name,
             description=description,
@@ -414,6 +427,7 @@ def register_tool(
     completion_text: str = "",
     response_mode: str = "await",
     dispatch_mode: DispatchMode = "local",
+    description: str = "",
 ) -> None:
     """Module-level convenience wrapper around :meth:`ToolRegistry.register`
     (spec §2 engine-level tool registration API)."""
@@ -426,6 +440,7 @@ def register_tool(
         completion_text=completion_text,
         response_mode=response_mode,
         dispatch_mode=dispatch_mode,
+        description=description,
     )
 
 
