@@ -63,6 +63,10 @@ class MossTtsNanoConfig:
     max_seq_len: int = 2048
     sample_rate: int = 48000
     channels: int = 2
+    # Stable identifier used by the product's speaker-resolution + request
+    # plumbing (``backend.model_id``). MOSS is a voice-clone backend with no
+    # built-in speaker table, so this is just a constant key.
+    model_id: str = "moss-tts-nano"
     # Only used when ``worker_bin`` ends in ``.py`` (ORT-mode persistent worker).
     py_repo: str = "/opt/moss-tts-nano-py"
     ort_ep: str = "cpu"
@@ -117,6 +121,10 @@ class MossTtsNanoBackend(TTSBackend):
     @property
     def name(self) -> str:
         return "jetson.moss_tts_nano"
+
+    @property
+    def model_id(self) -> str:
+        return self._config.model_id
 
     @property
     def capabilities(self) -> set[TTSCapability]:
