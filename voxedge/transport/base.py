@@ -170,7 +170,17 @@ class WebSocketTransport(Transport):
             self._pump_task = asyncio.create_task(self._pump())
 
     async def _pump(self) -> None:
-        """Single receive loop: demux ws frames into audio / event queues."""
+        """Single receive loop: demux ws frames into audio / event queues.
+
+        End-of-stream signalling (slot-leak fix): a client WS close surfaces
+        EITHER as a clean ``{"type": "websocket.disconnect"}`` frame OR as a
+        raised ``WebSocketDisconnect`` (Starlette raises it once the socket is
+        gone). BOTH are an end-of-input, not an error to swallow silently —
+        we must drop out of the loop and enqueue ``_CLOSE`` so the engine's
+        recv iterators return, ``_watch_input_end`` fires, and the session
+        tears down (otherwise the limiter slot leaks). We duck-type the
+        disconnect by class name so this module stays FastAPI-import-free.
+        """
         try:
             while not self._closed:
                 msg = await self._ws.receive()
@@ -188,9 +198,22 @@ class WebSocketTransport(Transport):
                     except (ValueError, TypeError):
                         continue
                     await self._event_q.put(payload)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # A raised WebSocketDisconnect is a normal end-of-stream — fall
+            # through to the finally that enqueues _CLOSE (no re-raise, no
+            # log spam). Anything else is an unexpected pump fault: we still
+            # enqueue _CLOSE (so callers never hang in queue-wait limbo) but
+            # leave a trace so the fault isn't lost.
+            if type(exc).__name__ != "WebSocketDisconnect":
+                import logging
+                logging.getLogger(__name__).warning(
+                    "voxedge ws transport pump error (%s): %s",
+                    type(exc).__name__, exc,
+                )
         finally:
+            # Flip _closed so send_*/recv_* don't keep a caller waiting on a
+            # dead socket, then unblock both recv iterators.
+            self._closed = True
             self._audio_q.put_nowait(_CLOSE)
             self._event_q.put_nowait(_CLOSE)
 

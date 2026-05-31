@@ -1158,19 +1158,62 @@ class Session:
 
         async def _watch_input_end() -> None:
             # Once the client stops feeding (both recv loops drained), the
-            # session is over. Flag the close-out so any in-flight ASR turn
-            # finalizes and the work tasks exit (not just spin).
+            # session is over. This drain only happens when the transport
+            # enqueues _CLOSE — i.e. a real WS close / disconnect. A quiet but
+            # still-connected client keeps the pump blocked on ws.receive(),
+            # so the recv loops never drain and this never fires (the critical
+            # "don't kill a silent client" invariant lives in the transport).
+            #
+            # Slot-leak fix (3b-ii): on the ASR+TTS V2V path the close-out
+            # MUST also terminate _tts_out_task, otherwise it spins forever in
+            # `while not client_closed` and the Session.run() gather never
+            # resolves → product finally never runs → limiter slot leaks. Set:
+            #   * asr_session_closed → in-flight ASR turn finalizes (close-out)
+            #   * tts_flush          → _tts_out_task drains its queue, emits its
+            #                          final tts_done, then BREAKS — because with
+            #                          asr_session_closed=True the `multi and not
+            #                          asr_session_closed` re-arm guard at the top
+            #                          of _tts_out_task is False, so the flush
+            #                          branch falls through to `break`.
+            # Previously the flush was gated behind `if not self.asr_enabled`,
+            # so the full ASR+TTS loop never flushed and _tts_out_task hung
+            # forever — that is the leak this removes.
+            #
+            # We deliberately do NOT set client_closed here: that would
+            # short-circuit the work-task loops BEFORE they emit their terminal
+            # close-out events (asr_final{session_complete=True} / final
+            # tts_done) and abort an in-flight close-out synth. client_closed is
+            # set by the run() finally, AFTER the gather has resolved (i.e. the
+            # work tasks have drained and emitted their finals).
             await asyncio.gather(*recv_tasks, return_exceptions=True)
             self.state["asr_session_closed"] = True
-            if not self.asr_enabled:
-                # TTS-only: no asr task to drain — also flush so tts_out_task
-                # emits its final tts_done and exits.
-                self.state["tts_flush"] = True
+            self.state["tts_flush"] = True
+            # Don't orphan in-flight remote tool futures on disconnect: clear
+            # them (same barge-in cancel mechanism, conversation.py:528-535 /
+            # tool_registry.py:404-416) so any awaiting _dispatch_remote
+            # returns a recoverable abort instead of hanging a multi-turn pump.
+            registry = self.engine.tool_registry
+            if registry is not None:
+                try:
+                    cleared = registry.cancel_pending_remote()
+                    if cleared:
+                        logger.debug(
+                            "voxedge input-end cleared %d pending remote tool "
+                            "call(s)", cleared,
+                        )
+                except Exception:
+                    logger.exception("voxedge cancel_pending_remote on close failed")
 
         end_watcher = asyncio.create_task(_watch_input_end())
 
         try:
             if work_tasks:
+                # Race the work tasks against input-end: a client WS close
+                # makes _watch_input_end set client_closed=True, which breaks
+                # both work-task loops so this gather resolves. We also include
+                # end_watcher so a degenerate config (no work tasks) — and any
+                # path where the work tasks somehow exit before the watcher —
+                # still completes deterministically.
                 await asyncio.gather(*work_tasks, return_exceptions=False)
             else:
                 # No work tasks (degenerate config) — still wait for input end.
