@@ -23,6 +23,7 @@ import asyncio
 import inspect
 import logging
 import types
+import uuid
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -145,6 +146,10 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # call_id → Future awaiting a remote ``tool_result`` frame (spec §4
+        # Mode B). One pending future per outstanding remote dispatch; cleared
+        # on resolve / timeout / barge-in cancel.
+        self._pending_remote: dict[str, "asyncio.Future[Any]"] = {}
 
     def tool(
         self,
@@ -286,6 +291,8 @@ class ToolRegistry:
         t = self._tools.get(name)
         if t is None:
             return {"success": False, "error": f"unknown tool: {name}"}
+        if t.dispatch_mode == "remote":
+            return await self._dispatch_remote(t, arguments or {}, ctx)
         allowed = set(t.parameters.get("properties", {}).keys())
         clean: dict[str, Any] = {
             k: v for k, v in (arguments or {}).items() if k in allowed
@@ -307,6 +314,93 @@ class ToolRegistry:
         except Exception as e:  # noqa: BLE001
             logger.warning("tool %s raised %r", name, e)
             return {"success": False, "error": str(e)}
+
+    async def _dispatch_remote(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        ctx: Any,
+    ) -> dict[str, Any]:
+        """Proxy a ``dispatch_mode == "remote"`` tool over the wire (spec §4
+        Mode B).
+
+        Sends ``{"type":"tool_call","call_id":...,"name":...,"arguments":...}``
+        via ``ctx.remote_send`` and awaits a correlated ``tool_result`` (which
+        :meth:`resolve_remote` delivers). On no transport / timeout / client
+        error returns the standard ``{"success": False, ...}`` dict so the LLM
+        tool loop stays recoverable — symmetric to the local error path."""
+        remote_send = getattr(ctx, "remote_send", None) if ctx is not None else None
+        if remote_send is None:
+            return {"success": False, "error": "no remote transport"}
+
+        call_id = uuid.uuid4().hex
+        loop = asyncio.get_event_loop()
+        fut: "asyncio.Future[Any]" = loop.create_future()
+        self._pending_remote[call_id] = fut
+        try:
+            await remote_send({
+                "type": "tool_call",
+                "call_id": call_id,
+                "name": tool.name,
+                "arguments": arguments,
+            })
+            try:
+                result = await asyncio.wait_for(fut, timeout=tool.timeout_s)
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "error": "timeout",
+                    "timeout_s": tool.timeout_s,
+                }
+            except asyncio.CancelledError:
+                # Barge-in / turn cancel cleared this future via
+                # cancel_pending_remote(); treat as a recoverable abort.
+                return {"success": False, "error": "cancelled"}
+            if isinstance(result, dict):
+                return result
+            return {"value": result}
+        except Exception as e:  # noqa: BLE001 — transport send failure, etc.
+            logger.warning("remote tool %s dispatch failed: %r", tool.name, e)
+            return {"success": False, "error": str(e)}
+        finally:
+            self._pending_remote.pop(call_id, None)
+
+    def resolve_remote(
+        self,
+        call_id: str,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        """Deliver a remote ``tool_result`` frame back to the awaiting
+        ``_dispatch_remote`` future (Phase 2 wire-receive hook).
+
+        Called by the product /v2v receive side when a ``tool_result`` /
+        ``tool_error`` frame arrives. Unknown or already-resolved ``call_id``
+        is safely ignored (late/duplicate client reply, or one already timed
+        out). ``error`` set → the awaiting dispatch raises ``RuntimeError`` and
+        returns the standard error dict; otherwise ``result`` is delivered."""
+        fut = self._pending_remote.get(call_id)
+        if fut is None or fut.done():
+            logger.debug("resolve_remote: no pending future for call_id=%s", call_id)
+            return
+        if error is not None:
+            fut.set_exception(RuntimeError(error))
+        else:
+            fut.set_result(result)
+
+    def cancel_pending_remote(self) -> int:
+        """Cancel + clear every outstanding remote tool future (spec §7 risk:
+        barge-in must not leave orphaned remote tool calls).
+
+        Called from the conversation barge-in / turn-cancel path. Each pending
+        ``_dispatch_remote`` await wakes with ``CancelledError`` and returns a
+        recoverable abort dict. Returns the number cleared (for logging)."""
+        pending = list(self._pending_remote.items())
+        self._pending_remote.clear()
+        for _call_id, fut in pending:
+            if not fut.done():
+                fut.cancel()
+        return len(pending)
 
 
 def register_tool(

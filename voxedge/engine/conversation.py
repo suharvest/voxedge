@@ -422,6 +422,14 @@ class Session:
         stop = self.state["current_tts_stop"]
         if stop is not None:
             stop.set()
+        # Phase 2a: barge-in must not orphan in-flight remote tool calls
+        # (spec §7). Clear any pending remote-dispatch futures so their
+        # awaiting _dispatch_remote returns a recoverable abort dict.
+        registry = self.engine.tool_registry
+        if registry is not None:
+            cleared = registry.cancel_pending_remote()
+            if cleared:
+                logger.debug("barge-in cleared %d pending remote tool call(s)", cleared)
 
     async def _open_asr_turn(self) -> bool:
         """Start a fresh ASR utterance via the session manager.
@@ -723,6 +731,11 @@ class Session:
         ctx = ToolContext(
             session_id=getattr(self.transport, "session_id", None),
             conversation=self,
+            # Phase 2a: remote-dispatch tools push their tool_call frame over
+            # the same event channel as other server→client events; the
+            # correlated tool_result is routed back via
+            # ``registry.resolve_remote`` from the transport receive side.
+            remote_send=self.transport.send_event,
         )
         max_rounds = self.engine.max_tool_rounds
         try:
@@ -787,10 +800,11 @@ class Session:
                     "tool_calls": tc_payload,
                 })
 
-                # Dispatch each tool sequentially (local path). Remote dispatch
-                # (dispatch_mode="remote") is Phase 2 — for now a remote tool
-                # falls through registry.dispatch which has no local fn and
-                # returns the standard error dict, keeping the loop recoverable.
+                # Dispatch each tool sequentially. registry.dispatch branches
+                # on dispatch_mode internally: local tools run in-process,
+                # remote tools (dispatch_mode="remote", Phase 2a) proxy over
+                # ctx.remote_send and await a correlated tool_result — both
+                # return a JSON-serialisable dict, transparent to this loop.
                 for tc in tc_payload:
                     tname = tc["function"]["name"]
                     # Fallback preamble: fire here if the streamed name delta

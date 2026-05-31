@@ -402,3 +402,184 @@ async def test_tool_registry_none_uses_plain_path():
     assert len(llm.calls) == 1
     assert "tools" not in llm.calls[0]["kw"]
     assert sess.state["tts_flush"] is True
+
+
+# ─────────────────── Phase 2a: remote dispatch ──────────────────────
+
+
+def _remote_registry(timeout_s: float = 5.0) -> ToolRegistry:
+    r = ToolRegistry()
+
+    @r.tool(description="set lamp", dispatch_mode="remote", timeout_s=timeout_s)
+    def set_lamp(on: bool) -> dict:  # body never runs (remote)
+        return {"unreachable": True}
+
+    return r
+
+
+@run_async
+async def test_remote_dispatch_payload_and_result():
+    r = _remote_registry()
+    sent: list[dict] = []
+
+    async def remote_send(frame: dict) -> None:
+        sent.append(frame)
+        # Simulate the client replying out-of-band.
+        r.resolve_remote(frame["call_id"], result={"ok": True, "lamp": "on"})
+
+    ctx = ToolContext(remote_send=remote_send)
+    out = await r.dispatch("set_lamp", {"on": True}, ctx)
+
+    assert out == {"ok": True, "lamp": "on"}
+    assert len(sent) == 1
+    frame = sent[0]
+    assert frame["type"] == "tool_call"
+    assert frame["name"] == "set_lamp"
+    assert frame["arguments"] == {"on": True}
+    assert isinstance(frame["call_id"], str) and frame["call_id"]
+    # Future cleaned up after dispatch.
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_remote_dispatch_deferred_resolve():
+    r = _remote_registry()
+    captured: dict = {}
+
+    async def remote_send(frame: dict) -> None:
+        captured["call_id"] = frame["call_id"]
+
+    ctx = ToolContext(remote_send=remote_send)
+    task = asyncio.ensure_future(r.dispatch("set_lamp", {"on": False}, ctx))
+    # Let dispatch send the frame and register the pending future.
+    await asyncio.sleep(0)
+    assert captured["call_id"] in r._pending_remote
+    r.resolve_remote(captured["call_id"], result={"value": 42})
+    out = await task
+    assert out == {"value": 42}
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_remote_dispatch_error_becomes_error_dict():
+    r = _remote_registry()
+
+    async def remote_send(frame: dict) -> None:
+        r.resolve_remote(frame["call_id"], error="device offline")
+
+    ctx = ToolContext(remote_send=remote_send)
+    out = await r.dispatch("set_lamp", {"on": True}, ctx)
+    assert out["success"] is False
+    assert "device offline" in out["error"]
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_remote_dispatch_non_dict_result_wrapped():
+    r = _remote_registry()
+
+    async def remote_send(frame: dict) -> None:
+        r.resolve_remote(frame["call_id"], result="plain-string")
+
+    ctx = ToolContext(remote_send=remote_send)
+    out = await r.dispatch("set_lamp", {"on": True}, ctx)
+    assert out == {"value": "plain-string"}
+
+
+@run_async
+async def test_remote_dispatch_timeout():
+    r = _remote_registry(timeout_s=0.05)
+
+    async def remote_send(frame: dict) -> None:
+        pass  # never resolves
+
+    ctx = ToolContext(remote_send=remote_send)
+    out = await r.dispatch("set_lamp", {"on": True}, ctx)
+    assert out["success"] is False
+    assert out["error"] == "timeout"
+    assert out["timeout_s"] == 0.05
+    # Future must be cleared even on timeout.
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_remote_dispatch_no_transport():
+    r = _remote_registry()
+    out = await r.dispatch("set_lamp", {"on": True}, ToolContext(remote_send=None))
+    assert out["success"] is False
+    assert out["error"] == "no remote transport"
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_remote_dispatch_no_transport_ctx_none():
+    r = _remote_registry()
+    out = await r.dispatch("set_lamp", {"on": True}, None)
+    assert out["success"] is False
+    assert out["error"] == "no remote transport"
+
+
+@run_async
+async def test_resolve_unknown_call_id_ignored():
+    r = _remote_registry()
+    # No exception; safe no-op.
+    r.resolve_remote("does-not-exist", result={"x": 1})
+    r.resolve_remote("does-not-exist", error="boom")
+    assert r._pending_remote == {}
+
+
+@run_async
+async def test_resolve_already_done_ignored():
+    r = _remote_registry()
+    captured: dict = {}
+
+    async def remote_send(frame: dict) -> None:
+        captured["call_id"] = frame["call_id"]
+
+    ctx = ToolContext(remote_send=remote_send)
+    task = asyncio.ensure_future(r.dispatch("set_lamp", {"on": True}, ctx))
+    await asyncio.sleep(0)
+    cid = captured["call_id"]
+    r.resolve_remote(cid, result={"first": True})
+    out = await task
+    # Second resolve after completion is ignored (no crash).
+    r.resolve_remote(cid, result={"second": True})
+    assert out == {"first": True}
+
+
+@run_async
+async def test_cancel_pending_remote_clears_futures():
+    r = _remote_registry(timeout_s=10.0)
+    captured: list[str] = []
+
+    async def remote_send(frame: dict) -> None:
+        captured.append(frame["call_id"])
+
+    ctx = ToolContext(remote_send=remote_send)
+    task = asyncio.ensure_future(r.dispatch("set_lamp", {"on": True}, ctx))
+    await asyncio.sleep(0)
+    assert len(r._pending_remote) == 1
+    cleared = r.cancel_pending_remote()
+    assert cleared == 1
+    assert r._pending_remote == {}
+    out = await task
+    assert out["success"] is False
+    assert out["error"] == "cancelled"
+
+
+@run_async
+async def test_local_dispatch_unchanged_by_remote_path():
+    # Regression: a local tool in the same registry still runs in-process.
+    r = ToolRegistry()
+
+    @r.tool(description="add")
+    def add(a: int, b: int) -> dict:
+        return {"sum": a + b}
+
+    @r.tool(description="remote", dispatch_mode="remote")
+    def rem(x: int) -> dict:
+        return {"unreachable": True}
+
+    out = await r.dispatch("add", {"a": 4, "b": 5}, ToolContext())
+    assert out == {"sum": 9}
+    assert r._pending_remote == {}
