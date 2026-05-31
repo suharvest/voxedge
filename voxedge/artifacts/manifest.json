@@ -41,10 +41,16 @@
           "sha256": "a6de7a2512d83a22cfba8e1793b1f463108126dfee4eb8592a28fe7c268d6861"
         },
         {
-          "path": "opt/kokoro-rknn/voices/style.npy",
-          "source_path": "rk3588/kokoro-hybrid-v1/voices/style.npy",
-          "size_bytes": 524416,
-          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          "path": "opt/kokoro-rknn/default.npy",
+          "source_path": "rk3588/kokoro-hybrid-v1/default.npy",
+          "size_bytes": 1152,
+          "sha256": "e844b0d3200a28b47a2472d4052c2696ac639197aa0ab06bb3fb708781b5a09d"
+        },
+        {
+          "path": "opt/kokoro-rknn/style.npy",
+          "source_path": "rk3588/kokoro-hybrid-v1/style.npy",
+          "size_bytes": 1152,
+          "sha256": "e844b0d3200a28b47a2472d4052c2696ac639197aa0ab06bb3fb708781b5a09d"
         }
       ]
     }
