@@ -164,6 +164,10 @@ class TRTEdgeLLMTTSConfig:
     # Extra env passed through to the worker subprocess.
     extra_worker_env: dict = field(default_factory=dict)
 
+    # Optional stable artifact name for the runtime-artifact manifest
+    # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
+    artifact_ref: Optional[str] = None
+
     def __post_init__(self) -> None:
         self.worker_concurrency = max(1, int(self.worker_concurrency))
         self.qwen3_runtime_profile = (

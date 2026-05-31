@@ -87,6 +87,9 @@ class RKASRConfig:
     energy_split_rms: float = 0.003
     energy_min_silence_ms: int = 120
     long_audio_threshold_s: float = 15.0
+    # Optional stable artifact name for the runtime-artifact manifest
+    # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
+    artifact_ref: Optional[str] = None
 
 
 def _split_at_silence_energy(

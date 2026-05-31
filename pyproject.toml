@@ -92,6 +92,15 @@ jetson = [
 text = [
     # "pysbd>=0.3.4"
 ]
+# Installing `voxedge[artifacts]` pulls the HuggingFace Hub client used by the
+# DEFAULT runtime-artifact downloader (`voxedge.artifacts.resolve_artifact`).
+# The manifest schema + SHA-256 verification logic itself is pure stdlib and
+# needs NO network dependency — callers can inject their own `download_fn`
+# (e.g. a local copy for tests), so this stays an OPTIONAL extra and never
+# enters the core dependency list.
+artifacts = [
+    "huggingface_hub>=0.20",
+]
 
 [tool.setuptools]
 packages = [
@@ -102,4 +111,8 @@ packages = [
     "voxedge.backends.jetson",
     "voxedge.transport",
     "voxedge.engine",
+    "voxedge.artifacts",
 ]
+
+[tool.setuptools.package-data]
+"voxedge.artifacts" = ["manifest.json"]

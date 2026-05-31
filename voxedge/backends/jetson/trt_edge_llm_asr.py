@@ -167,6 +167,10 @@ class TRTEdgeLLMASRConfig:
     # voxedge does not read process env; callers inject what the worker needs.
     extra_worker_env: dict = field(default_factory=dict)
 
+    # Optional stable artifact name for the runtime-artifact manifest
+    # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
+    artifact_ref: Optional[str] = None
+
     def __post_init__(self) -> None:
         self.max_slots = max(1, int(self.max_slots))
         self.stream_mode = (self.stream_mode or "accumulate").strip().lower()

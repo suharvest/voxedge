@@ -116,6 +116,9 @@ class KokoroTRTConfig:
     max_seq_len_fallback: int = 128
     hybrid_token_len: int = 0
     model_id: str = "kokoro_trt"
+    # Optional stable artifact name for the runtime-artifact manifest
+    # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
+    artifact_ref: Optional[str] = None
 
     def __post_init__(self) -> None:
         import os.path as _p

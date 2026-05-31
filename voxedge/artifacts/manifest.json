@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "hf_endpoint": "https://huggingface.co",
+  "artifacts": {
+    "rk3588-kokoro-hybrid-2026-05-23": {
+      "artifact_ref": "rk3588-kokoro-hybrid-2026-05-23",
+      "backend_key": "rk.tts",
+      "device": "rk3588",
+      "precision": "int8",
+      "hf_repo": "harvestsu/seeed-local-voice-rk-artifacts",
+      "revision": "main",
+      "sha256": "",
+      "runtime_contract": {
+        "tts_path": "kokoro_hybrid",
+        "closed_loop_validated": true,
+        "env": {
+          "TTS_BACKEND": "kokoro_rknn",
+          "KOKORO_RKNN_MODE": "hybrid",
+          "KOKORO_PREFIX_ONNX": "kokoro-prefix-cpu.onnx",
+          "KOKORO_FRONT_RKNN": "rk3588/kokoro-decoder-front.int8.rknn",
+          "KOKORO_TAIL_ONNX": "kokoro-generator-tail-cpu.onnx"
+        }
+      },
+      "file_list": [
+        {
+          "path": "opt/kokoro-rknn/kokoro-prefix-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-prefix-cpu.onnx",
+          "size_bytes": 22922434,
+          "sha256": "549fece07d8696ae9ea60f4667e2680b5ca1f41735af545489a378eed3fe1f1c"
+        },
+        {
+          "path": "opt/kokoro-rknn/kokoro-generator-tail-cpu.onnx",
+          "source_path": "rk3588/kokoro-hybrid-v1/kokoro-generator-tail-cpu.onnx",
+          "size_bytes": 89009749,
+          "sha256": "1bdbb9fdea62922e79fa29891471e7797047f16636bff9bfb8944b28ee451bcb"
+        },
+        {
+          "path": "opt/kokoro-rknn/rk3588/kokoro-decoder-front.int8.rknn",
+          "source_path": "rk3588/kokoro-hybrid-v1/rk3588/kokoro-decoder-front.int8.rknn",
+          "size_bytes": 40599018,
+          "sha256": "a6de7a2512d83a22cfba8e1793b1f463108126dfee4eb8592a28fe7c268d6861"
+        },
+        {
+          "path": "opt/kokoro-rknn/voices/style.npy",
+          "source_path": "rk3588/kokoro-hybrid-v1/voices/style.npy",
+          "size_bytes": 524416,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  }
+}

@@ -62,6 +62,9 @@ class RKTTSConfig:
     """
 
     model_id: str = "rk"
+    # Optional stable artifact name for the runtime-artifact manifest
+    # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
+    artifact_ref: Optional[str] = None
 
 
 class RKTTSBackend(TTSBackend):
