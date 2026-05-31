@@ -813,3 +813,187 @@ async def test_event_loop_routes_tool_result_to_resolve_remote():
     assert ok_fut.result() == {"v": 1}
     assert isinstance(err_fut.exception(), RuntimeError)
     assert "boom" in str(err_fut.exception())
+
+
+# ─────────────────────── tool advertise handshake ───────────────────────
+
+
+@run_async
+async def test_event_loop_tool_advertise_registers_remote_tools():
+    """CLIENT_TOOL_ADVERTISE registers the advertised OpenAI schemas as
+    dispatch_mode="remote" tools, exposes them via list_openai_tools, and
+    overrides the engine system_prompt / merges llm_params (spec §4/§6)."""
+    from voxedge.engine.conversation import Session, CLIENT_TOOL_ADVERTISE
+
+    registry = ToolRegistry()
+    engine = ConversationEngine(
+        backends={"tts": MockTTS()},
+        tool_registry=registry,
+        system_prompt="old prompt",
+        llm_params={"temperature": 0.1},
+    )
+
+    advertise = {
+        "type": CLIENT_TOOL_ADVERTISE,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "look_up",
+                    "description": "Tilt the arm up to look.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
+            # Bare (un-wrapped) form is also accepted.
+            {
+                "name": "wave",
+                "description": "Wave the arm.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+        "system_prompt": "You are a robot arm.",
+        "llm_params": {"max_tokens": 64},
+    }
+
+    class _FeedTransport:
+        session_id = "sid"
+
+        async def recv_event(self):
+            yield advertise
+
+        async def send_event(self, p):
+            pass
+
+        async def send_audio(self, b):
+            pass
+
+    sess = Session(engine, _FeedTransport())
+    await sess._event_loop()
+
+    # Both tools registered as remote-dispatch.
+    assert registry.has("look_up") and registry.has("wave")
+    assert registry.get("look_up").dispatch_mode == "remote"
+    assert registry.get("wave").dispatch_mode == "remote"
+
+    # list_openai_tools surfaces them in OpenAI chat-completions shape.
+    names = {t["function"]["name"] for t in registry.list_openai_tools()}
+    assert names == {"look_up", "wave"}
+    look = next(t for t in registry.list_openai_tools()
+                if t["function"]["name"] == "look_up")
+    assert look["type"] == "function"
+    assert look["function"]["description"] == "Tilt the arm up to look."
+
+    # System prompt overridden; llm_params merged (not replaced).
+    assert engine.system_prompt == "You are a robot arm."
+    assert engine.llm_params == {"temperature": 0.1, "max_tokens": 64}
+
+
+@run_async
+async def test_advertise_then_server_loop_picks_remote_tool_e2e():
+    """Full server-loop handshake: client advertises a remote arm tool →
+    scripted LLM selects it → engine proxies SERVER_TOOL_CALL to the client →
+    client replies tool_result → LLM continuation speaks. Proves the advertised
+    tool is visible to the LLM request AND flows through remote dispatch."""
+    from voxedge.engine.conversation import (
+        Session,
+        CLIENT_TOOL_ADVERTISE,
+        SERVER_TOOL_CALL,
+    )
+
+    registry = ToolRegistry()
+
+    # LLM round 1 picks look_up; round 2 (after tool_result) speaks.
+    llm = _ScriptedLLM([
+        [
+            LLMEvent(kind="tool_call_delta", tool_call_index=0,
+                     tool_call_id="call_arm", name="look_up", arguments="{}"),
+            LLMEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            LLMEvent(kind="text", text="好的，我抬头看看。"),
+            LLMEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    engine = ConversationEngine(
+        backends={"tts": MockTTS(), "llm": llm},
+        tool_registry=registry,
+    )
+
+    # Advertise the arm tool first (handshake).
+    sess0 = Session(engine, _CaptureTransport([]))
+    sess0._handle_tool_advertise({
+        "type": CLIENT_TOOL_ADVERTISE,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "look_up",
+                "description": "Tilt the arm up to look.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+        "system_prompt": "You are a robot arm assistant.",
+    })
+    assert registry.get("look_up").dispatch_mode == "remote"
+
+    # Drive the server-side pump on the SAME engine/registry. The capture
+    # transport records the SERVER_TOOL_CALL frame and auto-replies with a
+    # success tool_result so the remote dispatch future resolves.
+    transport = _CaptureTransport([], registry=registry)
+    sess = Session(engine, transport)
+    await sess._llm_turn_with_tools(
+        [{"role": "user", "content": "抬头看看"}]
+    )
+
+    # Server emitted a SERVER_TOOL_CALL for the advertised remote tool.
+    tool_calls = [e for e in transport.sent if e.get("type") == SERVER_TOOL_CALL]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["name"] == "look_up"
+
+    # The tools schema sent to the LLM included the advertised tool.
+    assert any(
+        t["function"]["name"] == "look_up"
+        for t in (llm.calls[0]["kw"].get("tools") or [])
+    )
+
+    # Continuation ran (round 2) after the tool_result, with the role:tool
+    # result injected — the full closed loop completed.
+    assert len(llm.calls) == 2
+    r2_roles = [m["role"] for m in llm.calls[1]["messages"]]
+    assert "tool" in r2_roles
+    assert sess.state["tts_flush"] is True
+
+
+class _CaptureTransport:
+    """Records sent events. When ``registry`` is given, auto-resolves a
+    SERVER_TOOL_CALL by feeding back a success tool_result (simulating a
+    device client that ran the arm action), so remote dispatch completes
+    without a live WS peer."""
+
+    session_id = "sid"
+
+    def __init__(self, events, registry=None):
+        self._events = events
+        self.sent: list[dict] = []
+        self._registry = registry
+
+    async def recv_event(self):
+        for e in self._events:
+            yield e
+
+    async def send_event(self, p):
+        self.sent.append(p)
+        if (
+            self._registry is not None
+            and isinstance(p, dict)
+            and p.get("type") == "tool_call"
+        ):
+            # Mimic the device client returning a successful arm result.
+            self._registry.resolve_remote(
+                p["call_id"], result={"started": True, "action": p["name"]}
+            )
+
+    async def send_audio(self, b):
+        pass

@@ -95,6 +95,13 @@ CLIENT_ABORT = "abort"
 # Remote-tool wire (spec §4 Mode B): the client returns a tool result that the
 # engine routes back to the awaiting remote-dispatch future via resolve_remote.
 CLIENT_TOOL_RESULT = "tool_result"
+# Tool advertise handshake (spec §4/§6): right after opening the session the
+# device client uploads the OpenAI-style tool schemas it can execute locally
+# (plus an optional system_prompt / llm_params override). The engine registers
+# them as dispatch_mode="remote" tools so the server-side LLM loop can pick one
+# and proxy execution back to the client via SERVER_TOOL_CALL. Additive — a
+# legacy client that never enables the server loop never sends this.
+CLIENT_TOOL_ADVERTISE = "tool_advertise"
 
 SERVER_ASR_PARTIAL = "asr_partial"
 SERVER_ASR_ENDPOINT = "asr_endpoint"
@@ -110,6 +117,16 @@ SERVER_TOOL_CALL = "tool_call"
 
 VAD_EVENT_SPEECH_START = "speech_start"
 VAD_EVENT_SPEECH_END = "speech_end"
+
+
+def _advertised_remote_noop(*_args, **_kwargs):  # pragma: no cover - never called
+    """Placeholder local handler for a client-advertised remote tool.
+
+    The registry's ``dispatch_mode="remote"`` path proxies execution to the
+    device client over the wire and never invokes ``fn``; this exists only so
+    ``ToolRegistry.register`` (which requires a callable) has something to hold.
+    """
+    raise RuntimeError("advertised remote tool must dispatch over the wire, not locally")
 
 
 @dataclass
@@ -434,9 +451,71 @@ class Session:
                                     call_id,
                                     error=str(payload.get("error") or "remote tool failed"),
                                 )
+                elif typ == CLIENT_TOOL_ADVERTISE:
+                    self._handle_tool_advertise(payload)
         except Exception:
             logger.exception("voxedge event_loop error")
             state["client_closed"] = True
+
+    def _handle_tool_advertise(self, payload: dict) -> None:
+        """Register client-advertised tool schemas into the engine registry
+        as remote-dispatch tools (spec §4 Mode B / §6 handshake).
+
+        ``payload`` carries:
+          * ``tools``  — a list of OpenAI-style ``{"type":"function",
+            "function":{"name","description","parameters"}}`` dicts (the exact
+            shape ``ToolRegistry.list_openai_tools`` emits), OR bare
+            ``{"name","description","parameters"}`` dicts. Each becomes a
+            ``dispatch_mode="remote"`` tool with a no-op local handler (the
+            registry's remote path never calls ``fn``; execution is proxied to
+            the client over SERVER_TOOL_CALL).
+          * ``system_prompt`` — optional; overrides the engine system prompt for
+            this session (read per-turn by the tool pump).
+          * ``llm_params`` — optional dict merged into the engine LLM params.
+
+        No-op (logged) when no registry is wired (server loop off). Re-advertise
+        is allowed: a tool name already present is overwritten (re-registration),
+        and the schema set defines what the LLM sees from the next turn on."""
+        registry = self.engine.tool_registry
+        if registry is None:
+            logger.warning("tool_advertise ignored: no tool_registry (server loop off)")
+            return
+        tools = payload.get("tools") or []
+        registered: list[str] = []
+        for entry in tools:
+            if not isinstance(entry, dict):
+                continue
+            # Accept both the full {"type":"function","function":{...}} wrapper
+            # and a bare {"name","description","parameters"} dict.
+            fn_block = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+            name = fn_block.get("name")
+            if not name:
+                continue
+            schema = fn_block.get("parameters") or {"type": "object", "properties": {}}
+            description = fn_block.get("description", "")
+            if isinstance(schema, dict) and description and "description" not in schema:
+                schema = {**schema, "description": description}
+            registry.register(
+                name,
+                schema,
+                _advertised_remote_noop,
+                timeout_s=float(entry.get("timeout_s", 15.0)),
+                preamble_text=str(entry.get("preamble_text", "")),
+                completion_text=str(entry.get("completion_text", "")),
+                response_mode=str(entry.get("response_mode", "await")),
+                dispatch_mode="remote",
+            )
+            registered.append(name)
+        sys_prompt = payload.get("system_prompt")
+        if isinstance(sys_prompt, str) and sys_prompt:
+            self.engine.system_prompt = sys_prompt
+        llm_params = payload.get("llm_params")
+        if isinstance(llm_params, dict) and llm_params:
+            self.engine.llm_params = {**(self.engine.llm_params or {}), **llm_params}
+        logger.info(
+            "tool_advertise: registered %d remote tool(s) %s (system_prompt=%s)",
+            len(registered), registered, "set" if sys_prompt else "unchanged",
+        )
 
     async def _bargein_tts(self) -> None:
         """Cancel in-flight TTS + signal the synth thread to stop
