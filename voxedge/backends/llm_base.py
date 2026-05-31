@@ -1,7 +1,7 @@
 """LLM backend ABC + streaming delta — canonical engine-facing contract.
 
-Phase 1 of the tool-calling migration (docs/specs/tool-calling-engine-migration.md
-§2/§3). The voxedge tool runner needs the richer ``stream_events`` shape
+Phase 1 of the tool-calling migration. The voxedge tool runner needs the
+richer ``stream_events`` shape
 (text + tool_call deltas + finish), which already exists on
 :class:`voxedge.backends.base.LLMBackend` / :class:`LLMEvent`.
 

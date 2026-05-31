@@ -1,7 +1,7 @@
 """Backend execution coordinator (voxedge engine slot layer).
 
 Copied/adapted from app/core/coordinator.py, dedup after Phase 1b.
-Migrated per docs/specs/edge-voice-library-architecture.md §3.1 — the
+The
 "N=2 small-GPU doesn't crash" moat. stdlib-only (asyncio); no app imports.
 
 Execution mode drives slot acquire:
@@ -12,7 +12,7 @@ Execution mode drives slot acquire:
                   dormant backend's ``unload()`` before yielding. Best-effort:
                   backends not overriding ``unload()`` stay resident.
 
-Spec docs/specs/concurrency-capability-framework.md §4: backend capability is
+Backend capability is
 the ceiling, the requested mode is the floor. ``concurrent`` is permitted only
 when BOTH active backends declare a parallel-capable
 ``ConcurrencyCapability``. If either cannot run parallel, the mode is

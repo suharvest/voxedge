@@ -84,7 +84,7 @@ def test_bundled_sample_manifest_parses_and_includes_style_npy():
     spec = manifest.get("rk3588-kokoro-hybrid-2026-05-23")
     assert spec.backend_key == "rk.tts"
     assert spec.device == "rk3588"
-    assert spec.hf_repo == "harvestsu/seeed-local-voice-rk-artifacts"
+    assert spec.hf_repo == "example-org/example-artifacts"
     rels = [f.rel_path for f in spec.file_list]
     # style.npy MUST be present — demonstrates voice-pack preflight coverage.
     assert any(p.endswith("style.npy") for p in rels), rels

@@ -7,7 +7,7 @@
       "backend_key": "rk.tts",
       "device": "rk3588",
       "precision": "int8",
-      "hf_repo": "harvestsu/seeed-local-voice-rk-artifacts",
+      "hf_repo": "example-org/example-artifacts",
       "revision": "main",
       "sha256": "",
       "runtime_contract": {

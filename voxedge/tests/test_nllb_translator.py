@@ -2,7 +2,7 @@
 
 Heavy runtime (ctranslate2 / sentencepiece) is mocked — these tests assert the
 *contract*: env-free config, the ABC default methods, and especially the three
-real-device bugs (memory ``nllb_translator_service_bugs``):
+real-device tokenizer/runtime quirks (all handled here):
   1. ``EncodeAsPieces`` (not ``EncodeAsIds``)
   2. ``</s>`` + src_lang appended AFTER source pieces (not prefixed)
   3. ``device_index`` forced to ``int``

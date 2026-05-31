@@ -6,8 +6,7 @@ parses and validates a JSON manifest that describes the runtime artifacts a
 backend needs (engines / plugins / model weights / voice-pack sidecars), each
 pinned by SHA-256 and referenced by a stable ``artifact_ref`` name.
 
-Schema (generalised from the existing ``deploy/artifacts/rk_manifest.json``
-prototype; see spec ``docs/specs/voxedge-engine-overlay-and-artifacts.md`` §3):
+Schema (a backend-agnostic generalisation of a per-device artifact manifest):
 
     {
       "schema_version": 1,

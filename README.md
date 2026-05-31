@@ -4,8 +4,9 @@
 
 **Status: Phase 1a — pure-Python foundation (additive scaffolding only).**
 
-This package is the open-core extraction of the seeed-local-voice product stack.
-See `docs/specs/edge-voice-library-architecture.md` for the full architecture.
+voxedge is an edge-native library for low-latency, local-first real-time voice
+conversation. It was originally extracted as the open-core foundation of a
+production edge voice stack.
 
 ## What's here (Phase 1a)
 

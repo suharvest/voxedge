@@ -1,8 +1,7 @@
 """Concurrency capability descriptor for ASR/TTS backends.
 
 Copied/adapted from app/core/concurrency_capability.py, dedup after Phase 1b.
-This is the pure-Python "slot layer" descriptor migrated into voxedge per
-docs/specs/edge-voice-library-architecture.md §3.1 ("并发抽象(slot 层)归属").
+This is the pure-Python "slot layer" descriptor migrated into voxedge.
 The dataclass is byte-equivalent to the app/core original (zero coupling —
 no env, no registry, no app imports).
 
@@ -10,8 +9,7 @@ Describes runtime concurrency properties (separate from feature capabilities
 such as ``STREAMING``) so the coordinator can derive ceilings from backend
 reality instead of profile-only defaults.
 
-See ``docs/specs/concurrency-capability-framework.md`` (Section 1) for the
-full field semantics.
+See the field docstrings below for the full semantics.
 """
 
 from __future__ import annotations

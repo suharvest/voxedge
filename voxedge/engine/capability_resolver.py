@@ -1,7 +1,7 @@
 """Concurrency-capability resolver (voxedge engine slot layer).
 
 Copied/adapted from app/core/capability_resolver.py, dedup after Phase 1b.
-Migrated per docs/specs/edge-voice-library-architecture.md §3.1 — only the
+Only the
 parts the engine's slot orchestration actually needs are ported; the rest is
 left as TODO (see below).
 

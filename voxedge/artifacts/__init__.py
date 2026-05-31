@@ -1,6 +1,6 @@
 """Backend-agnostic runtime artifact manifest + env-free download helper.
 
-See ``docs/specs/voxedge-engine-overlay-and-artifacts.md`` §3. The package is
+The package is
 pure-Python and env-free; ``huggingface_hub`` is an optional dependency only
 needed for the default network downloader (``voxedge[artifacts]``).
 

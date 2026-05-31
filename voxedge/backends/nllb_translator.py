@@ -5,9 +5,8 @@ Env-free port of ``services/translator/server.py`` onto the voxedge
 ``sentencepiece``) are deferred to :meth:`preload` so the pure-Python core stays
 installable on a CUDA-less / x86_64 dev box without the ``translator`` extra.
 
-The translate path bakes in the three bugs that only surfaced on real-device
-e2e (memory ``nllb_translator_service_bugs``, fixed in seeed-local-voice
-commit ``afa4296``):
+The translate path bakes in three tokenizer/runtime quirks that only surfaced
+on real-device e2e (all handled here):
 
   1. tokenize with ``EncodeAsPieces`` (piece STRINGS), NOT ``EncodeAsIds`` —
      CT2 ``translate_batch`` expects token pieces, not int IDs.

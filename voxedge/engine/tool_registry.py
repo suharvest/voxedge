@@ -1,7 +1,6 @@
 """Engine-owned tool registry + ``@tool`` decorator (Phase 1).
 
-Ported from ``agent/openvoicestream_agent/tools/registry.py`` (see
-docs/specs/tool-calling-engine-migration.md §2/§3). Builds OpenAI-style
+Ported from an in-process agent tool registry. Builds OpenAI-style
 ``tools[]`` schemas from Python type hints and dispatches function calls
 (sync or async) with per-tool timeout + error isolation. Designed for local,
 in-process tools — every entry is trusted code in the same Python process
