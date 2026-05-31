@@ -63,6 +63,11 @@ logger = logging.getLogger(__name__)
 #   EDGE_LLM_TTS_WORKER_BIN                           → worker_binary
 #   EDGELLM_PLUGIN_PATH                              → plugin_path
 #   EDGE_LLM_TTS_TALKER_DIR                           → talker_dir
+#   EDGE_LLM_TTS_TALKER_BACKEND                       → talker_backend ("")         ← explicit-KV worker flag
+#   EDGE_LLM_TTS_TALKER_ENGINE                        → talker_engine ("")          ← explicit-KV worker flag
+#   EDGE_LLM_TTS_CODE_PREDICTOR_BACKEND               → code_predictor_backend ("") ← explicit-KV worker flag
+#   EDGE_LLM_TTS_TEXT_PROJECTION                      → text_projection ("")        ← explicit-KV worker flag
+#   EDGE_LLM_TTS_PROMPT_KV_CACHE                      → prompt_kv_cache ("")         ← explicit-KV worker flag
 #   EDGE_LLM_TTS_CP_DIR                              → code_predictor_dir
 #   EDGE_LLM_TTS_TOKENIZER_DIR                       → tokenizer_dir
 #   EDGE_LLM_TTS_CODE2WAV_DIR                        → code2wav_dir
@@ -112,6 +117,23 @@ class TRTEdgeLLMTTSConfig:
     worker_binary: str = ""
     plugin_path: str = ""
     talker_dir: str = ""
+    # Explicit-KV (highperf) worker flags. When set, ``_ensure_worker`` passes the
+    # corresponding ``--qwen3Tts*`` / ``--codePredictor*`` flags to the C++
+    # ``qwen3_tts_worker`` so a single-optimization-profile w8a16 talker engine is
+    # loaded by the explicit-KV runner instead of the generic 2-profile
+    # ``LLMEngineRunner`` (which rejects the single-profile engine). Each is
+    # emitted independently; empty → flag omitted (legacy generic-runner path,
+    # byte-equivalent at N=1). Mirrors profiling patch a9995c6c.
+    #   talker_backend         → --qwen3TtsTalkerBackend
+    #   talker_engine          → --qwen3TtsTalkerEngine
+    #   code_predictor_backend → --codePredictorBackend
+    #   text_projection        → --qwen3TtsTextProjection
+    #   prompt_kv_cache        → --qwen3TtsPromptKvCache
+    talker_backend: str = ""
+    talker_engine: str = ""
+    code_predictor_backend: str = ""
+    text_projection: str = ""
+    prompt_kv_cache: str = ""
     code_predictor_dir: str = ""
     tokenizer_dir: str = ""
     code2wav_dir: str = ""
@@ -555,6 +577,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         # Artifact paths captured from the injected config (was resolved from
         # the current env at __init__ in the production copy).
         self._talker_dir = self._config.talker_dir
+        self._talker_backend = (self._config.talker_backend or "").strip()
+        self._talker_engine = (self._config.talker_engine or "").strip()
+        self._code_predictor_backend = (self._config.code_predictor_backend or "").strip()
+        self._text_projection = (self._config.text_projection or "").strip()
+        self._prompt_kv_cache = (self._config.prompt_kv_cache or "").strip()
         self._code_predictor_dir = self._config.code_predictor_dir
         self._tokenizer_dir = self._config.tokenizer_dir
         self._speaker_encoder = self._config.speaker_encoder
@@ -743,6 +770,28 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             else:
                 logger.debug("TTS worker stderr: %s", line.rstrip())
 
+    def _explicit_kv_flags(self) -> list:
+        """Explicit-KV (highperf) worker CLI flags for the C++ ``qwen3_tts_worker``.
+
+        Each flag is emitted independently when its config field is set, so a
+        single-optimization-profile w8a16 talker engine is loaded by the
+        explicit-KV runner instead of the generic 2-profile ``LLMEngineRunner``.
+        All-empty (default) → no flags (legacy generic-runner path, byte-equivalent
+        at N=1). Mirrors profiling patch a9995c6c.
+        """
+        flags: list = []
+        if self._talker_backend:
+            flags += ["--qwen3TtsTalkerBackend", self._talker_backend]
+        if self._talker_engine:
+            flags += ["--qwen3TtsTalkerEngine", self._talker_engine]
+        if self._code_predictor_backend:
+            flags += ["--codePredictorBackend", self._code_predictor_backend]
+        if self._text_projection:
+            flags += ["--qwen3TtsTextProjection", self._text_projection]
+        if self._prompt_kv_cache:
+            flags += ["--qwen3TtsPromptKvCache", self._prompt_kv_cache]
+        return flags
+
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.poll() is None:
             return
@@ -754,6 +803,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "--tokenizerDir", self._tokenizer_dir,
             "--code2wavEngineDir", self._code2wav_dir,
         ]
+        cmd += self._explicit_kv_flags()
         # Only emit --max_slots when N>1 (main fix b1cb1a5): at N=1 omit it for
         # legacy single-slot byte-equivalent behavior + back-compat with older
         # worker binaries that reject the unknown flag.
@@ -1257,6 +1307,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 "--outputFile", output_path,
                 "--outputAudioDir", audio_dir,
             ]
+            # Explicit-KV (highperf) flags — see _explicit_kv_flags.
+            cli_args += self._explicit_kv_flags()
 
             c2w_path = _code2wav_engine_path(self._code2wav_dir)
             if os.path.exists(c2w_path):
