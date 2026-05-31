@@ -92,6 +92,9 @@ CLIENT_TEXT = "text"
 CLIENT_ASR_EOS = "asr_eos"
 CLIENT_TTS_FLUSH = "tts_flush"
 CLIENT_ABORT = "abort"
+# Remote-tool wire (spec §4 Mode B): the client returns a tool result that the
+# engine routes back to the awaiting remote-dispatch future via resolve_remote.
+CLIENT_TOOL_RESULT = "tool_result"
 
 SERVER_ASR_PARTIAL = "asr_partial"
 SERVER_ASR_ENDPOINT = "asr_endpoint"
@@ -101,6 +104,9 @@ SERVER_TTS_SENTENCE_DONE = "tts_sentence_done"
 SERVER_TTS_DONE = "tts_done"
 SERVER_VAD_EVENT = "vad_event"
 SERVER_ERROR = "error"
+# Remote-tool wire (spec §4 Mode B): server asks a remote device client to run
+# a tool and report back via CLIENT_TOOL_RESULT.
+SERVER_TOOL_CALL = "tool_call"
 
 VAD_EVENT_SPEECH_START = "speech_start"
 VAD_EVENT_SPEECH_END = "speech_end"
@@ -409,6 +415,25 @@ class Session:
                         await self._asr_mgr.cancel("abort")
                         state["asr_active"] = False
                         state["asr_turn_started_at"] = None
+                elif typ == CLIENT_TOOL_RESULT:
+                    # Remote-tool wire (spec §4 Mode B): route a device client's
+                    # tool result back to the awaiting _dispatch_remote future.
+                    # ``ok=false`` carries an error string; unknown/late call_id
+                    # is safely ignored by resolve_remote.
+                    registry = self.engine.tool_registry
+                    if registry is not None:
+                        call_id = payload.get("call_id") or payload.get("id")
+                        if call_id:
+                            ok = payload.get("ok", True)
+                            if ok:
+                                registry.resolve_remote(
+                                    call_id, result=payload.get("result")
+                                )
+                            else:
+                                registry.resolve_remote(
+                                    call_id,
+                                    error=str(payload.get("error") or "remote tool failed"),
+                                )
         except Exception:
             logger.exception("voxedge event_loop error")
             state["client_closed"] = True
@@ -728,6 +753,13 @@ class Session:
         """
         registry = self.engine.tool_registry
         tools_schema = registry.list_openai_tools() or None
+        # Prepend the server-loop system prompt (spec §5). Done once on the
+        # working message list so every round re-sends the same prefix (keeps
+        # the edge-LLM prefix cache stable — append-only history per §8).
+        sys_prompt = self.engine.system_prompt
+        if sys_prompt and not (messages and messages[0].get("role") == "system"):
+            messages = [{"role": "system", "content": sys_prompt}, *messages]
+        llm_params = self.engine.llm_params
         ctx = ToolContext(
             session_id=getattr(self.transport, "session_id", None),
             conversation=self,
@@ -746,7 +778,7 @@ class Session:
                 preamble_fired: set[str] = set()  # tool names already spoken
 
                 async for ev in self._llm_be.stream_events(
-                    messages, tools=tools_schema
+                    messages, tools=tools_schema, **llm_params
                 ):
                     if ev.kind == "text" and ev.text:
                         text_chunks.append(ev.text)
@@ -1167,6 +1199,8 @@ class ConversationEngine:
         *,
         tool_registry: Optional[Any] = None,
         max_tool_rounds: int = 5,
+        system_prompt: Optional[str] = None,
+        llm_params: Optional[dict] = None,
         multi_utterance: bool = False,
         timeouts: Optional[dict] = None,
         silence_ms: int = 400,
@@ -1181,6 +1215,12 @@ class ConversationEngine:
         self.backends = backends
         self.tool_registry = tool_registry
         self.max_tool_rounds = max_tool_rounds
+        # Server-loop system prompt + LLM params (spec §2/§5). Injected by the
+        # product (env/config/profile) — the engine never reads env itself.
+        # Used only on the tool-pump path; the no-tool plain-text path is
+        # unaffected (Phase 1 contract).
+        self.system_prompt = system_prompt
+        self.llm_params = dict(llm_params or {})
         self.multi_utterance = multi_utterance
         self.timeouts = timeouts or {}
         self.silence_ms = silence_ms

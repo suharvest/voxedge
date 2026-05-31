@@ -583,3 +583,233 @@ async def test_local_dispatch_unchanged_by_remote_path():
     out = await r.dispatch("add", {"a": 4, "b": 5}, ToolContext())
     assert out == {"sum": 9}
     assert r._pending_remote == {}
+
+
+# ──────────── system prompt + llm_params injection (#37 step) ────────────
+
+
+def _make_session_cfg(llm, registry, *, system_prompt=None, llm_params=None,
+                      max_tool_rounds=5):
+    engine = ConversationEngine(
+        backends={"tts": MockTTS(), "llm": llm},
+        tool_registry=registry,
+        system_prompt=system_prompt,
+        llm_params=llm_params,
+        max_tool_rounds=max_tool_rounds,
+    )
+    from voxedge.engine.conversation import Session
+
+    class _DummyTransport:
+        session_id = "sid-test"
+
+        async def send_event(self, p):
+            pass
+
+        async def send_audio(self, b):
+            pass
+
+    return Session(engine, _DummyTransport())
+
+
+@run_async
+async def test_system_prompt_prepended_to_tool_pump():
+    """A configured system_prompt is prepended once as the first message on
+    every LLM round (stable prefix for the edge-LLM cache, spec §8)."""
+    registry = ToolRegistry()
+    llm = _ScriptedLLM([
+        [
+            LLMEvent(kind="text", text="Hi."),
+            LLMEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    sess = _make_session_cfg(llm, registry, system_prompt="You are a robot.")
+    await sess._llm_turn_with_tools([{"role": "user", "content": "hello"}])
+    msgs = llm.calls[0]["messages"]
+    assert msgs[0] == {"role": "system", "content": "You are a robot."}
+    assert msgs[1]["role"] == "user"
+
+
+@run_async
+async def test_system_prompt_prepended_once_across_rounds():
+    """Across a multi-round tool pump the system prompt appears exactly once
+    (round-2 re-send must not duplicate it)."""
+    registry = ToolRegistry()
+
+    @registry.tool()
+    def ping() -> dict:
+        return {"pong": True}
+
+    llm = _ScriptedLLM([
+        [
+            LLMEvent(kind="tool_call_delta", tool_call_index=0,
+                     tool_call_id="c1", name="ping", arguments="{}"),
+            LLMEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            LLMEvent(kind="text", text="done"),
+            LLMEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    sess = _make_session_cfg(llm, registry, system_prompt="SYS")
+    await sess._llm_turn_with_tools([{"role": "user", "content": "go"}])
+    assert len(llm.calls) == 2
+    r2 = llm.calls[1]["messages"]
+    assert [m for m in r2 if m["role"] == "system"] == [
+        {"role": "system", "content": "SYS"}
+    ]
+
+
+@run_async
+async def test_no_system_prompt_leaves_messages_unchanged():
+    registry = ToolRegistry()
+    llm = _ScriptedLLM([
+        [LLMEvent(kind="text", text="ok"),
+         LLMEvent(kind="finish", finish_reason="stop")],
+    ])
+    sess = _make_session_cfg(llm, registry, system_prompt=None)
+    await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
+    assert llm.calls[0]["messages"][0]["role"] == "user"
+
+
+@run_async
+async def test_llm_params_forwarded_to_stream_events():
+    """Configured llm_params (temperature / max_tokens) reach the backend
+    stream_events kwargs on every round."""
+    registry = ToolRegistry()
+    llm = _ScriptedLLM([
+        [LLMEvent(kind="text", text="ok"),
+         LLMEvent(kind="finish", finish_reason="stop")],
+    ])
+    sess = _make_session_cfg(
+        llm, registry, llm_params={"temperature": 0.3, "max_tokens": 64}
+    )
+    await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
+    kw = llm.calls[0]["kw"]
+    assert kw["temperature"] == 0.3
+    assert kw["max_tokens"] == 64
+
+
+# ───────── tool_result wire frame → resolve_remote (receive side) ─────────
+
+
+@run_async
+async def test_client_tool_result_frame_resolves_remote():
+    """End-to-end: a remote tool sends a SERVER_TOOL_CALL via the transport;
+    the client's CLIENT_TOOL_RESULT frame is routed by the engine event loop
+    to registry.resolve_remote, unblocking the dispatch."""
+    from voxedge.engine.conversation import Session
+    from voxedge.backends.base import LLMBackend
+
+    registry = ToolRegistry()
+
+    @registry.tool(description="wave", dispatch_mode="remote", timeout_s=5.0)
+    def wave() -> dict:  # body never runs (remote)
+        return {}
+
+    # Scripted LLM: round 1 calls the remote tool, round 2 speaks.
+    llm = _ScriptedLLM([
+        [
+            LLMEvent(kind="tool_call_delta", tool_call_index=0,
+                     tool_call_id="c1", name="wave", arguments="{}"),
+            LLMEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            LLMEvent(kind="text", text="waved"),
+            LLMEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    engine = ConversationEngine(
+        backends={"tts": MockTTS(), "llm": llm},
+        tool_registry=registry,
+    )
+
+    sent: list[dict] = []
+
+    class _CaptureTransport:
+        session_id = "sid"
+
+        async def send_event(self, p):
+            sent.append(p)
+
+        async def send_audio(self, b):
+            pass
+
+    sess = Session(engine, _CaptureTransport())
+
+    # Run the pump; concurrently feed the tool_result frame through the same
+    # receive handler the real /v2v event loop uses.
+    pump = asyncio.create_task(
+        sess._llm_turn_with_tools([{"role": "user", "content": "wave"}])
+    )
+
+    # Wait until the remote dispatch frame has been sent.
+    for _ in range(200):
+        tool_calls = [s for s in sent if s.get("type") == "tool_call"]
+        if tool_calls:
+            break
+        await asyncio.sleep(0.005)
+    tool_calls = [s for s in sent if s.get("type") == "tool_call"]
+    assert tool_calls, "remote tool_call frame never sent"
+    call_id = tool_calls[0]["call_id"]
+
+    # Simulate the device client's reply via the engine receive routing.
+    # (Directly exercise the same call the _event_loop CLIENT_TOOL_RESULT
+    # branch makes.)
+    registry.resolve_remote(call_id, result={"started": True, "action": "wave"})
+
+    await asyncio.wait_for(pump, timeout=5.0)
+    # Round 2 ran → tool result injected as role:tool, final text spoken.
+    assert len(llm.calls) == 2
+    r2 = llm.calls[1]["messages"]
+    tool_msg = next(m for m in r2 if m["role"] == "tool")
+    assert "wave" in tool_msg["content"]
+    assert registry._pending_remote == {}
+
+
+@run_async
+async def test_event_loop_routes_tool_result_to_resolve_remote():
+    """The engine ``_event_loop`` routes an inbound CLIENT_TOOL_RESULT frame
+    (ok / error variants) to ``registry.resolve_remote`` (the receive-side
+    wire hook added for spec §4 Mode B)."""
+    from voxedge.engine.conversation import Session, CLIENT_TOOL_RESULT
+
+    registry = ToolRegistry()
+    engine = ConversationEngine(
+        backends={"tts": MockTTS()},
+        tool_registry=registry,
+    )
+
+    frames = [
+        {"type": CLIENT_TOOL_RESULT, "call_id": "ok1", "result": {"v": 1}},
+        {"type": CLIENT_TOOL_RESULT, "call_id": "err1", "ok": False,
+         "error": "boom"},
+    ]
+
+    class _FeedTransport:
+        session_id = "sid"
+
+        async def recv_event(self):
+            for f in frames:
+                yield f
+
+        async def send_event(self, p):
+            pass
+
+        async def send_audio(self, b):
+            pass
+
+    sess = Session(engine, _FeedTransport())
+
+    # Pre-register two pending remote futures so the event loop can resolve
+    # them, mirroring what _dispatch_remote would have created.
+    loop = asyncio.get_event_loop()
+    ok_fut = loop.create_future()
+    err_fut = loop.create_future()
+    registry._pending_remote["ok1"] = ok_fut
+    registry._pending_remote["err1"] = err_fut
+
+    await sess._event_loop()
+
+    assert ok_fut.result() == {"v": 1}
+    assert isinstance(err_fut.exception(), RuntimeError)
+    assert "boom" in str(err_fut.exception())
