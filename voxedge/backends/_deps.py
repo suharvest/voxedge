@@ -90,3 +90,11 @@ def check_sherpa_deps() -> None:
 def check_rk_deps() -> None:
     """Fail fast with a friendly error if the ``rk`` extra is missing."""
     require_all([("rkvoice_stream", "rkvoice-stream")], extra="rk")
+
+
+def check_translator_deps() -> None:
+    """Fail fast with a friendly error if the ``translator`` extra is missing."""
+    require_all(
+        [("ctranslate2", "ctranslate2"), ("sentencepiece", "sentencepiece")],
+        extra="translator",
+    )

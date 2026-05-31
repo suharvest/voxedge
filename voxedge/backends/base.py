@@ -321,6 +321,117 @@ class VADBackend(ABC):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Translator
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TranslatorCapability(str, Enum):
+    """Capabilities a translation backend may advertise.
+
+    Mirrors the ASR/TTS capability-enum style — a small, env-free vocabulary
+    the capability resolver / callers can query via :meth:`has_capability`.
+    """
+
+    TEXT = "text"
+    MULTI_LANGUAGE = "multi_language"
+    BATCH = "batch"
+    STREAMING = "streaming"
+
+
+@dataclass
+class TranslatorConfig:
+    """Explicit, env-free construction parameters for a translator backend.
+
+    Mirrors the production ``services/translator/server.py`` env reads
+    (``TRANSLATOR_MODEL_PATH`` / ``TRANSLATOR_DEVICE`` / ``TRANSLATOR_DEVICE_INDEX``
+    …) but as plain fields — voxedge never reads ``os.environ``; callers pass
+    a fully-resolved config.
+    """
+
+    model_path: str
+    src_lang: str = "zho_Hans"
+    tgt_lang: str = "eng_Latn"
+    device: str = "cuda"
+    device_index: int = 0
+    compute_type: str = "default"
+    beam_size: int = 1
+    max_batch_size: int = 1
+
+
+@dataclass
+class TranslationResult:
+    """One translation output. Mirrors :class:`TranscriptionResult` style."""
+
+    text: str
+    src_lang: str
+    tgt_lang: str
+    meta: Optional[dict] = None
+
+
+class TranslatorBackend(ABC):
+    """Text-to-text translation backend.
+
+    Env-free, pure-config-driven — mirrors :class:`ASRBackend` /
+    :class:`TTSBackend`. Concrete backends are constructed with an explicit
+    :class:`TranslatorConfig`; nothing here reads ``os.environ`` or a profile.
+    """
+
+    # Backends whose unload() truly releases GPU/NPU resources set True.
+    supports_hot_reload: bool = False
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        ...
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> set[TranslatorCapability]:
+        ...
+
+    @abstractmethod
+    def is_ready(self) -> bool:
+        ...
+
+    @abstractmethod
+    def preload(self) -> None:
+        """Load models and warm up. Called once before use."""
+        ...
+
+    @abstractmethod
+    def translate(
+        self,
+        text: str,
+        src_lang: Optional[str] = None,
+        tgt_lang: Optional[str] = None,
+    ) -> TranslationResult:
+        """Translate ``text``. ``src_lang`` / ``tgt_lang`` default to config."""
+        ...
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        src_lang: Optional[str] = None,
+        tgt_lang: Optional[str] = None,
+    ) -> list[TranslationResult]:
+        """Translate several texts. Requires BATCH capability."""
+        raise NotImplementedError(
+            f"Backend '{self.name}' does not support batch translation"
+        )
+
+    def has_capability(self, cap: TranslatorCapability) -> bool:
+        return cap in self.capabilities
+
+    def unload(self) -> None:
+        """Release GPU/NPU resources. Default no-op."""
+
+    def concurrency_capability(self) -> "ConcurrencyCapability":
+        """See :meth:`ASRBackend.concurrency_capability`."""
+        from voxedge.engine.concurrency_capability import ConcurrencyCapability
+        return ConcurrencyCapability.default()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # LLM  (contract reproduced from agent/openvoicestream_agent/llm/base.py)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -396,6 +507,10 @@ __all__ = [
     "TTSBackend",
     "VADSession",
     "VADBackend",
+    "TranslatorCapability",
+    "TranslatorConfig",
+    "TranslationResult",
+    "TranslatorBackend",
     "LLMEvent",
     "LLMBackend",
 ]

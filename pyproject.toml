@@ -87,6 +87,17 @@ jetson = [
     "tokenizers>=0.15",    # Qwen3 BPE tokenizer (qwen3_trt)
     "webrtcvad>=2.0.10",   # trt_edge_llm long-audio silence splitter (energy RMS fallback if absent)
 ]
+# Installing `voxedge[translator]` pulls the NLLB-200 text translation adapter
+# in `voxedge/backends/nllb_translator.py` — a thin Python wrapper over the
+# CTranslate2 runtime + SentencePiece tokenizer. The adapter imports both
+# LAZILY (inside preload()), so the core stays installable without this extra.
+# On Jetson the CUDA-linked CTranslate2 wheel ships from a bare-metal build
+# (memory nllb_translator_slim_cuda_jetson), NOT pypi (pypi arm64 is CPU-only);
+# `sentencepiece` is the pure tokenizer dep.
+translator = [
+    "ctranslate2>=4.0",
+    "sentencepiece>=0.1.99",
+]
 # Sentence-boundary splitting upgrade (pure Python, ~100 KB). Optional because
 # voxedge ships a regex fallback when pysbd is absent (mirrors app/core/v2v.py).
 text = [
