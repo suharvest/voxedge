@@ -292,6 +292,13 @@ class Session:
             "asr_turn_started_at": None,
         }
         self._work_tasks: list[asyncio.Task] = []
+        # Server-loop LLM prefix warm-up state. The agent skips its local LLM
+        # warmup in server-loop mode (the LLM runs here), so voxedge primes
+        # edge-llm's prefix cache + CUDA graph once the advertised system_prompt
+        # + tools are known (see _maybe_warm_llm_prefix). Track the last warmed
+        # prefix signature so reconnect re-advertises don't re-warm needlessly.
+        self._warmed_prefix_sig: "tuple | None" = None
+        self._warm_task: "asyncio.Task | None" = None
 
     def _make_tts_buffer(self):
         """Build the TTS chunk buffer for this session (engine-parity #15).
@@ -528,6 +535,63 @@ class Session:
             "tool_advertise: registered %d remote tool(s) %s (system_prompt=%s)",
             len(registered), registered, "set" if sys_prompt else "unchanged",
         )
+        # Warm-up regression fix: in server-loop the agent skips its local LLM
+        # warmup (LLM runs here), so prime edge-llm now that the real prefix
+        # (system_prompt + tools) is known — otherwise the FIRST user turn pays
+        # a cold prefill + CUDA-graph capture. Fire-and-forget, gated per prefix
+        # signature so reconnect re-advertises don't re-warm.
+        self._maybe_warm_llm_prefix(registered)
+
+    def _maybe_warm_llm_prefix(self, tool_names: list[str]) -> None:
+        """Schedule a one-shot edge-llm prefix warm-up if the advertised prefix
+        (system_prompt + tool set) hasn't been warmed yet. Fire-and-forget."""
+        if self._llm_be is None or self.engine.tool_registry is None:
+            return
+        sig = (self.engine.system_prompt or "", tuple(sorted(tool_names)))
+        if sig == self._warmed_prefix_sig:
+            return
+        self._warmed_prefix_sig = sig
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop (shouldn't happen here)
+            return
+        if self._warm_task is not None and not self._warm_task.done():
+            self._warm_task.cancel()
+        self._warm_task = asyncio.create_task(self._warm_llm_prefix())
+
+    async def _warm_llm_prefix(self) -> None:
+        """Drive one throwaway LLM request with the real system_prompt + tools
+        so edge-llm caches the KV prefix and captures its CUDA graph here, not
+        on the user's first command. Best-effort: any failure is logged and
+        swallowed (the first real turn just pays cold-start)."""
+        try:
+            registry = self.engine.tool_registry
+            if registry is None or self._llm_be is None:
+                return
+            tools_schema = registry.list_openai_tools() or None
+            messages: list[dict[str, Any]] = []
+            if self.engine.system_prompt:
+                messages.append({"role": "system", "content": self.engine.system_prompt})
+            messages.append({"role": "user", "content": "hi"})
+            # Same sampling params the real turn uses, but cap generation — we
+            # only need the prefill + graph capture, not a full reply.
+            params = dict(self.engine.llm_params or {})
+            params["max_tokens"] = 1
+            t0 = self._loop.time()
+            n = 0
+            async for _ev in self._llm_be.stream_events(messages, tools=tools_schema, **params):
+                n += 1
+            logger.info(
+                "server-loop: edge-llm prefix warm-up done in %.2fs (%d events, %d tool(s))",
+                self._loop.time() - t0, n, len(tools_schema or []),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.info(
+                "server-loop: edge-llm prefix warm-up failed (non-fatal — first "
+                "turn pays cold-start)", exc_info=True,
+            )
 
     async def _bargein_tts(self) -> None:
         """Stop everything the current turn is producing and discard any
@@ -1350,6 +1414,10 @@ class Session:
             for t in work_tasks:
                 if not t.done():
                     t.cancel()
+            # Cancel a still-running prefix warm-up so it doesn't outlive the
+            # session (fire-and-forget; harmless if already done).
+            if self._warm_task is not None and not self._warm_task.done():
+                self._warm_task.cancel()
             # (b) signal the synth thread to bail so the TTS executor frees up
             # (app/main.py:3513-3517).
             stop = self.state.get("current_tts_stop")
@@ -1360,8 +1428,9 @@ class Session:
                     pass
             # (c) await the cancelled work tasks before releasing the backend
             # slot (app/main.py:3518-3528, race #6).
+            _extra = [self._warm_task] if self._warm_task is not None else []
             await asyncio.gather(
-                end_watcher, *recv_tasks, *work_tasks, return_exceptions=True
+                end_watcher, *recv_tasks, *work_tasks, *_extra, return_exceptions=True
             )
             # (d) cancel any in-flight ASR utterance so the worker doesn't
             # leak the session (app/main.py:3529-3535).
