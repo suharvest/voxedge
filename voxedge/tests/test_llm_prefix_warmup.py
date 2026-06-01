@@ -127,6 +127,37 @@ async def test_no_warmup_without_llm_backend():
     assert s._warm_task is None, "no LLM backend → no warm-up scheduled"
 
 
+class FlakyLLM(RecordingLLM):
+    """Fails the first warm-up, succeeds after — to prove a failed warm-up
+    doesn't permanently suppress retries (signature is set on success only)."""
+
+    def __init__(self, fail_first: int = 1):
+        super().__init__()
+        self.fail_first = fail_first
+
+    async def stream_events(self, messages, *, tools=None, **kw) -> AsyncIterator[LLMEvent]:
+        self.calls.append({"messages": messages, "tools": tools, "kw": kw})
+        if len(self.calls) <= self.fail_first:
+            raise RuntimeError("simulated edge-llm warm-up failure")
+        yield LLMEvent(kind="finish", finish_reason="stop")
+
+
+@run_async
+async def test_failed_warmup_retries_on_next_advertise():
+    llm = FlakyLLM(fail_first=1)
+    s = _session_with_llm(llm)
+    # First advertise: warm-up fails (swallowed) → signature must stay UNSET.
+    s._handle_tool_advertise(_advertise_payload(["wave"]))
+    await s._warm_task
+    assert s._warmed_prefix_sig is None, "failed warm-up must not mark the prefix warmed"
+    # Same prefix re-advertised (e.g. reconnect) → must RETRY, not be suppressed.
+    s._handle_tool_advertise(_advertise_payload(["wave"]))
+    assert s._warm_task is not None
+    await s._warm_task
+    assert len(llm.calls) == 2, "failed warm-up should retry on the next advertise"
+    assert s._warmed_prefix_sig is not None, "successful retry must mark warmed"
+
+
 @run_async
 async def test_no_warmup_without_registry():
     llm = RecordingLLM()

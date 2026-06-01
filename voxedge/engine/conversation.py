@@ -549,21 +549,28 @@ class Session:
             return
         sig = (self.engine.system_prompt or "", tuple(sorted(tool_names)))
         if sig == self._warmed_prefix_sig:
+            return  # already warmed (success)
+        # A warm-up is already in flight → let it finish rather than cancel +
+        # relaunch (a reconnect storm would otherwise thrash it). The next
+        # advertise re-checks the signature once it completes.
+        if self._warm_task is not None and not self._warm_task.done():
             return
-        self._warmed_prefix_sig = sig
         try:
             asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - no loop (shouldn't happen here)
             return
-        if self._warm_task is not None and not self._warm_task.done():
-            self._warm_task.cancel()
-        self._warm_task = asyncio.create_task(self._warm_llm_prefix())
+        # NOTE: _warmed_prefix_sig is set inside _warm_llm_prefix ON SUCCESS
+        # only — if the warm-up fails/cancels, the signature stays unset so a
+        # later advertise retries instead of being permanently suppressed.
+        self._warm_task = asyncio.create_task(self._warm_llm_prefix(sig))
 
-    async def _warm_llm_prefix(self) -> None:
+    async def _warm_llm_prefix(self, sig) -> None:
         """Drive one throwaway LLM request with the real system_prompt + tools
         so edge-llm caches the KV prefix and captures its CUDA graph here, not
-        on the user's first command. Best-effort: any failure is logged and
-        swallowed (the first real turn just pays cold-start)."""
+        on the user's first command. Marks ``sig`` warmed ONLY on success, so a
+        failed/cancelled warm-up doesn't permanently suppress future retries.
+        Best-effort: any failure is logged and swallowed (the first real turn
+        just pays cold-start)."""
         try:
             registry = self.engine.tool_registry
             if registry is None or self._llm_be is None:
@@ -581,6 +588,7 @@ class Session:
             n = 0
             async for _ev in self._llm_be.stream_events(messages, tools=tools_schema, **params):
                 n += 1
+            self._warmed_prefix_sig = sig  # mark warmed only after success
             logger.info(
                 "server-loop: edge-llm prefix warm-up done in %.2fs (%d events, %d tool(s))",
                 self._loop.time() - t0, n, len(tools_schema or []),
@@ -590,7 +598,7 @@ class Session:
         except Exception:
             logger.info(
                 "server-loop: edge-llm prefix warm-up failed (non-fatal — first "
-                "turn pays cold-start)", exc_info=True,
+                "turn pays cold-start; will retry on next advertise)", exc_info=True,
             )
 
     async def _bargein_tts(self) -> None:
@@ -1024,6 +1032,12 @@ class Session:
 
                 # No tool call → terminal text answer. Flush + done.
                 if not tool_accs or finish_reason != "tool_calls":
+                    # A barge-in can land in the await between the last stream
+                    # event and here (the per-event guard above won't catch it).
+                    # Don't flush stale text onto the freshly-drained queue —
+                    # _bargein_tts owns cleanup for the interrupted turn.
+                    if self.state.get("llm_barged"):
+                        return
                     final_text = "".join(text_chunks)
                     if final_text:
                         messages.append({"role": "assistant", "content": final_text})
@@ -1125,6 +1139,8 @@ class Session:
 
             # Iteration cap hit — flush whatever was spoken and finish.
             logger.warning("voxedge tool loop hit max_tool_rounds=%d", max_rounds)
+            if self.state.get("llm_barged"):
+                return
             for sentence in self._tts_buffer.flush():
                 await self._tts_q.put(sentence)
             self.state["tts_flush"] = True
