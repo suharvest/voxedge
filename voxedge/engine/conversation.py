@@ -273,6 +273,19 @@ class Session:
             "endpoint_pending_gen": None,
             "current_tts_task": None,
             "current_tts_stop": None,
+            # #2: handle to the in-flight server-loop LLM/tool turn so a
+            # barge-in can stop it (cooperatively — see ``llm_barged``) and
+            # _asr_out_task can move on to the next utterance instead of
+            # blocking on a turn whose (slow) round2 the user just interrupted.
+            "current_llm_task": None,
+            # #2: cooperative barge-in flag. task.cancel() alone is unsafe
+            # here — _dispatch_remote swallows CancelledError (returns a
+            # "cancelled" result) so a cancel landing mid remote-dispatch would
+            # NOT stop the turn. The turn polls this flag at each checkpoint
+            # (per stream event / per round / after dispatch) and self-
+            # terminates; _bargein_tts also cancel_pending_remote() to unblock
+            # an in-flight remote await fast.
+            "llm_barged": False,
             "tts_flush": False,
             "tts_started": False,
             # M1: per-ASR-turn wall-clock deadline anchor (app/main.py:2790).
@@ -422,12 +435,12 @@ class Session:
                     if not multi:
                         state["asr_session_closed"] = True
                 elif typ == CLIENT_ABORT:
+                    # _bargein_tts now owns the full TTS cleanup (cancel synth +
+                    # LLM turn, drain queue, reset buffer) for both barge-in
+                    # paths. Here we additionally cancel the ASR turn — the user
+                    # explicitly aborted, so (unlike VAD SPEECH_START) no new
+                    # utterance is being opened.
                     await self._bargein_tts()
-                    while not self._tts_q.empty():
-                        try:
-                            self._tts_q.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
                     if self._asr_mgr is not None and state["asr_active"]:
                         await self._asr_mgr.cancel("abort")
                         state["asr_active"] = False
@@ -517,22 +530,54 @@ class Session:
         )
 
     async def _bargein_tts(self) -> None:
-        """Cancel in-flight TTS + signal the synth thread to stop
-        (app/main.py:2856-2861, 2966-2972)."""
+        """Stop everything the current turn is producing and discard any
+        queued/buffered audio, so a barge-in leaves nothing stale to play
+        (app/main.py:2856-2861, 2966-2972).
+
+        Order matters: stop the producers (TTS synth + LLM turn) and wait for
+        the LLM turn to actually wind down BEFORE draining the queue, else it
+        could re-enqueue a sentence between drain iterations (#5). Used by both
+        barge-in paths — VAD SPEECH_START and CLIENT_ABORT — so cleanup is
+        identical.
+        """
+        # 1. Stop the in-flight TTS synth.
         t = self.state["current_tts_task"]
         if t is not None and not t.done():
             t.cancel()
         stop = self.state["current_tts_stop"]
         if stop is not None:
             stop.set()
+        # 2. #2: stop the in-flight LLM/tool turn. Set the cooperative flag
+        # (the turn polls it at each checkpoint), then unblock any in-flight
+        # remote tool dispatch so the turn reaches its next checkpoint fast.
+        self.state["llm_barged"] = True
         # Phase 2a: barge-in must not orphan in-flight remote tool calls
-        # (spec §7). Clear any pending remote-dispatch futures so their
-        # awaiting _dispatch_remote returns a recoverable abort dict.
+        # (spec §7). Clearing pending remote-dispatch futures makes their
+        # awaiting _dispatch_remote return a recoverable "cancelled" dict.
         registry = self.engine.tool_registry
         if registry is not None:
             cleared = registry.cancel_pending_remote()
             if cleared:
                 logger.debug("barge-in cleared %d pending remote tool call(s)", cleared)
+        # Wait (bounded) for the turn to wind down. shield() so a timeout
+        # never cancels the task — a cancel landing mid remote-dispatch would
+        # be swallowed by _dispatch_remote and NOT stop the turn anyway; the
+        # cooperative flag is the reliable stop. The bound keeps _audio_loop
+        # responsive if the turn is wedged in a sync tool / silent backend.
+        llm = self.state.get("current_llm_task")
+        if llm is not None and not llm.done():
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(llm), timeout=2.0)
+        # 3. #5: discard queued sentences + the half-accumulated buffer. The
+        # producers are stopped (steps 1-2), so this can't race an enqueue.
+        while not self._tts_q.empty():
+            try:
+                self._tts_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if self._tts_be is not None:
+            self._tts_buffer = self._make_tts_buffer()
+        self.state["tts_flush"] = False
 
     async def _open_asr_turn(self) -> bool:
         """Start a fresh ASR utterance via the session manager.
@@ -782,9 +827,31 @@ class Session:
         if self._tts_buffer is None:
             return
         if self.engine.tool_registry is not None:
-            await self._llm_turn_with_tools(
-                [{"role": "user", "content": text}]
+            # #2: run the tool loop as a cancellable task so a concurrent
+            # barge-in (_audio_loop's VAD / CLIENT_ABORT → _bargein_tts) can
+            # stop an in-flight turn. Reset the cooperative flag and create the
+            # task in one synchronous step (no await between) so a barge-in
+            # arriving right after create_task isn't lost to the reset.
+            self.state["llm_barged"] = False
+            task = asyncio.create_task(
+                self._llm_turn_with_tools([{"role": "user", "content": text}])
             )
+            self.state["current_llm_task"] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    # Barge-in (or a defensive cancel) stopped this turn —
+                    # swallow so _asr_out_task continues to the next utterance.
+                    logger.info("voxedge LLM turn cancelled (barge-in)")
+                else:
+                    # _asr_out_task itself is being torn down: make sure the
+                    # child task dies too, then propagate the teardown.
+                    task.cancel()
+                    raise
+            finally:
+                if self.state.get("current_llm_task") is task:
+                    self.state["current_llm_task"] = None
             return
         messages = [{"role": "user", "content": text}]
         try:
@@ -855,9 +922,19 @@ class Session:
                 finish_reason: Optional[str] = None
                 preamble_fired: set[str] = set()  # tool names already spoken
 
+                # #2: barged in between rounds → drop this turn (discard any
+                # partial text; _bargein_tts owns the TTS cleanup). Returning
+                # abandons the stream generator so the LLM connection closes.
+                if self.state.get("llm_barged"):
+                    return
+
                 async for ev in self._llm_be.stream_events(
                     messages, tools=tools_schema, **llm_params
                 ):
+                    # #2: barge-in mid-stream — stop consuming deltas and drop
+                    # the turn WITHOUT flushing the partial sentence buffer.
+                    if self.state.get("llm_barged"):
+                        return
                     if ev.kind == "text" and ev.text:
                         text_chunks.append(ev.text)
                         await self._enqueue_tts_text(ev.text)
@@ -915,6 +992,7 @@ class Session:
                 # remote tools (dispatch_mode="remote", Phase 2a) proxy over
                 # ctx.remote_send and await a correlated tool_result — both
                 # return a JSON-serialisable dict, transparent to this loop.
+                dispatched: list[tuple[str, str, str, Any]] = []
                 for tc in tc_payload:
                     tname = tc["function"]["name"]
                     # Fallback preamble: fire here if the streamed name delta
@@ -942,6 +1020,43 @@ class Session:
                         "tool_call_id": tc["id"],
                         "content": content,
                     })
+                    tool = registry.get(tname)
+                    dispatched.append((
+                        tname,
+                        (getattr(tool, "response_mode", "await") or "await") if tool else "await",
+                        (getattr(tool, "completion_text", "") or "") if tool else "",
+                        result,
+                    ))
+
+                # #2: a barge-in landing during tool dispatch (cancel_pending_
+                # remote unblocked the remote await with a "cancelled" result)
+                # → drop the turn before re-requesting the LLM.
+                if self.state.get("llm_barged"):
+                    return
+
+                # #7: template fast-path. If EVERY tool dispatched this round
+                # opted into response_mode="template" with a non-empty
+                # completion_text AND succeeded, skip the (slow) LLM round 2
+                # and speak the fixed completion_text instead. A single
+                # await/parallel tool, an empty completion_text, or a failed
+                # result keeps round 2 so the LLM still synthesises a reply —
+                # template is a per-tool default, NOT a global round-2 kill.
+                if dispatched and all(
+                    mode == "template"
+                    and comp
+                    and not (isinstance(res, dict) and res.get("success") is False)
+                    for _, mode, comp, res in dispatched
+                ):
+                    spoken = " ".join(comp for _, _, comp, _ in dispatched)
+                    logger.info(
+                        "voxedge tool loop: template fast-path — skipping round2, "
+                        "speaking completion_text (%r)", spoken,
+                    )
+                    await self._enqueue_tts_text(spoken)
+                    for sentence in self._tts_buffer.flush():
+                        await self._tts_q.put(sentence)
+                    self.state["tts_flush"] = True
+                    return
                 # loop: re-request the LLM with the tool results appended.
 
             # Iteration cap hit — flush whatever was spoken and finish.
