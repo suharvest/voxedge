@@ -104,6 +104,17 @@ class ASRSessionManager:
     Backends are synchronous; all calls into them are hopped through
     ``loop.run_in_executor`` to avoid blocking the event loop. A single
     instance-level ``asyncio.Lock`` serializes state transitions.
+
+    Worker-op serialization (F1): the underlying ASR worker is single-
+    concurrency (one C++ IPC at a time). Every worker operation — create_stream,
+    accept_waveform, finalize, get_partial, cancel — therefore runs while
+    holding ``self._lock``, so no two can hit the worker concurrently from the
+    three driver tasks (audio loop / asr-out / event loop). The introspection
+    properties (``state`` / ``current_generation`` / ``stream``) read their
+    fields WITHOUT the lock, so callers polling state stay responsive while a
+    worker op holds it. INVARIANT: any ``except``/error path inside a held-lock
+    worker op MUST call ``_handle_error_locked`` DIRECTLY (never ``async with
+    self._lock`` again — asyncio.Lock is not re-entrant → instant deadlock).
     """
 
     # Retry/backoff schedule for ERROR_REBUILD (≤3 attempts before
@@ -203,6 +214,8 @@ class ASRSessionManager:
 
         No-op outside ACTIVE. Failures route to ERROR_REBUILD.
         """
+        # F1: hold _lock across accept_waveform so it can't run concurrently
+        # with finalize/get_partial/cancel/create on the single ASR worker.
         async with self._lock:
             if self._state != SessionState.ACTIVE:
                 return
@@ -214,10 +227,10 @@ class ASRSessionManager:
                 except Exception as exc:  # noqa: BLE001
                     await self._handle_error_locked(exc)
                     return
-        try:
-            await self._run_sync(stream.accept_waveform, self._sample_rate, samples)
-        except Exception as exc:  # noqa: BLE001
-            async with self._lock:
+            try:
+                await self._run_sync(stream.accept_waveform, self._sample_rate, samples)
+            except Exception as exc:  # noqa: BLE001
+                # Lock already held — call directly (re-acquiring would deadlock).
                 await self._handle_error_locked(exc)
 
     async def finalize(self, reason: str = "vad_end") -> str:
@@ -239,25 +252,26 @@ class ASRSessionManager:
         result because the stream was cancelled, no longer finalizable, or
         superseded by another generation.
         """
+        # F1: hold _lock across the whole finalize (transition → worker op →
+        # commit) so it can't overlap accept/get_partial/cancel on the worker.
         async with self._lock:
             if self._state not in (SessionState.ACTIVE,):
                 return self._generation, "", False, None
             gen = self._generation
             self._state = SessionState.FINALIZING
             stream = self._stream
-        if stream is None:
-            async with self._lock:
+            if stream is None:
                 self._state = SessionState.IDLE
-            return gen, "", False, None
-        try:
-            raw = await self._run_sync(stream.finalize)
-        except Exception as exc:  # noqa: BLE001
-            async with self._lock:
-                await self._handle_error_locked(exc)
-            return gen, "", False, None
-        # Backends MUST return ``(text, language)`` per the ASRStream ABC.
-        final_text, detected_language = raw
-        async with self._lock:
+                return gen, "", False, None
+            try:
+                raw = await self._run_sync(stream.finalize)
+            except Exception as exc:  # noqa: BLE001
+                await self._handle_error_locked(exc)  # lock held — call directly
+                return gen, "", False, None
+            # Backends MUST return ``(text, language)`` per the ASRStream ABC.
+            final_text, detected_language = raw
+            # State/gen can't change under us now (lock held throughout), but
+            # keep the guards as defensive invariants.
             if self._state != SessionState.FINALIZING:
                 logger.info("ASRSessionManager: finalize result discarded (state=%s)", self._state)
                 return gen, "", False, None
@@ -277,16 +291,18 @@ class ASRSessionManager:
 
         Returns ``(generation, "", False)`` if there's no active stream.
         """
+        # F1: hold _lock across get_partial so it can't overlap accept/finalize/
+        # cancel on the single worker.
         async with self._lock:
             gen = self._generation
             stream = self._stream
             if stream is None or self._state != SessionState.ACTIVE:
                 return gen, "", False
-        try:
-            partial, is_endpoint = await self._run_sync(stream.get_partial)
-        except Exception:  # noqa: BLE001
-            return gen, "", False
-        return gen, partial or "", bool(is_endpoint)
+            try:
+                partial, is_endpoint = await self._run_sync(stream.get_partial)
+            except Exception:  # noqa: BLE001
+                return gen, "", False
+            return gen, partial or "", bool(is_endpoint)
 
     async def cancel(self, reason: str = "bargein") -> None:
         async with self._lock:
@@ -312,15 +328,25 @@ class ASRSessionManager:
 
         loop = self._get_loop()
         fut = loop.run_in_executor(self._executor, _cancel_call)
+        # P3: only close the stream if the cancel executor call actually
+        # FINISHED (returned or raised). On timeout the worker thread may still
+        # be inside _cancel_call on this C++ stream object; a synchronous
+        # stream.close() from the coroutine side would then race that thread
+        # (the asyncio lock doesn't extend to executor threads). Leave it to
+        # restart_worker to reclaim the worker-side resources instead.
+        thread_done = False
         try:
             await asyncio.wait_for(fut, timeout=self._CANCEL_ACK_TIMEOUT_S)
+            thread_done = True
         except asyncio.TimeoutError:
             logger.warning(
-                "ASRSessionManager: cancel(%s) timed out from state=%s; restarting worker",
+                "ASRSessionManager: cancel(%s) timed out from state=%s; restarting "
+                "worker (NOT closing stream — _cancel_call thread may still hold it)",
                 reason, prev_state,
             )
             await self._maybe_restart_worker()
         except Exception as exc:  # noqa: BLE001
+            thread_done = True  # future raised → the executor call has returned
             if _is_worker_protocol_error(exc):
                 logger.warning(
                     "ASRSessionManager: cancel(%s) raised worker error %s; restarting",
@@ -329,7 +355,8 @@ class ASRSessionManager:
                 await self._maybe_restart_worker()
             else:
                 logger.info("ASRSessionManager: cancel(%s) swallowed exc=%s", reason, exc)
-        _safe_close_stream(stream)
+        if thread_done:
+            _safe_close_stream(stream)
         self._state = SessionState.IDLE
 
     def mark_error(self, exc: BaseException) -> None:
