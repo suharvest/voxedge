@@ -46,6 +46,7 @@ import json
 import logging
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -994,6 +995,19 @@ class Session:
                 finish_reason: Optional[str] = None
                 preamble_fired: set[str] = set()  # tool names already spoken
 
+                # ── latency instrumentation ───────────────────────────────
+                # Localise the round2 spike: a "round" here is one LLM request
+                # in the tool loop (round 0 = initial command → tool_call,
+                # round 1 = post-tool-result reply). _ttft is prefill→first
+                # event (the true TTFT for THIS round's context); ctx_msgs is
+                # the message-list length sent (proxy for context size — watch
+                # it vs the engine's maxSupportedInputLength). This decisively
+                # separates "round2 LLM is slow" from "user took N s to speak"
+                # — the latter is OUTSIDE this span, in the next /asr turn.
+                _t_round_start = time.perf_counter()
+                _ttft: Optional[float] = None
+                _ctx_msgs = len(messages)
+
                 # #2: barged in between rounds → drop this turn (discard any
                 # partial text; _bargein_tts owns the TTS cleanup). Returning
                 # abandons the stream generator so the LLM connection closes.
@@ -1007,6 +1021,8 @@ class Session:
                     # the turn WITHOUT flushing the partial sentence buffer.
                     if self.state.get("llm_barged"):
                         return
+                    if _ttft is None:
+                        _ttft = time.perf_counter() - _t_round_start
                     if ev.kind == "text" and ev.text:
                         text_chunks.append(ev.text)
                         await self._enqueue_tts_text(ev.text)
@@ -1029,6 +1045,15 @@ class Session:
                             slot.arguments += ev.arguments
                     elif ev.kind == "finish":
                         finish_reason = ev.finish_reason
+
+                logger.info(
+                    "voxedge tool loop: round=%d ctx_msgs=%d ttft=%.3fs "
+                    "stream=%.3fs n_text=%d finish=%s n_tools=%d",
+                    _round, _ctx_msgs,
+                    (_ttft if _ttft is not None else -1.0),
+                    time.perf_counter() - _t_round_start,
+                    len(text_chunks), finish_reason, len(tool_accs),
+                )
 
                 # No tool call → terminal text answer. Flush + done.
                 if not tool_accs or finish_reason != "tool_calls":
@@ -1091,7 +1116,12 @@ class Session:
                             "error": f"invalid arguments JSON: {args_raw!r}",
                         }
                     else:
+                        _t_disp = time.perf_counter()
                         result = await registry.dispatch(tname, args, ctx)
+                        logger.info(
+                            "voxedge tool loop: tool=%s dispatch=%.3fs",
+                            tname, time.perf_counter() - _t_disp,
+                        )
                     content = json.dumps(result, ensure_ascii=False)
                     messages.append({
                         "role": "tool",
