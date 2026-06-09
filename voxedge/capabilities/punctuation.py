@@ -14,12 +14,27 @@ is lazy so this module imports without the optional ``voxedge[sherpa]`` extra.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 
 logger = logging.getLogger(__name__)
 
 # Stable identifier surfaced in payloads so consumers can detect a model swap.
 PUNCT_MODEL_NAME = "ct_transformer_zh_en_vocab272727_2024-04-12"
+
+# Sentence/clause punctuation the CT-Transformer re-inserts. We strip these
+# from the input first so already-punctuated ASR output (e.g. Qwen3/SenseVoice,
+# which punctuate inline) doesn't get DOUBLED (`。` → `。。`). CT-Transformer is
+# designed for unpunctuated text, so stripping is the correct usage and makes
+# the result idempotent + backend-agnostic. Word-internal marks (apostrophe,
+# hyphen, decimal point) are intentionally NOT stripped.
+_STRIP_PUNCT = re.compile(r"[。，、！？；：,!?;:]+")
+
+
+def _strip_existing_punct(text: str) -> str:
+    # Replace stripped punctuation with a space so token boundaries survive,
+    # then collapse runs of whitespace.
+    return re.sub(r"\s+", " ", _STRIP_PUNCT.sub(" ", text)).strip()
 
 
 class Punctuator:
@@ -81,7 +96,12 @@ class Punctuator:
         if punct is None:
             return text
         try:
-            return punct.add_punctuation(text)
+            # Strip any punctuation the ASR backend already produced so we don't
+            # double it; CT-Transformer wants unpunctuated input.
+            cleaned = _strip_existing_punct(text)
+            if not cleaned:
+                return text
+            return punct.add_punctuation(cleaned)
         except Exception:
             logger.exception("add_punctuation failed; returning original text.")
             return text
