@@ -119,6 +119,7 @@ packages = [
     "voxedge.backends.sherpa",
     "voxedge.backends.rk",
     "voxedge.backends.jetson",
+    "voxedge.capabilities",
     "voxedge.transport",
     "voxedge.engine",
     "voxedge.artifacts",
