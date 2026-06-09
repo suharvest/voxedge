@@ -231,3 +231,56 @@ async def test_m2_cancel_suppresses_finalize_race():
     # finalize after cancel → no active stream → suppressed.
     gen, text, accepted, lang = await mgr.finalize_with_status("vad_end")
     assert accepted is False and text == ""
+
+
+class _PrepareStream:
+    def __init__(self):
+        self.prepared = 0
+
+    def accept_waveform(self, sample_rate, samples):
+        pass
+
+    def finalize(self):
+        return ("prepared final", "English")
+
+    def prepare_finalize(self):
+        self.prepared += 1
+
+    def close(self):
+        pass
+
+
+class _PrepareBackend:
+    sample_rate = 16000
+
+    def __init__(self):
+        self.streams = []
+
+    def create_stream(self, language="auto"):
+        stream = _PrepareStream()
+        self.streams.append(stream)
+        return stream
+
+
+@run_async
+async def test_m2_prepare_finalize_is_generation_gated():
+    backend = _PrepareBackend()
+    mgr = ASRSessionManager(backend)
+
+    gen1 = await mgr.on_speech_start()
+    ran_gen, prepared = await mgr.prepare_finalize_for_generation(gen1)
+    assert (ran_gen, prepared) == (gen1, True)
+    assert backend.streams[-1].prepared == 1
+
+    gen2 = await mgr.on_speech_start()
+    ran_gen2, prepared2 = await mgr.prepare_finalize_for_generation(gen1)
+    assert (ran_gen2, prepared2) == (gen2, False)
+    assert backend.streams[-1].prepared == 0
+
+
+@run_async
+async def test_m2_prepare_finalize_noops_when_idle():
+    mgr = ASRSessionManager(_PrepareBackend())
+    ran_gen, prepared = await mgr.prepare_finalize_for_generation()
+    assert prepared is False
+    assert ran_gen == mgr.current_generation

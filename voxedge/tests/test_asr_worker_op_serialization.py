@@ -71,6 +71,9 @@ class _InstrumentedStream:
         self._op(dur=0.05)
         return ("final text", "zh")
 
+    def prepare_finalize(self):
+        self._op(dur=0.05)
+
     def cancel(self):
         self._op()
 
@@ -142,3 +145,25 @@ async def test_cancel_does_not_overlap_accept():
     await mgr.cancel("bargein")  # races the in-flight accept feeders
     await asyncio.gather(*feeders, return_exceptions=True)
     assert probe.max_live == 1, f"cancel overlapped accept (max={probe.max_live})"
+
+
+@run_async
+async def test_prepare_finalize_does_not_overlap_worker_ops():
+    probe = _ConcurrencyProbe()
+    mgr = ASRSessionManager(_InstrumentedBackend(probe), sample_rate=16000)
+    gen = await mgr.on_speech_start()
+    samples = b"\x00\x00" * 256
+
+    async def feed():
+        for _ in range(6):
+            await mgr.accept_audio(samples)
+
+    feeders = [asyncio.create_task(feed()) for _ in range(2)]
+    await asyncio.sleep(0.02)
+    prep = asyncio.create_task(mgr.prepare_finalize_for_generation(gen))
+    await asyncio.gather(*feeders, prep, return_exceptions=True)
+
+    assert prep.result() == (gen, True)
+    assert probe.max_live == 1, (
+        f"prepare_finalize overlapped worker ops (max={probe.max_live})"
+    )

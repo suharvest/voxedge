@@ -286,6 +286,39 @@ class ASRSessionManager:
             self._state = SessionState.IDLE
             return gen, final_text or "", True, detected_language
 
+    async def prepare_finalize_for_generation(
+        self, generation: int | None = None
+    ) -> tuple[int, bool]:
+        """Precompute final ASR work for the active generation when supported.
+
+        Dialogue clients often know an utterance is about to end before they
+        commit EOS. This method lets callers hide backend ``prepare_finalize``
+        work under that EOU lead time without changing the authoritative
+        ``finalize_with_status`` lifecycle. It returns ``(generation,
+        prepared)``; ``prepared`` is false when the requested generation is no
+        longer active or the stream has no prepare hook.
+        """
+        async with self._lock:
+            gen = self._generation
+            if generation is not None and generation != gen:
+                return gen, False
+            if self._state != SessionState.ACTIVE or self._stream is None:
+                return gen, False
+            stream = self._stream
+            prepare = getattr(stream, "prepare_finalize", None)
+            if prepare is None:
+                return gen, False
+            try:
+                await self._run_sync(prepare)
+            except Exception as exc:  # noqa: BLE001
+                await self._handle_error_locked(exc)
+                return gen, False
+            return gen, bool(
+                self._generation == gen
+                and self._state == SessionState.ACTIVE
+                and self._stream is stream
+            )
+
     async def get_partial_for_generation(self) -> tuple[int, str, bool]:
         """Snapshot ``(generation, partial_text, is_endpoint)`` atomically.
 
