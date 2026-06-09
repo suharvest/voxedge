@@ -57,6 +57,12 @@ class ASRStream(ABC):
     Public API mirrors app/core/asr_backend.py:36-91.
     """
 
+    prefer_backend_endpoint_vad: bool = False
+    """Whether this stream owns endpoint VAD finalization."""
+
+    immediate_client_eos_cancel_safe: bool = False
+    """Whether partial abort can run outside normal ASR serialization."""
+
     @abstractmethod
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         """Feed audio samples (float32, [-1,1]) into the stream."""
@@ -99,6 +105,9 @@ class ASRBackend(ABC):
 
     # Backends whose unload() truly releases GPU/NPU resources set True.
     supports_hot_reload: bool = False
+    prefer_backend_endpoint_vad: bool = False
+    """Whether streams from this backend should receive audio before frontend
+    VAD speech_start and rely on backend endpointing for finalization."""
 
     @property
     @abstractmethod

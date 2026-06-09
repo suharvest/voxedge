@@ -109,6 +109,37 @@ def test_rk_asr_backend_preload_friendly_error(monkeypatch):
     assert "voxedge[rk]" in str(ei.value)
 
 
+def test_rk_asr_stream_adapter_forwards_stream_flags_and_options():
+    from voxedge.backends.rk.asr import RKASRBackend, RKASRConfig
+
+    class InnerStream:
+        immediate_client_eos_cancel_safe = True
+        prefer_backend_endpoint_vad = True
+
+    class InnerBackend:
+        def __init__(self):
+            self.seen = None
+
+        def create_stream(self, language="auto", stream_options=None):
+            self.seen = (language, dict(stream_options or {}))
+            return InnerStream()
+
+    backend = RKASRBackend(RKASRConfig())
+    backend._inner = InnerBackend()
+
+    stream = backend.create_stream(
+        language="Chinese",
+        stream_options={"vad_endpoint_silence_ms": 800},
+    )
+
+    assert backend._inner.seen == (
+        "Chinese",
+        {"vad_endpoint_silence_ms": 800},
+    )
+    assert stream.immediate_client_eos_cancel_safe is True
+    assert stream.prefer_backend_endpoint_vad is True
+
+
 def test_rk_tts_backend_preload_friendly_error(monkeypatch):
     from voxedge.backends.rk.tts import RKTTSBackend, RKTTSConfig
 

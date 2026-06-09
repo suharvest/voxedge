@@ -273,6 +273,18 @@ class _RKASRStreamAdapter(ASRStream):
         return inner
 
     @property
+    def immediate_client_eos_cancel_safe(self) -> bool:
+        return bool(
+            getattr(self._inner, "immediate_client_eos_cancel_safe", False)
+        )
+
+    @property
+    def prefer_backend_endpoint_vad(self) -> bool:
+        return bool(
+            getattr(self._inner, "prefer_backend_endpoint_vad", False)
+        )
+
+    @property
     def _long_audio_threshold_s(self) -> float:
         backend = self._backend
         if backend is not None:
@@ -470,6 +482,11 @@ class RKASRBackend(ASRBackend):
             return False
         return self._inner.is_ready()
 
+    @property
+    def prefer_backend_endpoint_vad(self) -> bool:
+        inner = self._inner
+        return bool(getattr(inner, "prefer_backend_endpoint_vad", False))
+
     def preload(self) -> None:
         # Lazy first-load: build the inner backend (NPU init) here rather than
         # in __init__. After ``unload()`` this re-creates it, matching the
@@ -546,9 +563,18 @@ class RKASRBackend(ASRBackend):
             language=last_lang,
         )
 
-    def create_stream(self, language: str = "auto") -> ASRStream:
+    def create_stream(
+        self,
+        language: str = "auto",
+        stream_options: dict | None = None,
+    ) -> ASRStream:
         if self._inner is None:
             raise RuntimeError("RKASRBackend not loaded (was unloaded)")
         return _RKASRStreamAdapter(
-            self._inner.create_stream(language=language), self, language=language
+            self._inner.create_stream(
+                language=language,
+                stream_options=stream_options,
+            ),
+            self,
+            language=language,
         )
