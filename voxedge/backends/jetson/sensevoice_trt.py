@@ -252,10 +252,10 @@ class SenseVoiceTRTBackend(ASRBackend):
 
     def _build_speech(self, audio: np.ndarray, lang: str = "auto", textnorm: str = "withitn"):
         lfr = self._apply_lfr(self._compute_feats(audio))
-        # NOTE: do NOT apply external CMVN. The lovemefan SenseVoice encoder ONNX
-        # normalizes internally (first LayerNorm); applying am.mvn on top
-        # double-normalizes and degrades accuracy (mean CER 0.048→0.032 across 5
-        # zh samples when removed). am.mvn kept in bundle as reference only.
+        # External am.mvn CMVN — device-validated default. Removing it improves
+        # FP32 onnxruntime CER but is NOT a clean win on the fp16 device (per-
+        # sample instability); see sensevoice_rknn for the on-device finding.
+        lfr = (lfr + self._cmvn_add) * self._cmvn_scale
         prefix = np.stack([
             self._emb[_LANG_IDS.get(lang, 0)],
             self._emb[1],
