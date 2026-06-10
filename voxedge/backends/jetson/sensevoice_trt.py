@@ -163,8 +163,10 @@ class SenseVoiceTRTBackend(ASRBackend):
         speech, valid = self._build_speech(audio, lang=tag)
         logits = self._infer(speech)
         if logits is None:
-            return TranscriptionResult(text="", language=None)
-        return TranscriptionResult(text=self._ctc_decode(logits, valid), language=None)
+            return TranscriptionResult(text="", language=None, meta={})
+        return TranscriptionResult(
+            text=self._ctc_decode(logits, valid), language=None, meta={}
+        )
 
     def create_stream(self, language: str = "auto") -> ASRStream:
         raise NotImplementedError("sensevoice_trt is offline-only; use transcribe() / POST /asr.")
