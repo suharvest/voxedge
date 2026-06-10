@@ -77,6 +77,11 @@ class SenseVoiceTRTConfig:
 class SenseVoiceTRTBackend(ASRBackend):
     """SenseVoice offline ASR on the Jetson GPU via a standalone TensorRT engine."""
 
+    # Opt into the generic offline→streaming adapter (OfflineAccumulateStream):
+    # accumulate audio, transcribe the whole utterance on finalize, endpointing
+    # via the OVS server-side VAD. Unlocks /asr/stream + /v2v/stream.
+    supports_offline_streaming = True
+
     def __init__(self, config: Optional[SenseVoiceTRTConfig] = None):
         self._cfg = config or SenseVoiceTRTConfig()
         self._engine = None
@@ -158,18 +163,19 @@ class SenseVoiceTRTBackend(ASRBackend):
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         if not self.is_ready():
             raise RuntimeError("SenseVoice TRT backend not ready — call preload() first")
-        audio = self._decode_audio(audio_bytes)
+        return self.transcribe_array(self._decode_audio(audio_bytes), language)
+
+    def transcribe_array(self, samples: np.ndarray, language: str = "auto") -> TranscriptionResult:
+        if not self.is_ready():
+            raise RuntimeError("SenseVoice TRT backend not ready — call preload() first")
         tag = _map_language(language)
-        speech, valid = self._build_speech(audio, lang=tag)
+        speech, valid = self._build_speech(samples, lang=tag)
         logits = self._infer(speech)
         if logits is None:
             return TranscriptionResult(text="", language=None, meta={})
         return TranscriptionResult(
             text=self._ctc_decode(logits, valid), language=None, meta={}
         )
-
-    def create_stream(self, language: str = "auto") -> ASRStream:
-        raise NotImplementedError("sensevoice_trt is offline-only; use transcribe() / POST /asr.")
 
     def _infer(self, speech: np.ndarray):
         from cuda import cudart

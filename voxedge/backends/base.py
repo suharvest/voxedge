@@ -95,6 +95,48 @@ class ASRStream(ABC):
         """Release per-stream resources. Default no-op; safe to call twice."""
 
 
+class OfflineAccumulateStream(ASRStream):
+    """Generic offline→streaming adapter.
+
+    Wraps any offline backend (one that implements ``transcribe_array``) into a
+    streaming session by accumulating audio and transcribing the whole utterance
+    on ``finalize()``. Endpointing is delegated to the OVS server-side VAD (which
+    finalizes + recreates the stream per utterance), so there is NO internal VAD
+    and NO incremental partial — first visible text lands at finalize.
+
+    Any backend that sets ``supports_offline_streaming = True`` gets a streaming
+    session for free via ``ASRBackend.create_stream`` — no per-backend stream code.
+    """
+
+    def __init__(self, backend: "ASRBackend", language: str = "auto") -> None:
+        self._backend = backend
+        self._language = language
+        self._buf: list = []
+
+    def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
+        import numpy as np
+
+        self._buf.append(np.asarray(samples, dtype=np.float32))
+
+    def get_partial(self) -> tuple[str, bool]:
+        # Offline models produce no incremental partials; the server-side VAD
+        # (or explicit EOS) drives finalize().
+        return "", False
+
+    def finalize(self) -> tuple[str, Optional[str]]:
+        import numpy as np
+
+        if not self._buf:
+            return "", None
+        audio = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        self._buf = []
+        result = self._backend.transcribe_array(audio, self._language)
+        return result.text, result.language
+
+    def close(self) -> None:
+        self._buf = []
+
+
 class ASRBackend(ABC):
     """Streaming/offline ASR backend.
 
@@ -108,6 +150,11 @@ class ASRBackend(ABC):
     prefer_backend_endpoint_vad: bool = False
     """Whether streams from this backend should receive audio before frontend
     VAD speech_start and rely on backend endpointing for finalization."""
+
+    # Offline backends set this True + implement transcribe_array() to get a
+    # streaming session (via OfflineAccumulateStream) + the STREAMING capability
+    # for free — no per-backend stream code, no internal VAD.
+    supports_offline_streaming: bool = False
 
     @property
     @abstractmethod
@@ -140,12 +187,33 @@ class ASRBackend(ABC):
         """One-shot offline transcription."""
         ...
 
+    def transcribe_array(
+        self, samples: "np.ndarray", language: str = "auto"
+    ) -> TranscriptionResult:
+        """One-shot offline transcription on a float32 mono 16k sample array.
+
+        Implemented by offline backends that opt into ``supports_offline_streaming``;
+        the generic OfflineAccumulateStream calls this on finalize().
+        """
+        raise NotImplementedError(f"{self.name} does not implement transcribe_array")
+
     def create_stream(self, language: str = "auto") -> ASRStream:
-        """Create a streaming ASR session. Requires STREAMING capability."""
+        """Create a streaming ASR session. Requires STREAMING capability.
+
+        Offline backends with ``supports_offline_streaming`` get a generic
+        accumulate-then-transcribe stream for free.
+        """
+        if self.supports_offline_streaming:
+            return OfflineAccumulateStream(self, language)
         raise NotImplementedError(f"{self.name} does not support streaming")
 
     def has_capability(self, cap: ASRCapability) -> bool:
-        return cap in self.capabilities
+        if cap in self.capabilities:
+            return True
+        # Offline backends that opt into pseudo-streaming advertise STREAMING.
+        if cap == ASRCapability.STREAMING and self.supports_offline_streaming:
+            return True
+        return False
 
     def unload(self) -> None:
         """Release GPU/NPU resources. Default no-op."""
