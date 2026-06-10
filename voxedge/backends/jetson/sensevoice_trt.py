@@ -252,7 +252,10 @@ class SenseVoiceTRTBackend(ASRBackend):
 
     def _build_speech(self, audio: np.ndarray, lang: str = "auto", textnorm: str = "withitn"):
         lfr = self._apply_lfr(self._compute_feats(audio))
-        lfr = (lfr + self._cmvn_add) * self._cmvn_scale
+        # NOTE: do NOT apply external CMVN. The lovemefan SenseVoice encoder ONNX
+        # normalizes internally (first LayerNorm); applying am.mvn on top
+        # double-normalizes and degrades accuracy (mean CER 0.048→0.032 across 5
+        # zh samples when removed). am.mvn kept in bundle as reference only.
         prefix = np.stack([
             self._emb[_LANG_IDS.get(lang, 0)],
             self._emb[1],
