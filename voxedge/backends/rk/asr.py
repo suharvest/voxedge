@@ -449,6 +449,11 @@ class RKASRBackend(ASRBackend):
                 mapped = _CAP_MAP.get(value)
                 if mapped is not None:
                     cached_caps.add(mapped)
+            # Offline backends opting into pseudo-streaming expose STREAMING via
+            # the supports_offline_streaming flag, not the capabilities set —
+            # forward it so OVS sees the adapter as streaming-capable.
+            if getattr(self._inner, "supports_offline_streaming", False):
+                cached_caps.add(ASRCapability.STREAMING)
             self._cached_capabilities = cached_caps
         except Exception:
             self._cached_capabilities = set()
@@ -469,6 +474,8 @@ class RKASRBackend(ASRBackend):
             mapped = _CAP_MAP.get(value)
             if mapped is not None:
                 out.add(mapped)
+        if getattr(self._inner, "supports_offline_streaming", False):
+            out.add(ASRCapability.STREAMING)
         return out
 
     @property
