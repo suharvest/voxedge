@@ -61,6 +61,7 @@ from voxedge.engine.asr_session_manager import (
 from voxedge.engine.coordinator import BackendCoordinator
 from voxedge.engine.session_state import SessionState
 from voxedge.engine.tts_buffer import LowLatencyTTSBuffer
+from voxedge.engine.tts_sequencer import _TTSChannel
 from voxedge.transport.base import Transport
 
 
@@ -72,53 +73,30 @@ async def _passthrough():
 
 logger = logging.getLogger(__name__)
 
-
-def _is_pool_saturated(exc: BaseException) -> tuple[bool, Optional[int]]:
-    """Duck-type a backend ``PoolSaturatedError`` (M4).
-
-    Mirrors app/main.py:592-610: recognize by ``status == 4429`` (+ class
-    name as belt-and-braces) and surface a clean 4429 reject. These are
-    deliberately NOT worker-protocol errors — a saturation is "backend
-    busy", never a worker fault, so it must NOT trigger a worker restart.
-
-    Returns ``(is_saturated, max_slots_or_None)``.
-    """
-    if getattr(exc, "status", None) == 4429 or type(exc).__name__ == "PoolSaturatedError":
-        ms = getattr(exc, "max_slots", None)
-        return True, ms if isinstance(ms, int) else None
-    return False, None
-
-
-# ── protocol constants (mirror app/core/v2v.py:33-53) ──────────────────
-CLIENT_TEXT = "text"
-CLIENT_ASR_EOS = "asr_eos"
-CLIENT_TTS_FLUSH = "tts_flush"
-CLIENT_ABORT = "abort"
-# Remote-tool wire (spec §4 Mode B): the client returns a tool result that the
-# engine routes back to the awaiting remote-dispatch future via resolve_remote.
-CLIENT_TOOL_RESULT = "tool_result"
-# Tool advertise handshake (spec §4/§6): right after opening the session the
-# device client uploads the OpenAI-style tool schemas it can execute locally
-# (plus an optional system_prompt / llm_params override). The engine registers
-# them as dispatch_mode="remote" tools so the server-side LLM loop can pick one
-# and proxy execution back to the client via SERVER_TOOL_CALL. Additive — a
-# legacy client that never enables the server loop never sends this.
-CLIENT_TOOL_ADVERTISE = "tool_advertise"
-
-SERVER_ASR_PARTIAL = "asr_partial"
-SERVER_ASR_ENDPOINT = "asr_endpoint"
-SERVER_ASR_FINAL = "asr_final"
-SERVER_TTS_STARTED = "tts_started"
-SERVER_TTS_SENTENCE_DONE = "tts_sentence_done"
-SERVER_TTS_DONE = "tts_done"
-SERVER_VAD_EVENT = "vad_event"
-SERVER_ERROR = "error"
-# Remote-tool wire (spec §4 Mode B): server asks a remote device client to run
-# a tool and report back via CLIENT_TOOL_RESULT.
-SERVER_TOOL_CALL = "tool_call"
-
-VAD_EVENT_SPEECH_START = "speech_start"
-VAD_EVENT_SPEECH_END = "speech_end"
+# Protocol constants + the pool-saturation duck-type now live in
+# voxedge/engine/protocol.py so the split-out submodules can share them without
+# importing conversation (cycle-free). Re-exported here for back-compat — tests
+# and callers still do ``from voxedge.engine.conversation import SERVER_TOOL_CALL``.
+from voxedge.engine.protocol import (  # noqa: E402
+    CLIENT_TEXT,
+    CLIENT_ASR_EOS,
+    CLIENT_TTS_FLUSH,
+    CLIENT_ABORT,
+    CLIENT_TOOL_RESULT,
+    CLIENT_TOOL_ADVERTISE,
+    SERVER_ASR_PARTIAL,
+    SERVER_ASR_ENDPOINT,
+    SERVER_ASR_FINAL,
+    SERVER_TTS_STARTED,
+    SERVER_TTS_SENTENCE_DONE,
+    SERVER_TTS_DONE,
+    SERVER_VAD_EVENT,
+    SERVER_ERROR,
+    SERVER_TOOL_CALL,
+    VAD_EVENT_SPEECH_START,
+    VAD_EVENT_SPEECH_END,
+    _is_pool_saturated,
+)
 
 
 def _advertised_remote_noop(*_args, **_kwargs):  # pragma: no cover - never called
@@ -193,73 +171,6 @@ class _SentenceBuffer:
                 self._buf = self._buf[end:]
                 return prefix.strip()
             pos = end
-
-
-class _TTSChannel:
-    """Owns the TTS sentence queue + chunk buffer and centralises every write
-    to them.
-
-    Step 2 of the conversation split (see seeed-local-voice
-    docs/plans/conversation-split.md). ``_event_loop``, ``_on_asr_final``,
-    ``_llm_turn_with_tools`` and ``_bargein_tts`` previously poked
-    ``self._tts_q`` / ``self._tts_buffer`` / ``state.tts_flush`` directly from
-    four places; they now go through these methods, so the TTS write surface is
-    one object. Step 3 extracts this whole channel — including the consumer
-    loop (still ``Session._tts_out_task``, which reads ``self.q``) — into its
-    own module. Holds a back-ref to the owning Session for backend/state
-    access; every method is a 1:1 behaviour port of the code it replaces (the
-    ``conversation.py`` line refs are the source of truth)."""
-
-    def __init__(self, sess: "Session"):
-        self._sess = sess
-        self.q: asyncio.Queue = asyncio.Queue()
-        self.buffer = sess._make_tts_buffer() if sess._tts_be else None
-
-    async def enqueue_text(self, chunk: str) -> None:
-        """Add assistant / preamble / client text to the sentence buffer and
-        push any completed sentences to the synth queue (was
-        ``_enqueue_tts_text`` and the inline ``buffer.add`` loops at
-        conversation.py:411-412/899-900/915-916)."""
-        if not chunk or self.buffer is None:
-            return
-        for sentence in self.buffer.add(chunk):
-            await self.q.put(sentence)
-
-    async def flush_and_signal(self) -> None:
-        """Flush the buffer remainder to the queue and signal end-of-input so
-        the consumer drains then emits its terminal ``tts_done`` — the
-        ``for s in buffer.flush(): q.put(s)`` + ``state.tts_flush = True`` pair
-        that was repeated at six sites (conversation.py:415-417/904-906/
-        1035-1037/1130-1132/1140-1142/1146-1148)."""
-        if self.buffer is not None:
-            for sentence in self.buffer.flush():
-                await self.q.put(sentence)
-        self._sess.state.tts_flush = True
-
-    def interrupt_synth(self) -> None:
-        """Barge-in step 1: stop the in-flight synth task + signal its stop
-        event (was conversation.py:593-598). Ordered BEFORE the LLM wind-down."""
-        state = self._sess.state
-        t = state.current_tts_task
-        if t is not None and not t.done():
-            t.cancel()
-        stop = state.current_tts_stop
-        if stop is not None:
-            stop.set()
-
-    def drain_and_reset(self) -> None:
-        """Barge-in step 3: discard queued sentences + rebuild the buffer so
-        nothing stale plays, and clear the flush signal (was
-        conversation.py:622-629). Ordered AFTER the LLM wind-down so the turn
-        can't re-enqueue a sentence between drain iterations (#5)."""
-        while not self.q.empty():
-            try:
-                self.q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        if self._sess._tts_be is not None:
-            self.buffer = self._sess._make_tts_buffer()
-        self._sess.state.tts_flush = False
 
 
 class Session:
@@ -1186,162 +1097,6 @@ class Session:
         """
         await self._tts.enqueue_text(preamble_text)
 
-    # ══════════════════════════════════════════════════════════════════
-    # tts_out_task  ← app/main.py:3207-3432
-    # ══════════════════════════════════════════════════════════════════
-
-    async def _tts_out_task(self) -> None:
-        state = self.state
-        multi = self.engine.multi_utterance
-        sr_header_sent = False
-        while not state.client_closed:
-            # Exit / per-turn done when flush + drained (app/main.py:3217-3233).
-            if state.tts_flush and self._tts.q.empty():
-                if multi and not state.asr_session_closed:
-                    state.tts_flush = False
-                    if not state.client_closed:
-                        await self._send_event({
-                            "type": SERVER_TTS_DONE,
-                            "session_complete": False,
-                        })
-                    continue
-                break
-            try:
-                sentence = await asyncio.wait_for(self._tts.q.get(), timeout=0.2)
-            except asyncio.TimeoutError:
-                continue
-
-            audio_queue: asyncio.Queue = asyncio.Queue()
-            stop_event = threading.Event()
-            state.current_tts_stop = stop_event
-
-            # Engine-parity #15: resolve speaker / voice / speed kwargs once
-            # per sentence (same dict the legacy _run_synth builds,
-            # app/main.py:3473-3478). Empty when nothing injected → default
-            # speaker, unchanged behavior.
-            stream_kwargs = self._tts_stream_kwargs()
-
-            def _run_synth(s: str, ev: threading.Event, aq: asyncio.Queue):
-                # Mirrors app/main.py:3246-3281 _run_synth (thread body).
-                try:
-                    for chunk in self._tts_be.generate_streaming(
-                        s,
-                        language=self.engine.tts_language,
-                        cancel_token=ev,
-                        **stream_kwargs,
-                    ):
-                        if ev.is_set():
-                            break
-                        self._loop.call_soon_threadsafe(aq.put_nowait, chunk)
-                except Exception as e:  # noqa: BLE001
-                    # M4: a slot-pool saturation is "backend busy", NOT a
-                    # synth fault — surface a typed reject marker, not a
-                    # generic tts error (app/main.py:3342-3356).
-                    sat, max_slots = _is_pool_saturated(e)
-                    if sat:
-                        self._loop.call_soon_threadsafe(
-                            aq.put_nowait, ("__saturated__", max_slots)
-                        )
-                    else:
-                        logger.exception("voxedge tts synth failed for %r", s[:80])
-                        self._loop.call_soon_threadsafe(
-                            aq.put_nowait, ("__error__", str(e))
-                        )
-                finally:
-                    self._loop.call_soon_threadsafe(aq.put_nowait, None)
-
-            chunk_timeout_s = self._tts_chunk_timeout_s
-
-            async def drain(s: str, ev: threading.Event, aq: asyncio.Queue):
-                nonlocal sr_header_sent
-                # Mirrors app/main.py:3283-3361 drain().
-                if not sr_header_sent:
-                    sr = self._tts_be.sample_rate
-                    await self._send_audio(struct.pack("<I", sr))
-                    sr_header_sent = True
-                await self._send_event({"type": SERVER_TTS_STARTED, "sentence": s})
-                # Slot acquire: a TTS synth is the GPU-heavy op; in
-                # serialized/exclusive mode it must not overlap an ASR finalize.
-                # Held across the whole synth so the synth thread runs alone.
-                async with self._acquire("tts"):
-                    self._loop.run_in_executor(None, _run_synth, s, ev, aq)
-                    state.tts_started = True
-                    # M3: per-chunk watchdog — a wedged backend that produces no
-                    # chunk within the budget aborts the sentence + emits an
-                    # error so the client never waits forever (app/main.py:3322-3339).
-                    while True:
-                        try:
-                            item = await asyncio.wait_for(aq.get(), timeout=chunk_timeout_s)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "voxedge tts watchdog: no chunk within %.1fs for "
-                                "sentence=%r — aborting synth", chunk_timeout_s, s[:80],
-                            )
-                            ev.set()
-                            await self._send_error(
-                                f"tts: synth produced no chunks within "
-                                f"{chunk_timeout_s:.0f}s"
-                            )
-                            break
-                        if item is None:
-                            break
-                        if isinstance(item, tuple) and item[0] == "__saturated__":
-                            # M4: typed pool_saturated; keep the session alive.
-                            await self._emit_pool_saturated(item[1])
-                            break
-                        if isinstance(item, tuple) and item[0] == "__error__":
-                            await self._send_error(f"tts: {item[1]}")
-                            break
-                        await self._send_audio(item)
-                await self._send_event({"type": SERVER_TTS_SENTENCE_DONE, "sentence": s})
-
-            task = asyncio.create_task(drain(sentence, stop_event, audio_queue))
-            state.current_tts_task = task
-            # M3: outer per-sentence wall-clock deadline. Covers wedges BEFORE
-            # the first chunk watchdog can fire (e.g. a backend that hangs in
-            # generate_streaming setup before yielding) (app/main.py:3382-3409).
-            sentence_timeout_s = self._tts_sentence_timeout_s
-            try:
-                await asyncio.wait_for(task, timeout=sentence_timeout_s)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "voxedge tts: per-sentence deadline %.1fs exceeded for "
-                    "sentence=%r — cancelling drain", sentence_timeout_s, sentence[:80],
-                )
-                stop_event.set()
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                if not state.client_closed:
-                    try:
-                        await self._send_error(
-                            f"tts: per-sentence deadline "
-                            f"{sentence_timeout_s:.0f}s exceeded"
-                        )
-                    except Exception:
-                        logger.exception("voxedge send_error after tts deadline failed")
-            except asyncio.CancelledError:
-                # Barge-in: stop synth + drain residual chunks (app/main.py:3410-3420).
-                stop_event.set()
-                try:
-                    while True:
-                        item = audio_queue.get_nowait()
-                        if item is None:
-                            break
-                except asyncio.QueueEmpty:
-                    pass
-            finally:
-                state.current_tts_task = None
-                state.current_tts_stop = None
-
-        # Session-final tts_done (app/main.py:3424-3432).
-        if not state.client_closed:
-            payload = {"type": SERVER_TTS_DONE}
-            if multi:
-                payload["session_complete"] = True
-            await self._send_event(payload)
 
     # ══════════════════════════════════════════════════════════════════
     # orchestrate  ← app/main.py:3434-3457
@@ -1371,7 +1126,7 @@ class Session:
         if self.asr_enabled:
             work_tasks.append(asyncio.create_task(self._asr_out_task()))
         if self._tts_be is not None:
-            work_tasks.append(asyncio.create_task(self._tts_out_task()))
+            work_tasks.append(asyncio.create_task(self._tts.run()))
         self._work_tasks = work_tasks
 
         async def _watch_input_end() -> None:
