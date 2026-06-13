@@ -47,7 +47,6 @@ import logging
 import struct
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
@@ -59,6 +58,7 @@ from voxedge.engine.asr_session_manager import (
     ASRSessionUnavailable,
 )
 from voxedge.engine.asr_loop import _ASRLoop
+from voxedge.engine.llm_turn import _LLMTurn
 from voxedge.engine.audio_dispatcher import _AudioDispatcher
 from voxedge.engine.client_events import _ClientEvents
 from voxedge.engine.coordinator import BackendCoordinator
@@ -110,17 +110,6 @@ def _advertised_remote_noop(*_args, **_kwargs):  # pragma: no cover - never call
     ``ToolRegistry.register`` (which requires a callable) has something to hold.
     """
     raise RuntimeError("advertised remote tool must dispatch over the wire, not locally")
-
-
-@dataclass
-class _ToolCallAcc:
-    """Accumulator for one tool_call's streamed deltas (per OpenAI index slot).
-
-    Mirrors agent/openvoicestream_agent/tools/runner.py:41-49."""
-
-    id: str = ""
-    name: str = ""
-    arguments: str = ""
 
 
 # ── lightweight sentence buffer (regex fallback, mirrors v2v.py path) ──
@@ -241,6 +230,9 @@ class Session:
         # Step 6: inbound control-event demux lives in _ClientEvents; its
         # handlers stay on Session (_tts / _bargein_tts / _handle_tool_advertise).
         self._events = _ClientEvents(self)
+        # Step 7: the server-side multi-round LLM↔tool pump lives in _LLMTurn;
+        # _on_asr_final (the ASR→LLM/TTS bridge) stays on Session and drives it.
+        self._llm = _LLMTurn(self)
         self._loop = asyncio.get_event_loop()
 
         # M1/M3: wall-clock watchdog thresholds — constructor-injected (spec
@@ -521,7 +513,7 @@ class Session:
             # arriving right after create_task isn't lost to the reset.
             self.state.llm_barged = False
             task = asyncio.create_task(
-                self._llm_turn_with_tools([{"role": "user", "content": text}])
+                self._llm.run([{"role": "user", "content": text}])
             )
             self.state.current_llm_task = task
             try:
@@ -551,242 +543,6 @@ class Session:
             await self._tts.flush_and_signal()
         except Exception:
             logger.exception("voxedge LLM stream failed")
-
-    async def _llm_turn_with_tools(self, messages: list[dict[str, Any]]) -> None:
-        """Server-side multi-turn LLM ↔ tool pump (spec §2/§4).
-
-        Ported in shape from the agent runner
-        (agent/openvoicestream_agent/tools/runner.py:116-443) but self-
-        contained: it owns the local ``messages`` list (no agent ``Session``
-        dependency) and streams assistant text into the engine TTS buffer
-        instead of an SLV client.
-
-        Loop (≤ ``engine.max_tool_rounds`` iterations):
-          1. Stream ``llm.stream_events(messages, tools=schema)``.
-          2. Text events → TTS sentence buffer.
-          3. Accumulate ``tool_call_delta`` events per OpenAI tool-call index.
-          4. finish_reason != "tool_calls" (or no tool calls) → done.
-          5. Else: append assistant(tool_calls), dispatch each handler
-             (local path), append role:"tool" results, re-request the LLM.
-
-        Only invoked when ``tool_registry`` is non-None, so the no-tool path
-        in :meth:`_on_asr_final` is unaffected (Phase 1 contract).
-        """
-        registry = self.engine.tool_registry
-        tools_schema = registry.list_openai_tools() or None
-        # Prepend the server-loop system prompt (spec §5). Done once on the
-        # working message list so every round re-sends the same prefix (keeps
-        # the edge-LLM prefix cache stable — append-only history per §8).
-        sys_prompt = self.engine.system_prompt
-        if sys_prompt and not (messages and messages[0].get("role") == "system"):
-            messages = [{"role": "system", "content": sys_prompt}, *messages]
-        llm_params = self.engine.llm_params
-        ctx = ToolContext(
-            session_id=getattr(self.transport, "session_id", None),
-            conversation=self,
-            # Phase 2a: remote-dispatch tools push their tool_call frame over
-            # the same event channel as other server→client events; the
-            # correlated tool_result is routed back via
-            # ``registry.resolve_remote`` from the transport receive side.
-            remote_send=self.transport.send_event,
-        )
-        max_rounds = self.engine.max_tool_rounds
-        try:
-            for _round in range(max_rounds):
-                text_chunks: list[str] = []
-                tool_accs: dict[int, _ToolCallAcc] = {}
-                finish_reason: Optional[str] = None
-                preamble_fired: set[str] = set()  # tool names already spoken
-
-                # ── latency instrumentation ───────────────────────────────
-                # Localise the round2 spike: a "round" here is one LLM request
-                # in the tool loop (round 0 = initial command → tool_call,
-                # round 1 = post-tool-result reply). _ttft is prefill→first
-                # event (the true TTFT for THIS round's context); ctx_msgs is
-                # the message-list length sent (proxy for context size — watch
-                # it vs the engine's maxSupportedInputLength). This decisively
-                # separates "round2 LLM is slow" from "user took N s to speak"
-                # — the latter is OUTSIDE this span, in the next /asr turn.
-                _t_round_start = time.perf_counter()
-                _ttft: Optional[float] = None
-                _ctx_msgs = len(messages)
-
-                # #2: barged in between rounds → drop this turn (discard any
-                # partial text; _bargein_tts owns the TTS cleanup). Returning
-                # abandons the stream generator so the LLM connection closes.
-                if self.state.llm_barged:
-                    return
-
-                async for ev in self._llm_be.stream_events(
-                    messages, tools=tools_schema, **llm_params
-                ):
-                    # #2: barge-in mid-stream — stop consuming deltas and drop
-                    # the turn WITHOUT flushing the partial sentence buffer.
-                    if self.state.llm_barged:
-                        return
-                    if _ttft is None:
-                        _ttft = time.perf_counter() - _t_round_start
-                    if ev.kind == "text" and ev.text:
-                        text_chunks.append(ev.text)
-                        await self._tts.enqueue_text(ev.text)
-                    elif ev.kind == "tool_call_delta":
-                        idx = ev.tool_call_index if ev.tool_call_index is not None else 0
-                        slot = tool_accs.setdefault(idx, _ToolCallAcc())
-                        if ev.tool_call_id:
-                            slot.id = ev.tool_call_id
-                        if ev.name:
-                            slot.name = ev.name
-                            # Early-fire the per-tool preamble as soon as the
-                            # tool name is known (lowest voice latency).
-                            if ev.name not in preamble_fired:
-                                tool = registry.get(ev.name)
-                                pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
-                                if pre:
-                                    preamble_fired.add(ev.name)
-                                    await self._emit_preamble(pre)
-                        if ev.arguments:
-                            slot.arguments += ev.arguments
-                    elif ev.kind == "finish":
-                        finish_reason = ev.finish_reason
-
-                logger.info(
-                    "voxedge tool loop: round=%d ctx_msgs=%d ttft=%.3fs "
-                    "stream=%.3fs n_text=%d finish=%s n_tools=%d",
-                    _round, _ctx_msgs,
-                    (_ttft if _ttft is not None else -1.0),
-                    time.perf_counter() - _t_round_start,
-                    len(text_chunks), finish_reason, len(tool_accs),
-                )
-
-                # No tool call → terminal text answer. Flush + done.
-                if not tool_accs or finish_reason != "tool_calls":
-                    # A barge-in can land in the await between the last stream
-                    # event and here (the per-event guard above won't catch it).
-                    # Don't flush stale text onto the freshly-drained queue —
-                    # _bargein_tts owns cleanup for the interrupted turn.
-                    if self.state.llm_barged:
-                        return
-                    final_text = "".join(text_chunks)
-                    if final_text:
-                        messages.append({"role": "assistant", "content": final_text})
-                    await self._tts.flush_and_signal()
-                    return
-
-                # Commit assistant(tool_calls) to the local message list.
-                preamble_content = "".join(text_chunks) or None
-                tc_payload: list[dict[str, Any]] = [
-                    {
-                        "id": acc.id or f"call_{idx}",
-                        "type": "function",
-                        "function": {
-                            "name": acc.name,
-                            "arguments": acc.arguments or "{}",
-                        },
-                    }
-                    for idx, acc in sorted(tool_accs.items())
-                ]
-                messages.append({
-                    "role": "assistant",
-                    "content": preamble_content,
-                    "tool_calls": tc_payload,
-                })
-
-                # Dispatch each tool sequentially. registry.dispatch branches
-                # on dispatch_mode internally: local tools run in-process,
-                # remote tools (dispatch_mode="remote", Phase 2a) proxy over
-                # ctx.remote_send and await a correlated tool_result — both
-                # return a JSON-serialisable dict, transparent to this loop.
-                dispatched: list[tuple[str, str, str, Any]] = []
-                for tc in tc_payload:
-                    tname = tc["function"]["name"]
-                    # Fallback preamble: fire here if the streamed name delta
-                    # never triggered the early path above (e.g. backend sent
-                    # the whole tool_call in one finish chunk).
-                    if tname and tname not in preamble_fired:
-                        tool = registry.get(tname)
-                        pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
-                        if pre:
-                            preamble_fired.add(tname)
-                            await self._emit_preamble(pre)
-                    args_raw = tc["function"]["arguments"]
-                    try:
-                        args = json.loads(args_raw or "{}")
-                    except json.JSONDecodeError:
-                        result: dict[str, Any] = {
-                            "success": False,
-                            "error": f"invalid arguments JSON: {args_raw!r}",
-                        }
-                    else:
-                        _t_disp = time.perf_counter()
-                        result = await registry.dispatch(tname, args, ctx)
-                        logger.info(
-                            "voxedge tool loop: tool=%s dispatch=%.3fs",
-                            tname, time.perf_counter() - _t_disp,
-                        )
-                    content = json.dumps(result, ensure_ascii=False)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": content,
-                    })
-                    tool = registry.get(tname)
-                    dispatched.append((
-                        tname,
-                        (getattr(tool, "response_mode", "await") or "await") if tool else "await",
-                        (getattr(tool, "completion_text", "") or "") if tool else "",
-                        result,
-                    ))
-
-                # #2: a barge-in landing during tool dispatch (cancel_pending_
-                # remote unblocked the remote await with a "cancelled" result)
-                # → drop the turn before re-requesting the LLM.
-                if self.state.llm_barged:
-                    return
-
-                # #7: template fast-path. If EVERY tool dispatched this round
-                # opted into response_mode="template" with a non-empty
-                # completion_text AND succeeded, skip the (slow) LLM round 2
-                # and speak the fixed completion_text instead. A single
-                # await/parallel tool, an empty completion_text, or a failed
-                # result keeps round 2 so the LLM still synthesises a reply —
-                # template is a per-tool default, NOT a global round-2 kill.
-                if dispatched and all(
-                    mode == "template"
-                    and comp
-                    and not (isinstance(res, dict) and res.get("success") is False)
-                    for _, mode, comp, res in dispatched
-                ):
-                    spoken = " ".join(comp for _, _, comp, _ in dispatched)
-                    logger.info(
-                        "voxedge tool loop: template fast-path — skipping round2, "
-                        "speaking completion_text (%r)", spoken,
-                    )
-                    await self._tts.enqueue_text(spoken)
-                    await self._tts.flush_and_signal()
-                    return
-                # loop: re-request the LLM with the tool results appended.
-
-            # Iteration cap hit — flush whatever was spoken and finish.
-            logger.warning("voxedge tool loop hit max_tool_rounds=%d", max_rounds)
-            if self.state.llm_barged:
-                return
-            await self._tts.flush_and_signal()
-        except Exception:
-            logger.exception("voxedge LLM tool loop failed")
-            try:
-                await self._tts.flush_and_signal()
-            except Exception:
-                logger.exception("voxedge tool-loop flush after error failed")
-
-    async def _emit_preamble(self, preamble_text: str) -> None:
-        """Speak a tool preamble (e.g. "好的。") via the TTS buffer.
-
-        TODO(phase-2): if the TTS buffer / app grows a dedicated preamble
-        interface (immediate flush, bypass sentence buffering for lowest
-        latency), route through it. For now the preamble goes through the same
-        sentence buffer as assistant text — correct, just not latency-tuned.
-        """
-        await self._tts.enqueue_text(preamble_text)
 
 
     # ══════════════════════════════════════════════════════════════════

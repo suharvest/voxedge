@@ -318,7 +318,7 @@ async def test_T8_barged_turn_returns_without_flushing():
     s.engine.tool_registry = reg
 
     s.state.llm_barged = True  # barge-in landed before the turn started
-    await s._llm_turn_with_tools([{"role": "user", "content": "请帮我开灯"}])
+    await s._llm.run([{"role": "user", "content": "请帮我开灯"}])
 
     assert fake.calls == 0, "barged turn must not call the LLM"
     assert s._tts.q.empty(), "barged turn must not flush any text to TTS"

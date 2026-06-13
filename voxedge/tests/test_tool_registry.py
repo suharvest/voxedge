@@ -298,7 +298,7 @@ async def test_pump_one_tool_round_then_text():
         ],
     ])
     sess = _make_session(llm, registry)
-    await sess._llm_turn_with_tools([{"role": "user", "content": "weather in Paris?"}])
+    await sess._llm.run([{"role": "user", "content": "weather in Paris?"}])
 
     # Tool dispatched with the right args.
     assert dispatched["city"] == "Paris"
@@ -327,7 +327,7 @@ async def test_pump_no_tool_short_circuits():
         ],
     ])
     sess = _make_session(llm, registry)
-    await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
+    await sess._llm.run([{"role": "user", "content": "hi"}])
     assert len(llm.calls) == 1  # no continuation
     assert sess.state.tts_flush is True
 
@@ -348,7 +348,7 @@ async def test_pump_iteration_cap():
     ] for _ in range(20)]
     llm = _ScriptedLLM(forever)
     sess = _make_session(llm, registry, max_tool_rounds=3)
-    await sess._llm_turn_with_tools([{"role": "user", "content": "go"}])
+    await sess._llm.run([{"role": "user", "content": "go"}])
     # Capped at max_tool_rounds LLM calls.
     assert len(llm.calls) == 3
     assert sess.state.tts_flush is True
@@ -376,7 +376,7 @@ async def test_pump_invalid_arguments_json_recovers():
         ],
     ])
     sess = _make_session(llm, registry)
-    await sess._llm_turn_with_tools([{"role": "user", "content": "x"}])
+    await sess._llm.run([{"role": "user", "content": "x"}])
     # Handler never ran (bad JSON), but loop continued and got the error dict
     # injected as the tool result, then terminated on text.
     assert fired["n"] == 0
@@ -406,7 +406,7 @@ async def test_preamble_spoken_via_tts():
     ])
     sess = _make_session(llm, registry)
     # Drain the TTS queue to confirm the preamble was enqueued.
-    await sess._llm_turn_with_tools([{"role": "user", "content": "wave"}])
+    await sess._llm.run([{"role": "user", "content": "wave"}])
     queued = []
     while not sess._tts.q.empty():
         queued.append(sess._tts.q.get_nowait())
@@ -666,7 +666,7 @@ async def test_system_prompt_prepended_to_tool_pump():
         ],
     ])
     sess = _make_session_cfg(llm, registry, system_prompt="You are a robot.")
-    await sess._llm_turn_with_tools([{"role": "user", "content": "hello"}])
+    await sess._llm.run([{"role": "user", "content": "hello"}])
     msgs = llm.calls[0]["messages"]
     assert msgs[0] == {"role": "system", "content": "You are a robot."}
     assert msgs[1]["role"] == "user"
@@ -694,7 +694,7 @@ async def test_system_prompt_prepended_once_across_rounds():
         ],
     ])
     sess = _make_session_cfg(llm, registry, system_prompt="SYS")
-    await sess._llm_turn_with_tools([{"role": "user", "content": "go"}])
+    await sess._llm.run([{"role": "user", "content": "go"}])
     assert len(llm.calls) == 2
     r2 = llm.calls[1]["messages"]
     assert [m for m in r2 if m["role"] == "system"] == [
@@ -710,7 +710,7 @@ async def test_no_system_prompt_leaves_messages_unchanged():
          LLMEvent(kind="finish", finish_reason="stop")],
     ])
     sess = _make_session_cfg(llm, registry, system_prompt=None)
-    await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
+    await sess._llm.run([{"role": "user", "content": "hi"}])
     assert llm.calls[0]["messages"][0]["role"] == "user"
 
 
@@ -726,7 +726,7 @@ async def test_llm_params_forwarded_to_stream_events():
     sess = _make_session_cfg(
         llm, registry, llm_params={"temperature": 0.3, "max_tokens": 64}
     )
-    await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
+    await sess._llm.run([{"role": "user", "content": "hi"}])
     kw = llm.calls[0]["kw"]
     assert kw["temperature"] == 0.3
     assert kw["max_tokens"] == 64
@@ -782,7 +782,7 @@ async def test_client_tool_result_frame_resolves_remote():
     # Run the pump; concurrently feed the tool_result frame through the same
     # receive handler the real /v2v event loop uses.
     pump = asyncio.create_task(
-        sess._llm_turn_with_tools([{"role": "user", "content": "wave"}])
+        sess._llm.run([{"role": "user", "content": "wave"}])
     )
 
     # Wait until the remote dispatch frame has been sent.
@@ -996,7 +996,7 @@ async def test_advertise_then_server_loop_picks_remote_tool_e2e():
     # success tool_result so the remote dispatch future resolves.
     transport = _CaptureTransport([], registry=registry)
     sess = Session(engine, transport)
-    await sess._llm_turn_with_tools(
+    await sess._llm.run(
         [{"role": "user", "content": "抬头看看"}]
     )
 
