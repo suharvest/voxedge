@@ -60,6 +60,7 @@ from voxedge.engine.asr_session_manager import (
 )
 from voxedge.engine.asr_loop import _ASRLoop
 from voxedge.engine.audio_dispatcher import _AudioDispatcher
+from voxedge.engine.client_events import _ClientEvents
 from voxedge.engine.coordinator import BackendCoordinator
 from voxedge.engine.session_state import SessionState
 from voxedge.engine.tts_buffer import LowLatencyTTSBuffer
@@ -237,6 +238,9 @@ class Session:
         # Step 5: inbound audio → VAD → ASR feed lives in _AudioDispatcher;
         # barge-in (_bargein_tts) + ASR turn open/close stay on Session/_ASRLoop.
         self._audio = _AudioDispatcher(self)
+        # Step 6: inbound control-event demux lives in _ClientEvents; its
+        # handlers stay on Session (_tts / _bargein_tts / _handle_tool_advertise).
+        self._events = _ClientEvents(self)
         self._loop = asyncio.get_event_loop()
 
         # M1/M3: wall-clock watchdog thresholds — constructor-injected (spec
@@ -321,63 +325,6 @@ class Session:
 
     async def _send_error(self, msg: str) -> None:
         await self._send_event({"type": SERVER_ERROR, "error": msg})
-
-    # ══════════════════════════════════════════════════════════════════
-    # dispatcher  ← app/main.py:2814-2990
-    # ══════════════════════════════════════════════════════════════════
-
-    async def _event_loop(self) -> None:
-        """Inbound control events. Port of the text-frame branch of
-        dispatcher() (app/main.py:2944-2983)."""
-        state = self.state
-        multi = self.engine.multi_utterance
-        try:
-            async for payload in self.transport.recv_event():
-                if state.client_closed:
-                    break
-                typ = payload.get("type")
-                if typ == CLIENT_TEXT:
-                    await self._tts.enqueue_text(payload.get("text", ""))
-                elif typ == CLIENT_TTS_FLUSH:
-                    await self._tts.flush_and_signal()
-                elif typ == CLIENT_ASR_EOS:
-                    state.stamp_endpoint("client_eos")
-                    if not multi:
-                        state.asr_session_closed = True
-                elif typ == CLIENT_ABORT:
-                    # _bargein_tts now owns the full TTS cleanup (cancel synth +
-                    # LLM turn, drain queue, reset buffer) for both barge-in
-                    # paths. Here we additionally cancel the ASR turn — the user
-                    # explicitly aborted, so (unlike VAD SPEECH_START) no new
-                    # utterance is being opened.
-                    await self._bargein_tts()
-                    if self._asr_mgr is not None and state.asr_active:
-                        await self._asr_mgr.cancel("abort")
-                        state.deactivate_asr()
-                elif typ == CLIENT_TOOL_RESULT:
-                    # Remote-tool wire (spec §4 Mode B): route a device client's
-                    # tool result back to the awaiting _dispatch_remote future.
-                    # ``ok=false`` carries an error string; unknown/late call_id
-                    # is safely ignored by resolve_remote.
-                    registry = self.engine.tool_registry
-                    if registry is not None:
-                        call_id = payload.get("call_id") or payload.get("id")
-                        if call_id:
-                            ok = payload.get("ok", True)
-                            if ok:
-                                registry.resolve_remote(
-                                    call_id, result=payload.get("result")
-                                )
-                            else:
-                                registry.resolve_remote(
-                                    call_id,
-                                    error=str(payload.get("error") or "remote tool failed"),
-                                )
-                elif typ == CLIENT_TOOL_ADVERTISE:
-                    self._handle_tool_advertise(payload)
-        except Exception:
-            logger.exception("voxedge event_loop error")
-            state.client_closed = True
 
     def _handle_tool_advertise(self, payload: dict) -> None:
         """Register client-advertised tool schemas into the engine registry
@@ -864,7 +811,7 @@ class Session:
         """
         recv_tasks = [
             asyncio.create_task(self._audio.run()),
-            asyncio.create_task(self._event_loop()),
+            asyncio.create_task(self._events.run()),
         ]
         work_tasks: list[asyncio.Task] = []
         if self.asr_enabled:

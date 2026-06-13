@@ -851,7 +851,7 @@ async def test_event_loop_routes_tool_result_to_resolve_remote():
     registry._pending_remote["ok1"] = ok_fut
     registry._pending_remote["err1"] = err_fut
 
-    await sess._event_loop()
+    await sess._events.run()
 
     assert ok_fut.result() == {"v": 1}
     assert isinstance(err_fut.exception(), RuntimeError)
@@ -914,7 +914,7 @@ async def test_event_loop_tool_advertise_registers_remote_tools():
             pass
 
     sess = Session(engine, _FeedTransport())
-    await sess._event_loop()
+    await sess._events.run()
 
     # Both tools registered as remote-dispatch.
     assert registry.has("look_up") and registry.has("wave")
