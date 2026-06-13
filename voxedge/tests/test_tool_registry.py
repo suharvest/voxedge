@@ -408,8 +408,8 @@ async def test_preamble_spoken_via_tts():
     # Drain the TTS queue to confirm the preamble was enqueued.
     await sess._llm_turn_with_tools([{"role": "user", "content": "wave"}])
     queued = []
-    while not sess._tts_q.empty():
-        queued.append(sess._tts_q.get_nowait())
+    while not sess._tts.q.empty():
+        queued.append(sess._tts.q.get_nowait())
     assert any("好的" in s for s in queued)
 
 

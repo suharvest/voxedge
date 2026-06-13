@@ -195,6 +195,73 @@ class _SentenceBuffer:
             pos = end
 
 
+class _TTSChannel:
+    """Owns the TTS sentence queue + chunk buffer and centralises every write
+    to them.
+
+    Step 2 of the conversation split (see seeed-local-voice
+    docs/plans/conversation-split.md). ``_event_loop``, ``_on_asr_final``,
+    ``_llm_turn_with_tools`` and ``_bargein_tts`` previously poked
+    ``self._tts_q`` / ``self._tts_buffer`` / ``state.tts_flush`` directly from
+    four places; they now go through these methods, so the TTS write surface is
+    one object. Step 3 extracts this whole channel — including the consumer
+    loop (still ``Session._tts_out_task``, which reads ``self.q``) — into its
+    own module. Holds a back-ref to the owning Session for backend/state
+    access; every method is a 1:1 behaviour port of the code it replaces (the
+    ``conversation.py`` line refs are the source of truth)."""
+
+    def __init__(self, sess: "Session"):
+        self._sess = sess
+        self.q: asyncio.Queue = asyncio.Queue()
+        self.buffer = sess._make_tts_buffer() if sess._tts_be else None
+
+    async def enqueue_text(self, chunk: str) -> None:
+        """Add assistant / preamble / client text to the sentence buffer and
+        push any completed sentences to the synth queue (was
+        ``_enqueue_tts_text`` and the inline ``buffer.add`` loops at
+        conversation.py:411-412/899-900/915-916)."""
+        if not chunk or self.buffer is None:
+            return
+        for sentence in self.buffer.add(chunk):
+            await self.q.put(sentence)
+
+    async def flush_and_signal(self) -> None:
+        """Flush the buffer remainder to the queue and signal end-of-input so
+        the consumer drains then emits its terminal ``tts_done`` — the
+        ``for s in buffer.flush(): q.put(s)`` + ``state.tts_flush = True`` pair
+        that was repeated at six sites (conversation.py:415-417/904-906/
+        1035-1037/1130-1132/1140-1142/1146-1148)."""
+        if self.buffer is not None:
+            for sentence in self.buffer.flush():
+                await self.q.put(sentence)
+        self._sess.state.tts_flush = True
+
+    def interrupt_synth(self) -> None:
+        """Barge-in step 1: stop the in-flight synth task + signal its stop
+        event (was conversation.py:593-598). Ordered BEFORE the LLM wind-down."""
+        state = self._sess.state
+        t = state.current_tts_task
+        if t is not None and not t.done():
+            t.cancel()
+        stop = state.current_tts_stop
+        if stop is not None:
+            stop.set()
+
+    def drain_and_reset(self) -> None:
+        """Barge-in step 3: discard queued sentences + rebuild the buffer so
+        nothing stale plays, and clear the flush signal (was
+        conversation.py:622-629). Ordered AFTER the LLM wind-down so the turn
+        can't re-enqueue a sentence between drain iterations (#5)."""
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if self._sess._tts_be is not None:
+            self.buffer = self._sess._make_tts_buffer()
+        self._sess.state.tts_flush = False
+
+
 class Session:
     """One conversation over one Transport. Owns the per-conn state machine."""
 
@@ -234,15 +301,6 @@ class Session:
             if self._asr_be
             else None
         )
-        # Engine-parity #15: select the TTS chunk buffer. Default keeps the
-        # back-compat ``_SentenceBuffer`` (existing tests unchanged); when the
-        # engine is constructed with ``low_latency_tts=True`` use the ported
-        # ``LowLatencyTTSBuffer`` (CJK clause / bounded-span early emit) — the
-        # same buffer the legacy /v2v handler selects (app/main.py:2961-2970).
-        self._tts_buffer = (
-            self._make_tts_buffer() if self._tts_be else None
-        )
-
         # Engine-parity #15: speaker / voice / speed kwargs forwarded to the
         # TTS backend's ``generate_streaming``. Constructor-injected (no env
         # / no app.core.tts_speakers import in voxedge) so the resolved
@@ -254,7 +312,11 @@ class Session:
         self._tts_voice = engine.tts_voice
         self._tts_speed = engine.tts_speed
 
-        self._tts_q: asyncio.Queue = asyncio.Queue()
+        # Step 2 of the split: the TTS sentence queue + chunk buffer and every
+        # write to them live in one facade (selects _SentenceBuffer vs
+        # LowLatencyTTSBuffer via _make_tts_buffer). The consumer loop is still
+        # Session._tts_out_task (reads self._tts.q); it relocates in step 3.
+        self._tts = _TTSChannel(self)
         self._loop = asyncio.get_event_loop()
 
         # M1/M3: wall-clock watchdog thresholds — constructor-injected (spec
@@ -407,14 +469,10 @@ class Session:
                 if state.client_closed:
                     break
                 typ = payload.get("type")
-                if typ == CLIENT_TEXT and self._tts_buffer is not None:
-                    for sentence in self._tts_buffer.add(payload.get("text", "")):
-                        await self._tts_q.put(sentence)
+                if typ == CLIENT_TEXT:
+                    await self._tts.enqueue_text(payload.get("text", ""))
                 elif typ == CLIENT_TTS_FLUSH:
-                    if self._tts_buffer is not None:
-                        for sentence in self._tts_buffer.flush():
-                            await self._tts_q.put(sentence)
-                    state.tts_flush = True
+                    await self._tts.flush_and_signal()
                 elif typ == CLIENT_ASR_EOS:
                     state.stamp_endpoint("client_eos")
                     if not multi:
@@ -590,12 +648,7 @@ class Session:
         identical.
         """
         # 1. Stop the in-flight TTS synth.
-        t = self.state.current_tts_task
-        if t is not None and not t.done():
-            t.cancel()
-        stop = self.state.current_tts_stop
-        if stop is not None:
-            stop.set()
+        self._tts.interrupt_synth()
         # 2. #2: stop the in-flight LLM/tool turn. Set the cooperative flag
         # (the turn polls it at each checkpoint), then unblock any in-flight
         # remote tool dispatch so the turn reaches its next checkpoint fast.
@@ -619,14 +672,7 @@ class Session:
                 await asyncio.wait_for(asyncio.shield(llm), timeout=2.0)
         # 3. #5: discard queued sentences + the half-accumulated buffer. The
         # producers are stopped (steps 1-2), so this can't race an enqueue.
-        while not self._tts_q.empty():
-            try:
-                self._tts_q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        if self._tts_be is not None:
-            self._tts_buffer = self._make_tts_buffer()
-        self.state.tts_flush = False
+        self._tts.drain_and_reset()
 
     async def _open_asr_turn(self) -> bool:
         """Start a fresh ASR utterance via the session manager.
@@ -863,7 +909,7 @@ class Session:
         """
         if self._llm_be is None or not text.strip():
             return
-        if self._tts_buffer is None:
+        if self._tts.buffer is None:
             return
         if self.engine.tool_registry is not None:
             # #2: run the tool loop as a cancellable task so a concurrent
@@ -896,24 +942,13 @@ class Session:
         try:
             async for ev in self._llm_be.stream_events(messages):
                 if ev.kind == "text" and ev.text:
-                    for sentence in self._tts_buffer.add(ev.text):
-                        await self._tts_q.put(sentence)
+                    await self._tts.enqueue_text(ev.text)
                 # tool_call_delta is only reachable via the tool_registry path
                 # above; with no registry the engine never sends a tools schema
                 # so the backend never emits tool calls.
-            for sentence in self._tts_buffer.flush():
-                await self._tts_q.put(sentence)
-            self.state.tts_flush = True
+            await self._tts.flush_and_signal()
         except Exception:
             logger.exception("voxedge LLM stream failed")
-
-    async def _enqueue_tts_text(self, chunk: str) -> None:
-        """Push assistant text into the TTS sentence buffer (same path LLM
-        text deltas take in :meth:`_on_asr_final`)."""
-        if not chunk or self._tts_buffer is None:
-            return
-        for sentence in self._tts_buffer.add(chunk):
-            await self._tts_q.put(sentence)
 
     async def _llm_turn_with_tools(self, messages: list[dict[str, Any]]) -> None:
         """Server-side multi-turn LLM ↔ tool pump (spec §2/§4).
@@ -991,7 +1026,7 @@ class Session:
                         _ttft = time.perf_counter() - _t_round_start
                     if ev.kind == "text" and ev.text:
                         text_chunks.append(ev.text)
-                        await self._enqueue_tts_text(ev.text)
+                        await self._tts.enqueue_text(ev.text)
                     elif ev.kind == "tool_call_delta":
                         idx = ev.tool_call_index if ev.tool_call_index is not None else 0
                         slot = tool_accs.setdefault(idx, _ToolCallAcc())
@@ -1032,9 +1067,7 @@ class Session:
                     final_text = "".join(text_chunks)
                     if final_text:
                         messages.append({"role": "assistant", "content": final_text})
-                    for sentence in self._tts_buffer.flush():
-                        await self._tts_q.put(sentence)
-                    self.state.tts_flush = True
+                    await self._tts.flush_and_signal()
                     return
 
                 # Commit assistant(tool_calls) to the local message list.
@@ -1126,10 +1159,8 @@ class Session:
                         "voxedge tool loop: template fast-path — skipping round2, "
                         "speaking completion_text (%r)", spoken,
                     )
-                    await self._enqueue_tts_text(spoken)
-                    for sentence in self._tts_buffer.flush():
-                        await self._tts_q.put(sentence)
-                    self.state.tts_flush = True
+                    await self._tts.enqueue_text(spoken)
+                    await self._tts.flush_and_signal()
                     return
                 # loop: re-request the LLM with the tool results appended.
 
@@ -1137,15 +1168,11 @@ class Session:
             logger.warning("voxedge tool loop hit max_tool_rounds=%d", max_rounds)
             if self.state.llm_barged:
                 return
-            for sentence in self._tts_buffer.flush():
-                await self._tts_q.put(sentence)
-            self.state.tts_flush = True
+            await self._tts.flush_and_signal()
         except Exception:
             logger.exception("voxedge LLM tool loop failed")
             try:
-                for sentence in self._tts_buffer.flush():
-                    await self._tts_q.put(sentence)
-                self.state.tts_flush = True
+                await self._tts.flush_and_signal()
             except Exception:
                 logger.exception("voxedge tool-loop flush after error failed")
 
@@ -1157,7 +1184,7 @@ class Session:
         latency), route through it. For now the preamble goes through the same
         sentence buffer as assistant text — correct, just not latency-tuned.
         """
-        await self._enqueue_tts_text(preamble_text)
+        await self._tts.enqueue_text(preamble_text)
 
     # ══════════════════════════════════════════════════════════════════
     # tts_out_task  ← app/main.py:3207-3432
@@ -1169,7 +1196,7 @@ class Session:
         sr_header_sent = False
         while not state.client_closed:
             # Exit / per-turn done when flush + drained (app/main.py:3217-3233).
-            if state.tts_flush and self._tts_q.empty():
+            if state.tts_flush and self._tts.q.empty():
                 if multi and not state.asr_session_closed:
                     state.tts_flush = False
                     if not state.client_closed:
@@ -1180,7 +1207,7 @@ class Session:
                     continue
                 break
             try:
-                sentence = await asyncio.wait_for(self._tts_q.get(), timeout=0.2)
+                sentence = await asyncio.wait_for(self._tts.q.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
 

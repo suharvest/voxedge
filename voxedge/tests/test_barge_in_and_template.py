@@ -265,20 +265,20 @@ async def test_T6_bargein_drains_queue_and_rebuilds_buffer():
     tts_flush, and sets llm_barged."""
     s = _session()
     # Stale queued sentences + a half-accumulated buffer fragment.
-    await s._tts_q.put("残句一")
-    await s._tts_q.put("残句二")
-    assert s._tts_buffer is not None
-    s._tts_buffer.add("半句")  # no terminator → stays buffered
+    await s._tts.q.put("残句一")
+    await s._tts.q.put("残句二")
+    assert s._tts.buffer is not None
+    s._tts.buffer.add("半句")  # no terminator → stays buffered
     s.state.tts_flush = True
-    old_buffer = s._tts_buffer
+    old_buffer = s._tts.buffer
 
     await s._bargein_tts()
 
-    assert s._tts_q.empty(), "queue should be drained"
+    assert s._tts.q.empty(), "queue should be drained"
     assert s.state.llm_barged is True
     assert s.state.tts_flush is False
-    assert s._tts_buffer is not old_buffer, "buffer should be rebuilt (new object)"
-    assert list(s._tts_buffer.flush()) == [], "rebuilt buffer should be empty"
+    assert s._tts.buffer is not old_buffer, "buffer should be rebuilt (new object)"
+    assert list(s._tts.buffer.flush()) == [], "rebuilt buffer should be empty"
 
 
 @run_async
@@ -321,5 +321,5 @@ async def test_T8_barged_turn_returns_without_flushing():
     await s._llm_turn_with_tools([{"role": "user", "content": "请帮我开灯"}])
 
     assert fake.calls == 0, "barged turn must not call the LLM"
-    assert s._tts_q.empty(), "barged turn must not flush any text to TTS"
+    assert s._tts.q.empty(), "barged turn must not flush any text to TTS"
     assert s.state.tts_flush is False
