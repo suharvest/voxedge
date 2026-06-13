@@ -979,6 +979,16 @@ async def test_advertise_then_server_loop_picks_remote_tool_e2e():
         }],
         "system_prompt": "You are a robot arm assistant.",
     })
+    # The advertise handshake fires a best-effort LLM prefix warm-up as an
+    # un-awaited background task (Session._warm_llm_prefix → one extra
+    # stream_events call). It shares this test's finite _ScriptedLLM, so if the
+    # event loop schedules it mid-pump (more likely on slower hardware) it
+    # consumes a scripted round and inflates llm.calls non-deterministically.
+    # Cancel it now — before any await, so it never runs — so this test
+    # measures only the tool pump. Warm-up has its own coverage in
+    # test_llm_prefix_warmup.py.
+    if sess0._warm_task is not None:
+        sess0._warm_task.cancel()
     assert registry.get("look_up").dispatch_mode == "remote"
 
     # Drive the server-side pump on the SAME engine/registry. The capture
