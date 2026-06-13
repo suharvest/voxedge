@@ -82,9 +82,9 @@ async def test_v2v_client_close_no_speech_returns_and_sets_flags():
 
     await asyncio.wait_for(session.run(), timeout=4.0)
 
-    assert session.state["client_closed"] is True
-    assert session.state["tts_flush"] is True
-    assert session.state["asr_session_closed"] is True
+    assert session.state.client_closed is True
+    assert session.state.tts_flush is True
+    assert session.state.asr_session_closed is True
 
 
 @run_async
@@ -105,9 +105,9 @@ async def test_v2v_client_close_after_turn_returns():
 
     await asyncio.wait_for(session.run(), timeout=5.0)
 
-    assert session.state["client_closed"] is True
-    assert session.state["tts_flush"] is True
-    assert session.state["asr_session_closed"] is True
+    assert session.state.client_closed is True
+    assert session.state.tts_flush is True
+    assert session.state.asr_session_closed is True
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -138,13 +138,13 @@ async def test_quiet_client_does_not_terminate_session():
     await asyncio.sleep(0.5)
 
     assert not run_task.done(), "quiet client wrongly terminated the session"
-    assert session.state["client_closed"] is False
-    assert session.state["asr_session_closed"] is False
+    assert session.state.client_closed is False
+    assert session.state.asr_session_closed is False
 
     # Now actually close → it must wind down promptly.
     transport.end_input()
     await asyncio.wait_for(run_task, timeout=5.0)
-    assert session.state["client_closed"] is True
+    assert session.state.client_closed is True
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -290,6 +290,6 @@ async def test_v2v_over_ws_raised_disconnect_returns():
 
     await asyncio.wait_for(session.run(), timeout=5.0)
 
-    assert session.state["client_closed"] is True
-    assert session.state["tts_flush"] is True
+    assert session.state.client_closed is True
+    assert session.state.tts_flush is True
     assert ws.closed is True

@@ -269,14 +269,14 @@ async def test_T6_bargein_drains_queue_and_rebuilds_buffer():
     await s._tts_q.put("残句二")
     assert s._tts_buffer is not None
     s._tts_buffer.add("半句")  # no terminator → stays buffered
-    s.state["tts_flush"] = True
+    s.state.tts_flush = True
     old_buffer = s._tts_buffer
 
     await s._bargein_tts()
 
     assert s._tts_q.empty(), "queue should be drained"
-    assert s.state["llm_barged"] is True
-    assert s.state["tts_flush"] is False
+    assert s.state.llm_barged is True
+    assert s.state.tts_flush is False
     assert s._tts_buffer is not old_buffer, "buffer should be rebuilt (new object)"
     assert list(s._tts_buffer.flush()) == [], "rebuilt buffer should be empty"
 
@@ -289,11 +289,11 @@ async def test_T7_bargein_awaits_cooperative_llm_task():
 
     async def _coop_turn():
         # Self-stops once the barge-in flag flips.
-        while not s.state["llm_barged"]:
+        while not s.state.llm_barged:
             await asyncio.sleep(0.01)
 
     task = asyncio.create_task(_coop_turn())
-    s.state["current_llm_task"] = task
+    s.state.current_llm_task = task
     # Let it spin at least once before barging in.
     await asyncio.sleep(0.02)
     assert not task.done()
@@ -301,7 +301,7 @@ async def test_T7_bargein_awaits_cooperative_llm_task():
     await s._bargein_tts()
 
     assert task.done(), "cooperative task should have stopped and been awaited"
-    assert s.state["llm_barged"] is True
+    assert s.state.llm_barged is True
 
 
 @run_async
@@ -317,9 +317,9 @@ async def test_T8_barged_turn_returns_without_flushing():
     s = _session(extra_backends={"llm": fake})
     s.engine.tool_registry = reg
 
-    s.state["llm_barged"] = True  # barge-in landed before the turn started
+    s.state.llm_barged = True  # barge-in landed before the turn started
     await s._llm_turn_with_tools([{"role": "user", "content": "请帮我开灯"}])
 
     assert fake.calls == 0, "barged turn must not call the LLM"
     assert s._tts_q.empty(), "barged turn must not flush any text to TTS"
-    assert s.state["tts_flush"] is False
+    assert s.state.tts_flush is False

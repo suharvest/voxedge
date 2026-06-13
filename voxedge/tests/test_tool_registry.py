@@ -314,7 +314,7 @@ async def test_pump_one_tool_round_then_text():
     assert tool_msg["tool_call_id"] == "call_1"
     assert "21" in tool_msg["content"]
     # Final text spoken → tts_flush set.
-    assert sess.state["tts_flush"] is True
+    assert sess.state.tts_flush is True
 
 
 @run_async
@@ -329,7 +329,7 @@ async def test_pump_no_tool_short_circuits():
     sess = _make_session(llm, registry)
     await sess._llm_turn_with_tools([{"role": "user", "content": "hi"}])
     assert len(llm.calls) == 1  # no continuation
-    assert sess.state["tts_flush"] is True
+    assert sess.state.tts_flush is True
 
 
 @run_async
@@ -351,7 +351,7 @@ async def test_pump_iteration_cap():
     await sess._llm_turn_with_tools([{"role": "user", "content": "go"}])
     # Capped at max_tool_rounds LLM calls.
     assert len(llm.calls) == 3
-    assert sess.state["tts_flush"] is True
+    assert sess.state.tts_flush is True
 
 
 @run_async
@@ -444,7 +444,7 @@ async def test_tool_registry_none_uses_plain_path():
     # Exactly one call, and NO tools kwarg passed (plain stream_events path).
     assert len(llm.calls) == 1
     assert "tools" not in llm.calls[0]["kw"]
-    assert sess.state["tts_flush"] is True
+    assert sess.state.tts_flush is True
 
 
 # ─────────────────── Phase 2a: remote dispatch ──────────────────────
@@ -1006,7 +1006,7 @@ async def test_advertise_then_server_loop_picks_remote_tool_e2e():
     assert len(llm.calls) == 2
     r2_roles = [m["role"] for m in llm.calls[1]["messages"]]
     assert "tool" in r2_roles
-    assert sess.state["tts_flush"] is True
+    assert sess.state.tts_flush is True
 
 
 class _CaptureTransport:

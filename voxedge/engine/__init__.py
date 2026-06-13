@@ -4,6 +4,7 @@ from __future__ import annotations
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 from voxedge.engine.conversation import ConversationEngine, Session
 from voxedge.engine.coordinator import BackendCoordinator
+from voxedge.engine.session_state import SessionState
 from voxedge.engine.tool_registry import (
     Tool,
     ToolContext,
@@ -14,6 +15,7 @@ from voxedge.engine.tool_registry import (
 __all__ = [
     "ConversationEngine",
     "Session",
+    "SessionState",
     "BackendCoordinator",
     "ConcurrencyCapability",
     "Tool",

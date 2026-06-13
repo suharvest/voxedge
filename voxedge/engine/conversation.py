@@ -59,6 +59,7 @@ from voxedge.engine.asr_session_manager import (
     ASRSessionUnavailable,
 )
 from voxedge.engine.coordinator import BackendCoordinator
+from voxedge.engine.session_state import SessionState
 from voxedge.engine.tts_buffer import LowLatencyTTSBuffer
 from voxedge.transport.base import Transport
 
@@ -264,34 +265,12 @@ class Session:
         self._tts_chunk_timeout_s = engine.tts_chunk_timeout_s
         self._tts_sentence_timeout_s = engine.tts_sentence_timeout_s
 
-        # per-conn state (mirrors app/main.py:2751-2791 state dict)
-        self.state = {
-            "client_closed": False,
-            "asr_active": False,
-            "asr_active_gen": 0,
-            "asr_session_closed": False,
-            "endpoint_pending": None,
-            "endpoint_pending_gen": None,
-            "current_tts_task": None,
-            "current_tts_stop": None,
-            # #2: handle to the in-flight server-loop LLM/tool turn so a
-            # barge-in can stop it (cooperatively — see ``llm_barged``) and
-            # _asr_out_task can move on to the next utterance instead of
-            # blocking on a turn whose (slow) round2 the user just interrupted.
-            "current_llm_task": None,
-            # #2: cooperative barge-in flag. task.cancel() alone is unsafe
-            # here — _dispatch_remote swallows CancelledError (returns a
-            # "cancelled" result) so a cancel landing mid remote-dispatch would
-            # NOT stop the turn. The turn polls this flag at each checkpoint
-            # (per stream event / per round / after dispatch) and self-
-            # terminates; _bargein_tts also cancel_pending_remote() to unblock
-            # an in-flight remote await fast.
-            "llm_barged": False,
-            "tts_flush": False,
-            "tts_started": False,
-            # M1: per-ASR-turn wall-clock deadline anchor (app/main.py:2790).
-            "asr_turn_started_at": None,
-        }
+        # per-conn state (mirrors app/main.py:2751-2791 state dict). Step 1 of
+        # the conversation.py split: a typed SessionState with grouped
+        # transition methods, replacing the ad-hoc dict. Field defaults +
+        # transitions are a 1:1 port — no behaviour change. See
+        # voxedge/engine/session_state.py.
+        self.state = SessionState()
         self._work_tasks: list[asyncio.Task] = []
         # Server-loop LLM prefix warm-up state. The agent skips its local LLM
         # warmup in server-loop mode (the LLM runs here), so voxedge primes
@@ -350,13 +329,13 @@ class Session:
         try:
             await self.transport.send_event(payload)
         except Exception:
-            self.state["client_closed"] = True
+            self.state.client_closed = True
 
     async def _send_audio(self, data: bytes) -> None:
         try:
             await self.transport.send_audio(data)
         except Exception:
-            self.state["client_closed"] = True
+            self.state.client_closed = True
 
     async def _send_error(self, msg: str) -> None:
         await self._send_event({"type": SERVER_ERROR, "error": msg})
@@ -374,9 +353,9 @@ class Session:
         multi = self.engine.multi_utterance
         try:
             async for data in self.transport.recv_audio():
-                if state["client_closed"]:
+                if state.client_closed:
                     break
-                if not self.asr_enabled or state["asr_session_closed"]:
+                if not self.asr_enabled or state.asr_session_closed:
                     continue
                 samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 speech_ended_now = False
@@ -398,26 +377,25 @@ class Session:
                         speech_ended_now = True
 
                 # No-VAD: open lazily on first audio (app/main.py:2901-2921).
-                if self._vad is None and not state["asr_active"]:
+                if self._vad is None and not state.asr_active:
                     if not await self._open_asr_turn():
                         continue
 
-                if state["asr_active"]:
+                if state.asr_active:
                     await self._asr_mgr.accept_audio(samples)
 
                 # Now safe to latch endpoint (app/main.py:2929-2942).
                 if speech_ended_now:
-                    state["endpoint_pending"] = "vad"
-                    state["endpoint_pending_gen"] = state["asr_active_gen"]
+                    state.stamp_endpoint("vad")
                     if not multi:
-                        state["asr_session_closed"] = True
+                        state.asr_session_closed = True
                     await self._send_event({
                         "type": SERVER_VAD_EVENT,
                         "event": VAD_EVENT_SPEECH_END,
                     })
         except Exception:
             logger.exception("voxedge audio_loop error")
-            state["client_closed"] = True
+            state.client_closed = True
 
     async def _event_loop(self) -> None:
         """Inbound control events. Port of the text-frame branch of
@@ -426,7 +404,7 @@ class Session:
         multi = self.engine.multi_utterance
         try:
             async for payload in self.transport.recv_event():
-                if state["client_closed"]:
+                if state.client_closed:
                     break
                 typ = payload.get("type")
                 if typ == CLIENT_TEXT and self._tts_buffer is not None:
@@ -436,12 +414,11 @@ class Session:
                     if self._tts_buffer is not None:
                         for sentence in self._tts_buffer.flush():
                             await self._tts_q.put(sentence)
-                    state["tts_flush"] = True
+                    state.tts_flush = True
                 elif typ == CLIENT_ASR_EOS:
-                    state["endpoint_pending"] = "client_eos"
-                    state["endpoint_pending_gen"] = state["asr_active_gen"]
+                    state.stamp_endpoint("client_eos")
                     if not multi:
-                        state["asr_session_closed"] = True
+                        state.asr_session_closed = True
                 elif typ == CLIENT_ABORT:
                     # _bargein_tts now owns the full TTS cleanup (cancel synth +
                     # LLM turn, drain queue, reset buffer) for both barge-in
@@ -449,10 +426,9 @@ class Session:
                     # explicitly aborted, so (unlike VAD SPEECH_START) no new
                     # utterance is being opened.
                     await self._bargein_tts()
-                    if self._asr_mgr is not None and state["asr_active"]:
+                    if self._asr_mgr is not None and state.asr_active:
                         await self._asr_mgr.cancel("abort")
-                        state["asr_active"] = False
-                        state["asr_turn_started_at"] = None
+                        state.deactivate_asr()
                 elif typ == CLIENT_TOOL_RESULT:
                     # Remote-tool wire (spec §4 Mode B): route a device client's
                     # tool result back to the awaiting _dispatch_remote future.
@@ -476,7 +452,7 @@ class Session:
                     self._handle_tool_advertise(payload)
         except Exception:
             logger.exception("voxedge event_loop error")
-            state["client_closed"] = True
+            state.client_closed = True
 
     def _handle_tool_advertise(self, payload: dict) -> None:
         """Register client-advertised tool schemas into the engine registry
@@ -614,16 +590,16 @@ class Session:
         identical.
         """
         # 1. Stop the in-flight TTS synth.
-        t = self.state["current_tts_task"]
+        t = self.state.current_tts_task
         if t is not None and not t.done():
             t.cancel()
-        stop = self.state["current_tts_stop"]
+        stop = self.state.current_tts_stop
         if stop is not None:
             stop.set()
         # 2. #2: stop the in-flight LLM/tool turn. Set the cooperative flag
         # (the turn polls it at each checkpoint), then unblock any in-flight
         # remote tool dispatch so the turn reaches its next checkpoint fast.
-        self.state["llm_barged"] = True
+        self.state.llm_barged = True
         # Phase 2a: barge-in must not orphan in-flight remote tool calls
         # (spec §7). Clearing pending remote-dispatch futures makes their
         # awaiting _dispatch_remote return a recoverable "cancelled" dict.
@@ -637,7 +613,7 @@ class Session:
         # be swallowed by _dispatch_remote and NOT stop the turn anyway; the
         # cooperative flag is the reliable stop. The bound keeps _audio_loop
         # responsive if the turn is wedged in a sync tool / silent backend.
-        llm = self.state.get("current_llm_task")
+        llm = self.state.current_llm_task
         if llm is not None and not llm.done():
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.wait_for(asyncio.shield(llm), timeout=2.0)
@@ -650,7 +626,7 @@ class Session:
                 break
         if self._tts_be is not None:
             self._tts_buffer = self._make_tts_buffer()
-        self.state["tts_flush"] = False
+        self.state.tts_flush = False
 
     async def _open_asr_turn(self) -> bool:
         """Start a fresh ASR utterance via the session manager.
@@ -665,9 +641,8 @@ class Session:
         try:
             new_gen = await self._asr_mgr.on_speech_start()
         except ASRSessionUnavailable as e:
-            state["asr_active"] = False
-            state["endpoint_pending"] = None
-            state["endpoint_pending_gen"] = None
+            state.asr_active = False
+            state.clear_endpoint()
             # M4: the manager wraps create_stream failures in
             # ASRSessionUnavailable (raised ``from`` the original). If the
             # root cause was a slot-pool saturation, surface the typed
@@ -685,15 +660,11 @@ class Session:
             if sat:
                 # M4: backend slot-pool saturated → typed 4429, not a fault.
                 await self._emit_pool_saturated(max_slots)
-                state["asr_active"] = False
+                state.asr_active = False
                 return False
             raise
-        state["endpoint_pending"] = None
-        state["endpoint_pending_gen"] = None
-        state["asr_active"] = True
-        state["asr_active_gen"] = new_gen
         # M1: anchor the per-turn wall-clock deadline (app/main.py:2892).
-        state["asr_turn_started_at"] = self._loop.time()
+        state.open_asr_generation(new_gen, self._loop.time())
         return True
 
     async def _emit_pool_saturated(self, max_slots: Optional[int]) -> None:
@@ -713,14 +684,14 @@ class Session:
         last_streamed_final = None
         last_partial: tuple[int, str] = (-1, "")
         asr_turn_timeout_s = self._asr_turn_timeout_s
-        while not state["client_closed"]:
+        while not state.client_closed:
             # ── M1: wall-clock per-turn deadline (app/main.py:3012-3077) ─
             # Active turn that hasn't finalized within the deadline → force
             # cancel + worker restart (via the manager's bounded cancel
             # ladder) so a wedged backend can't pin the session forever.
-            turn_started = state.get("asr_turn_started_at")
+            turn_started = state.asr_turn_started_at
             if (
-                state.get("asr_active")
+                state.asr_active
                 and turn_started is not None
                 and (self._loop.time() - turn_started) > asr_turn_timeout_s
             ):
@@ -744,23 +715,21 @@ class Session:
                         )
                 # Step 2: clear state + emit error so the client unwinds
                 # (app/main.py:3055-3068).
-                state["asr_active"] = False
-                state["asr_turn_started_at"] = None
-                state["endpoint_pending"] = None
-                state["endpoint_pending_gen"] = None
+                state.deactivate_asr()
+                state.clear_endpoint()
                 try:
                     await self._send_error(
                         f"asr: per-turn deadline {asr_turn_timeout_s:.0f}s exceeded"
                     )
                 except Exception:
                     logger.exception("voxedge send_error after asr turn timeout failed")
-                if multi and not state["asr_session_closed"]:
+                if multi and not state.asr_session_closed:
                     await asyncio.sleep(0.05)
                     continue
                 return
 
             # ── partial poll (app/main.py:3084-3096) ──────────────────
-            if state["asr_active"]:
+            if state.asr_active:
                 try:
                     # M2: atomic (gen, partial, is_endpoint) snapshot under
                     # the manager's lock — no torn read against a stream that
@@ -776,7 +745,7 @@ class Session:
                 # similarly, app/main.py:3001/3187).
                 if (
                     partial
-                    and partial_gen == state["asr_active_gen"]
+                    and partial_gen == state.asr_active_gen
                     and (partial_gen, partial) != last_partial
                 ):
                     last_partial = (partial_gen, partial)
@@ -789,28 +758,26 @@ class Session:
                 is_endpoint = False
 
             # ── endpoint resolution (app/main.py:3098-3119) ───────────
-            endpoint_reason = state["endpoint_pending"]
+            endpoint_reason = state.endpoint_pending
             # Gen-race gate (app/main.py:3107-3114): endpoint stamped against a
             # generation that has since been preempted → drop on the floor.
             if (
                 endpoint_reason
-                and state["endpoint_pending_gen"] is not None
-                and state["endpoint_pending_gen"] != state["asr_active_gen"]
+                and state.endpoint_pending_gen is not None
+                and state.endpoint_pending_gen != state.asr_active_gen
             ):
-                state["endpoint_pending"] = None
-                state["endpoint_pending_gen"] = None
+                state.clear_endpoint()
                 endpoint_reason = None
 
-            endpoint_fired = bool(endpoint_reason) or (is_endpoint and state["asr_active"])
+            endpoint_fired = bool(endpoint_reason) or (is_endpoint and state.asr_active)
 
             if endpoint_fired:
-                state["endpoint_pending"] = None
-                state["endpoint_pending_gen"] = None
+                state.clear_endpoint()
                 if endpoint_reason != "client_eos":
                     await self._send_event({"type": SERVER_ASR_ENDPOINT})
 
-                if state["asr_active"]:
-                    finalize_gen = state["asr_active_gen"]
+                if state.asr_active:
+                    finalize_gen = state.asr_active_gen
                     # M2: finalize_with_status suppresses stale/cancelled
                     # results (accepted=False) so a finalize that raced a
                     # barge-in doesn't emit a spurious final
@@ -828,15 +795,14 @@ class Session:
                     else:
                         final_text, detected_language = "", None
                     # Only clear active if generation still current (BUG 2).
-                    if state["asr_active_gen"] == finalize_gen:
-                        state["asr_active"] = False
-                        state["asr_turn_started_at"] = None
+                    if state.asr_active_gen == finalize_gen:
+                        state.deactivate_asr()
                 else:
                     final_text, detected_language = "", None
 
                 # ── emit asr_final (app/main.py:3164-3197) ────────────
                 if multi:
-                    is_closing = state["asr_session_closed"]
+                    is_closing = state.asr_session_closed
                     # Close-out endpoint with no fresh utterance (e.g. a
                     # client_eos / input-end arriving after the turn already
                     # finalized via VAD): there is nothing new to transcribe,
@@ -877,7 +843,7 @@ class Session:
                     return
 
             # Exit when closed + nothing left (app/main.py:3202-3203).
-            if state["asr_session_closed"] and not state["asr_active"]:
+            if state.asr_session_closed and not state.asr_active:
                 return
             await asyncio.sleep(0.02)
 
@@ -905,11 +871,11 @@ class Session:
             # stop an in-flight turn. Reset the cooperative flag and create the
             # task in one synchronous step (no await between) so a barge-in
             # arriving right after create_task isn't lost to the reset.
-            self.state["llm_barged"] = False
+            self.state.llm_barged = False
             task = asyncio.create_task(
                 self._llm_turn_with_tools([{"role": "user", "content": text}])
             )
-            self.state["current_llm_task"] = task
+            self.state.current_llm_task = task
             try:
                 await task
             except asyncio.CancelledError:
@@ -923,8 +889,8 @@ class Session:
                     task.cancel()
                     raise
             finally:
-                if self.state.get("current_llm_task") is task:
-                    self.state["current_llm_task"] = None
+                if self.state.current_llm_task is task:
+                    self.state.current_llm_task = None
             return
         messages = [{"role": "user", "content": text}]
         try:
@@ -937,7 +903,7 @@ class Session:
                 # so the backend never emits tool calls.
             for sentence in self._tts_buffer.flush():
                 await self._tts_q.put(sentence)
-            self.state["tts_flush"] = True
+            self.state.tts_flush = True
         except Exception:
             logger.exception("voxedge LLM stream failed")
 
@@ -1011,7 +977,7 @@ class Session:
                 # #2: barged in between rounds → drop this turn (discard any
                 # partial text; _bargein_tts owns the TTS cleanup). Returning
                 # abandons the stream generator so the LLM connection closes.
-                if self.state.get("llm_barged"):
+                if self.state.llm_barged:
                     return
 
                 async for ev in self._llm_be.stream_events(
@@ -1019,7 +985,7 @@ class Session:
                 ):
                     # #2: barge-in mid-stream — stop consuming deltas and drop
                     # the turn WITHOUT flushing the partial sentence buffer.
-                    if self.state.get("llm_barged"):
+                    if self.state.llm_barged:
                         return
                     if _ttft is None:
                         _ttft = time.perf_counter() - _t_round_start
@@ -1061,14 +1027,14 @@ class Session:
                     # event and here (the per-event guard above won't catch it).
                     # Don't flush stale text onto the freshly-drained queue —
                     # _bargein_tts owns cleanup for the interrupted turn.
-                    if self.state.get("llm_barged"):
+                    if self.state.llm_barged:
                         return
                     final_text = "".join(text_chunks)
                     if final_text:
                         messages.append({"role": "assistant", "content": final_text})
                     for sentence in self._tts_buffer.flush():
                         await self._tts_q.put(sentence)
-                    self.state["tts_flush"] = True
+                    self.state.tts_flush = True
                     return
 
                 # Commit assistant(tool_calls) to the local message list.
@@ -1139,7 +1105,7 @@ class Session:
                 # #2: a barge-in landing during tool dispatch (cancel_pending_
                 # remote unblocked the remote await with a "cancelled" result)
                 # → drop the turn before re-requesting the LLM.
-                if self.state.get("llm_barged"):
+                if self.state.llm_barged:
                     return
 
                 # #7: template fast-path. If EVERY tool dispatched this round
@@ -1163,23 +1129,23 @@ class Session:
                     await self._enqueue_tts_text(spoken)
                     for sentence in self._tts_buffer.flush():
                         await self._tts_q.put(sentence)
-                    self.state["tts_flush"] = True
+                    self.state.tts_flush = True
                     return
                 # loop: re-request the LLM with the tool results appended.
 
             # Iteration cap hit — flush whatever was spoken and finish.
             logger.warning("voxedge tool loop hit max_tool_rounds=%d", max_rounds)
-            if self.state.get("llm_barged"):
+            if self.state.llm_barged:
                 return
             for sentence in self._tts_buffer.flush():
                 await self._tts_q.put(sentence)
-            self.state["tts_flush"] = True
+            self.state.tts_flush = True
         except Exception:
             logger.exception("voxedge LLM tool loop failed")
             try:
                 for sentence in self._tts_buffer.flush():
                     await self._tts_q.put(sentence)
-                self.state["tts_flush"] = True
+                self.state.tts_flush = True
             except Exception:
                 logger.exception("voxedge tool-loop flush after error failed")
 
@@ -1201,12 +1167,12 @@ class Session:
         state = self.state
         multi = self.engine.multi_utterance
         sr_header_sent = False
-        while not state["client_closed"]:
+        while not state.client_closed:
             # Exit / per-turn done when flush + drained (app/main.py:3217-3233).
-            if state["tts_flush"] and self._tts_q.empty():
-                if multi and not state["asr_session_closed"]:
-                    state["tts_flush"] = False
-                    if not state["client_closed"]:
+            if state.tts_flush and self._tts_q.empty():
+                if multi and not state.asr_session_closed:
+                    state.tts_flush = False
+                    if not state.client_closed:
                         await self._send_event({
                             "type": SERVER_TTS_DONE,
                             "session_complete": False,
@@ -1220,7 +1186,7 @@ class Session:
 
             audio_queue: asyncio.Queue = asyncio.Queue()
             stop_event = threading.Event()
-            state["current_tts_stop"] = stop_event
+            state.current_tts_stop = stop_event
 
             # Engine-parity #15: resolve speaker / voice / speed kwargs once
             # per sentence (same dict the legacy _run_synth builds,
@@ -1272,7 +1238,7 @@ class Session:
                 # Held across the whole synth so the synth thread runs alone.
                 async with self._acquire("tts"):
                     self._loop.run_in_executor(None, _run_synth, s, ev, aq)
-                    state["tts_started"] = True
+                    state.tts_started = True
                     # M3: per-chunk watchdog — a wedged backend that produces no
                     # chunk within the budget aborts the sentence + emits an
                     # error so the client never waits forever (app/main.py:3322-3339).
@@ -1303,7 +1269,7 @@ class Session:
                 await self._send_event({"type": SERVER_TTS_SENTENCE_DONE, "sentence": s})
 
             task = asyncio.create_task(drain(sentence, stop_event, audio_queue))
-            state["current_tts_task"] = task
+            state.current_tts_task = task
             # M3: outer per-sentence wall-clock deadline. Covers wedges BEFORE
             # the first chunk watchdog can fire (e.g. a backend that hangs in
             # generate_streaming setup before yielding) (app/main.py:3382-3409).
@@ -1321,7 +1287,7 @@ class Session:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-                if not state["client_closed"]:
+                if not state.client_closed:
                     try:
                         await self._send_error(
                             f"tts: per-sentence deadline "
@@ -1340,11 +1306,11 @@ class Session:
                 except asyncio.QueueEmpty:
                     pass
             finally:
-                state["current_tts_task"] = None
-                state["current_tts_stop"] = None
+                state.current_tts_task = None
+                state.current_tts_stop = None
 
         # Session-final tts_done (app/main.py:3424-3432).
-        if not state["client_closed"]:
+        if not state.client_closed:
             payload = {"type": SERVER_TTS_DONE}
             if multi:
                 payload["session_complete"] = True
@@ -1411,8 +1377,7 @@ class Session:
             # set by the run() finally, AFTER the gather has resolved (i.e. the
             # work tasks have drained and emitted their finals).
             await asyncio.gather(*recv_tasks, return_exceptions=True)
-            self.state["asr_session_closed"] = True
-            self.state["tts_flush"] = True
+            self.state.close_input()
             # Don't orphan in-flight remote tool futures on disconnect: clear
             # them (same barge-in cancel mechanism, conversation.py:528-535 /
             # tool_registry.py:404-416) so any awaiting _dispatch_remote
@@ -1450,7 +1415,7 @@ class Session:
             # backends BEFORE closing the transport so the worker doesn't
             # leak the session and the synth thread is released for the next
             # connection.
-            self.state["client_closed"] = True
+            self.state.client_closed = True
             if not end_watcher.done():
                 end_watcher.cancel()
             # (a) cancel the recv loops + work tasks.
@@ -1466,7 +1431,7 @@ class Session:
                 self._warm_task.cancel()
             # (b) signal the synth thread to bail so the TTS executor frees up
             # (app/main.py:3513-3517).
-            stop = self.state.get("current_tts_stop")
+            stop = self.state.current_tts_stop
             if stop is not None:
                 try:
                     stop.set()
