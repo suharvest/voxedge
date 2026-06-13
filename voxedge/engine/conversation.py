@@ -59,6 +59,7 @@ from voxedge.engine.asr_session_manager import (
     ASRSessionUnavailable,
 )
 from voxedge.engine.asr_loop import _ASRLoop
+from voxedge.engine.audio_dispatcher import _AudioDispatcher
 from voxedge.engine.coordinator import BackendCoordinator
 from voxedge.engine.session_state import SessionState
 from voxedge.engine.tts_buffer import LowLatencyTTSBuffer
@@ -233,6 +234,9 @@ class Session:
         # _ASRLoop; _on_asr_final / _emit_pool_saturated / the ASRSessionManager
         # stay on Session (bridge + shared with TTS).
         self._asr = _ASRLoop(self)
+        # Step 5: inbound audio → VAD → ASR feed lives in _AudioDispatcher;
+        # barge-in (_bargein_tts) + ASR turn open/close stay on Session/_ASRLoop.
+        self._audio = _AudioDispatcher(self)
         self._loop = asyncio.get_event_loop()
 
         # M1/M3: wall-clock watchdog thresholds — constructor-injected (spec
@@ -321,59 +325,6 @@ class Session:
     # ══════════════════════════════════════════════════════════════════
     # dispatcher  ← app/main.py:2814-2990
     # ══════════════════════════════════════════════════════════════════
-
-    async def _audio_loop(self) -> None:
-        """Inbound audio frames → VAD segmentation + ASR feed.
-
-        Port of the binary-frame branch of dispatcher() (app/main.py:2831-2943).
-        """
-        state = self.state
-        multi = self.engine.multi_utterance
-        try:
-            async for data in self.transport.recv_audio():
-                if state.client_closed:
-                    break
-                if not self.asr_enabled or state.asr_session_closed:
-                    continue
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                speech_ended_now = False
-
-                if self._vad is not None:
-                    event = self._vad.process(samples)
-                    if event == self._vad.SPEECH_START:
-                        # Notify client first, then barge-in (app/main.py:2845-2893).
-                        await self._send_event({
-                            "type": SERVER_VAD_EVENT,
-                            "event": VAD_EVENT_SPEECH_START,
-                        })
-                        await self._bargein_tts()
-                        if not await self._asr.open_turn():
-                            continue
-                    elif event == self._vad.SPEECH_END:
-                        # Defer endpoint flag until AFTER accepting this chunk
-                        # (BUG 3, app/main.py:2894-2900).
-                        speech_ended_now = True
-
-                # No-VAD: open lazily on first audio (app/main.py:2901-2921).
-                if self._vad is None and not state.asr_active:
-                    if not await self._asr.open_turn():
-                        continue
-
-                if state.asr_active:
-                    await self._asr_mgr.accept_audio(samples)
-
-                # Now safe to latch endpoint (app/main.py:2929-2942).
-                if speech_ended_now:
-                    state.stamp_endpoint("vad")
-                    if not multi:
-                        state.asr_session_closed = True
-                    await self._send_event({
-                        "type": SERVER_VAD_EVENT,
-                        "event": VAD_EVENT_SPEECH_END,
-                    })
-        except Exception:
-            logger.exception("voxedge audio_loop error")
-            state.client_closed = True
 
     async def _event_loop(self) -> None:
         """Inbound control events. Port of the text-frame branch of
@@ -912,7 +863,7 @@ class Session:
         terminate cleanly, instead of polling forever until force-cancelled.
         """
         recv_tasks = [
-            asyncio.create_task(self._audio_loop()),
+            asyncio.create_task(self._audio.run()),
             asyncio.create_task(self._event_loop()),
         ]
         work_tasks: list[asyncio.Task] = []
