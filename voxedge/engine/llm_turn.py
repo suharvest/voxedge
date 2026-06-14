@@ -138,9 +138,16 @@ class _LLMTurn:
             ctx=ctx,
             llm_params=sess.engine.llm_params,
             max_rounds=sess.engine.max_tool_rounds,
-            # Server P0: all client seams stay at their server-equivalent
-            # defaults (None / False) so this adapter is byte-equivalent.
-            # The driver's return value (final text) is intentionally
-            # ignored here — the server speaks via the TTS sink.
+            # P2b: align the server pump to the client's semantic LLM-stream
+            # watchdog (first-token / idle). on_timeout stays None → the driver
+            # raises the default asyncio.TimeoutError, which reraise_errors=False
+            # swallows into a graceful flush + turn-end (vs hanging to the
+            # backend's coarse httpx read timeout). Non-timeout behaviour is
+            # unchanged — fast responses never hit the watchdog.
+            first_token_timeout_s=sess.engine.llm_first_token_timeout_s,
+            idle_timeout_s=sess.engine.llm_idle_timeout_s,
+            # All other client seams stay at server-equivalent defaults; the
+            # driver's return value (final text) is ignored — the server speaks
+            # via the TTS sink.
             reraise_errors=False,
         )

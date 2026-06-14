@@ -782,6 +782,16 @@ class ConversationEngine:
         self.asr_turn_timeout_s = float(self.timeouts.get("asr_turn", 45.0))
         self.tts_chunk_timeout_s = float(self.timeouts.get("tts_chunk", 10.0))
         self.tts_sentence_timeout_s = float(self.timeouts.get("tts_sentence", 15.0))
+        # P2b: server-loop LLM-stream watchdog — align the server pump to the
+        # client's semantic first-token / idle timeouts (vs only the backend's
+        # coarse httpx read timeout). On timeout the driver raises and, since
+        # the server adapter runs with reraise_errors=False, the turn ends
+        # gracefully (flush + log) rather than hanging. Defaults mirror the
+        # client (15s / 30s); injectable via the timeouts dict for tuning.
+        self.llm_first_token_timeout_s = float(
+            self.timeouts.get("llm_first_token", 15.0)
+        )
+        self.llm_idle_timeout_s = float(self.timeouts.get("llm_idle", 30.0))
 
         # Preload ready backends once (app/main.py does this at startup).
         for be in backends.values():
