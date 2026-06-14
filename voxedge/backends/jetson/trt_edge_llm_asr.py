@@ -1127,7 +1127,36 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             self._closed = True
             return self._join_committed(""), self._detected_language
         self._send_chunk(last=True)
-        return self._join_committed(self._final_text), self._detected_language
+        text = self._join_committed(self._final_text)
+        # Empty-final rescue (2026-06-14): the streaming worker withholds up to
+        # ``unfixed_token_num`` trailing tokens; a SHORT utterance whose entire
+        # output fits inside that hold emits NO final text (observed real-machine:
+        # short English commands → empty asr_final, while the offline transcribe()
+        # path — what POST /asr uses — transcribes the very same audio cleanly;
+        # short Chinese commits enough tokens to escape the hold). When the worker
+        # returned empty but we buffered ≥ offline_segment_min_s of audio, fall
+        # back to the offline path. Non-empty finals (Chinese / long English) take
+        # zero new code.
+        if not text.strip() and (
+            len(self._audio_accum) / self._sample_rate
+            >= self._backend._config.offline_segment_min_s
+        ):
+            try:
+                wav_bytes = _float_audio_to_wav_bytes(self._audio_accum, self._sample_rate)
+                result = self._backend.transcribe(wav_bytes, language=self._language)
+                if result.text and result.text.strip():
+                    logging.getLogger(__name__).info(
+                        "streaming finalize empty → offline fallback recovered %d chars",
+                        len(result.text),
+                    )
+                    return result.text.strip(), (
+                        getattr(result, "language", None) or self._detected_language
+                    )
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "streaming finalize offline fallback failed", exc_info=True
+                )
+        return text, self._detected_language
 
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
