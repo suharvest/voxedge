@@ -15,16 +15,20 @@ transport. It talks to the host only through three seams:
 * ``should_abort: Callable[[], bool]`` — cooperative barge/cancel poll,
   checked at every barge checkpoint exactly as the original.
 
-Strategy is explicit (never hard-coded):
+The driver has a SINGLE behaviour (server semantics, P2a unification — see
+docs/plans/turn-driver-unification.md §6d):
 
-* ``preamble_dedup``: ``"name"`` (server semantics) | ``"index"``.
-* ``template_fastpath``: ``"all_join"`` (server semantics) | ``"any_first"``.
+* preamble dedup is keyed by tool **name** (a same-name tool called twice in
+  one round speaks its preamble once).
+* the template fast-path is **all_join**: it short-circuits only when EVERY
+  dispatched tool succeeded in ``response_mode="template"`` with a non-empty
+  completion_text, and the spoken completion is the space-join of all
+  completion_texts. A mixed template/non-template round runs round 2.
 
-P0 callers (server) pass ``preamble_dedup="name"`` and
-``template_fastpath="all_join"`` to preserve ``llm_turn.py`` semantics
-byte-for-byte. Only the ``"name"`` / ``"all_join"`` branches are exercised by
-P0; the ``"index"`` / ``"any_first"`` branches exist for the P1 client wiring
-and are written to mirror the agent runner, but P0 must not depend on them.
+P1 carried ``preamble_dedup`` / ``template_fastpath`` strategy params (with
+``"index"`` / ``"any_first"`` client branches) so the agent client stayed
+byte-equivalent during extraction; P2a aligned the client to server semantics
+and removed those params + branches as dead code.
 """
 from __future__ import annotations
 
@@ -84,8 +88,6 @@ async def run_turn(
     ctx: Any,
     llm_params: dict[str, Any],
     max_rounds: int,
-    preamble_dedup: str = "name",
-    template_fastpath: str = "all_join",
     tools_schema: Any = _UNSET,
     llm_params_for_round: Optional[Callable[[int], dict[str, Any]]] = None,
     on_iteration_limit: Optional[Callable[[], None]] = None,
@@ -103,8 +105,10 @@ async def run_turn(
 ) -> Optional[str]:
     """Pure multi-turn LLM ↔ tool pump (spec §2/§4).
 
-    Byte-equivalent port of ``_LLMTurn.run`` for the server semantics
-    (``preamble_dedup="name"``, ``template_fastpath="all_join"``).
+    Single behaviour (server semantics, P2a): preamble dedup keyed by tool
+    name; template fast-path is all_join (short-circuit only when ALL tools
+    succeeded as template with non-empty completion_text; join completions
+    with a space).
 
     The caller MUST have already placed the system prompt at the head of
     ``msg_sink.working_messages()`` if one is desired — this function never
@@ -150,10 +154,10 @@ async def run_turn(
       (P0 behaviour: same TTS channel as assistant text). Client passes a
       dedicated callback (its ``on_tool_completion_text``) so the emission is
       distinguishable from streamed assistant tokens.
-    * ``on_template_misconfig(tool_name)`` — fired (``any_first`` only) when a
-      template tool SUCCEEDED but declared an empty completion_text, so the
-      fast-path is abandoned and a normal LLM round runs. Lets the client log
-      the operator warning from its own logger. Server (``all_join``) unused.
+    * ``on_template_misconfig(tool_name)`` — fired when a template tool
+      SUCCEEDED but declared an empty completion_text, so the all_join
+      fast-path cannot fire and a normal LLM round runs. Lets the client log
+      the operator warning from its own logger.
 
     Returns the final assistant text (client path uses it; the server
     adapter ignores it). May be ``None`` when nothing terminal was spoken
@@ -170,7 +174,7 @@ async def run_turn(
             text_chunks: list[str] = []
             tool_accs: dict[int, _ToolCallAcc] = {}
             finish_reason: Optional[str] = None
-            # preamble dedup key set: tool names ("name") or call indices ("index")
+            # preamble dedup key set: tool names (P2a — name-only semantics).
             preamble_fired: set = set()
 
             messages = msg_sink.working_messages()
@@ -280,13 +284,13 @@ async def run_turn(
                     if ev.name:
                         slot.name = ev.name
                         # Early-fire the per-tool preamble as soon as the
-                        # tool name is known (lowest voice latency).
-                        key = idx if preamble_dedup == "index" else ev.name
-                        if key not in preamble_fired:
+                        # tool name is known (lowest voice latency). Dedup by
+                        # tool name (P2a).
+                        if ev.name not in preamble_fired:
                             tool = registry.get(ev.name)
                             pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
                             if pre:
-                                preamble_fired.add(key)
+                                preamble_fired.add(ev.name)
                                 await text_sink.preamble(pre)
                     if ev.arguments:
                         slot.arguments += ev.arguments
@@ -314,11 +318,8 @@ async def run_turn(
                 await text_sink.flush()
                 return final_text
 
-            # Commit assistant(tool_calls) to the message list.
-            # Preserve the ORIGINAL tool_call indices alongside the payload
-            # so the "index" dedup fallback uses the real OpenAI index, not
-            # an enumerate() position (sparse indices are not equivalent —
-            # spec §6c, mirrors agent runner.py:287-293).
+            # Commit assistant(tool_calls) to the message list, in ascending
+            # original tool_call index order.
             preamble_content = "".join(text_chunks) or None
             sorted_idxs = sorted(tool_accs.keys())
             tc_payload: list[dict[str, Any]] = [
@@ -339,24 +340,18 @@ async def run_turn(
             # tools proxy over ctx.remote_send and await a correlated
             # tool_result — both return a JSON-serialisable dict.
             dispatched: list[tuple[str, str, str, Any]] = []
-            for tc_pos, tc in enumerate(tc_payload):
+            for tc in tc_payload:
                 tname = tc["function"]["name"]
-                # Original tool_call index for "index"-mode dedup (sparse-
-                # safe); position aligns with sorted_idxs.
-                tc_idx = (
-                    sorted_idxs[tc_pos] if tc_pos < len(sorted_idxs) else tc_pos
-                )
                 if on_tool_started is not None:
                     await on_tool_started(tc)
                 # Fallback preamble: fire here if the streamed name delta never
                 # triggered the early path above (e.g. backend sent the whole
-                # tool_call in one finish chunk).
-                key = tc_idx if preamble_dedup == "index" else tname
-                if tname and key not in preamble_fired:
+                # tool_call in one finish chunk). Dedup by tool name (P2a).
+                if tname and tname not in preamble_fired:
                     tool = registry.get(tname)
                     pre = (getattr(tool, "preamble_text", "") or "") if tool else ""
                     if pre:
-                        preamble_fired.add(key)
+                        preamble_fired.add(tname)
                         await text_sink.preamble(pre)
                 _t_disp = time.perf_counter()
                 args_raw = tc["function"]["arguments"]
@@ -391,50 +386,14 @@ async def run_turn(
             if should_abort():
                 return None
 
-            # #7: template fast-path.
-            if template_fastpath == "any_first":
-                # Client semantics (byte-equivalent to agent
-                # runner.py:382-442): walk template tools in dispatch order.
-                # First failed template tool → abandon fast-path. First
-                # template tool with empty completion_text → warn (via
-                # ``on_template_misconfig``) + abandon. Otherwise emit each
-                # eligible tool's completion_text and skip round 2; the synth
-                # assistant text is the FIRST eligible completion.
-                template_handled = False
-                for _tname, rmode, ctext, result in dispatched:
-                    if rmode != "template":
-                        continue
-                    ok = not (
-                        isinstance(result, dict)
-                        and result.get("success") is False
-                    )
-                    if not ok:
-                        template_handled = False
-                        break
-                    if not ctext:
-                        if on_template_misconfig is not None:
-                            on_template_misconfig(_tname)
-                        template_handled = False
-                        break
-                    template_handled = True
-                    if completion_text_cb is not None:
-                        await completion_text_cb(ctext)
-                    else:
-                        await text_sink.text(ctext)
-                if template_handled:
-                    synth = next(
-                        (
-                            ct for _n, rm, ct, _r in dispatched
-                            if rm == "template" and ct
-                        ),
-                        "",
-                    )
-                    if record_template_text and synth:
-                        msg_sink.add_assistant_text(synth)
-                    await text_sink.flush()
-                    return synth
-            elif dispatched and _template_fires(dispatched, template_fastpath):
-                spoken = _template_completion(dispatched, template_fastpath)
+            # #7: template fast-path (all_join — P2a single semantics).
+            # Short-circuit round 2 only when EVERY dispatched tool succeeded
+            # as response_mode="template" with a non-empty completion_text;
+            # the spoken completion is the space-join of all completion_texts.
+            # A mixed template/non-template round (or any failed/empty-text
+            # template tool) falls through to a normal LLM round 2.
+            if dispatched and _template_fires(dispatched):
+                spoken = _template_completion(dispatched)
                 logger.info(
                     "voxedge tool loop: template fast-path — skipping round2, "
                     "speaking completion_text (%r)", spoken,
@@ -453,6 +412,21 @@ async def run_turn(
                     msg_sink.add_assistant_text(spoken)
                 await text_sink.flush()
                 return spoken
+
+            # Operator diagnostic (orthogonal to the fast-path strategy;
+            # server passes ``on_template_misconfig=None`` → no-op, byte-
+            # equivalent). When the fast-path did NOT fire, surface any tool
+            # that declared ``response_mode="template"`` and SUCCEEDED but
+            # left ``completion_text`` empty — that misconfig is why we fall
+            # through to round 2, and it's worth flagging so it's fixable.
+            if on_template_misconfig is not None:
+                for _name, _mode, _comp, _res in dispatched:
+                    if (
+                        _mode == "template"
+                        and not _comp
+                        and not (isinstance(_res, dict) and _res.get("success") is False)
+                    ):
+                        on_template_misconfig(_name)
             # loop: re-request the LLM with the tool results appended.
 
         # Iteration cap hit — flush whatever was spoken and finish.
@@ -474,15 +448,10 @@ async def run_turn(
         return None
 
 
-def _template_fires(
-    dispatched: list[tuple[str, str, str, Any]], mode_policy: str
-) -> bool:
-    """Whether the template fast-path triggers for this round.
-
-    ``all_join`` (server): EVERY tool opted into ``response_mode="template"``
-    with a non-empty completion_text AND succeeded.
-    ``any_first`` (client): ANY such tool.
-    """
+def _template_fires(dispatched: list[tuple[str, str, str, Any]]) -> bool:
+    """Whether the all_join template fast-path triggers for this round:
+    EVERY tool opted into ``response_mode="template"`` with a non-empty
+    completion_text AND succeeded (P2a single semantics)."""
     def ok(entry: tuple[str, str, str, Any]) -> bool:
         _, mode, comp, res = entry
         return (
@@ -491,26 +460,10 @@ def _template_fires(
             and not (isinstance(res, dict) and res.get("success") is False)
         )
 
-    if mode_policy == "any_first":
-        return any(ok(e) for e in dispatched)
     return all(ok(e) for e in dispatched)
 
 
-def _template_completion(
-    dispatched: list[tuple[str, str, str, Any]], mode_policy: str
-) -> str:
-    """Spoken completion text for the template fast-path.
-
-    ``all_join`` (server): join all completion_texts with a space.
-    ``any_first`` (client): the first eligible tool's completion_text.
-    """
-    if mode_policy == "any_first":
-        for _, mode, comp, res in dispatched:
-            if (
-                mode == "template"
-                and comp
-                and not (isinstance(res, dict) and res.get("success") is False)
-            ):
-                return comp
-        return ""
+def _template_completion(dispatched: list[tuple[str, str, str, Any]]) -> str:
+    """Spoken completion text for the all_join template fast-path: join all
+    completion_texts with a space (P2a single semantics)."""
     return " ".join(comp for _, _, comp, _ in dispatched)

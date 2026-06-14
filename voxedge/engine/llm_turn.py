@@ -5,8 +5,9 @@ Conversation split step 7 (see seeed-local-voice docs/plans/conversation-split.m
 *algorithm* now lives in ``voxedge.engine.turn_driver.run_turn`` (provider-
 agnostic, no I/O — see docs/plans/turn-driver-unification.md, P0). ``_LLMTurn``
 is the server adapter: it wires the driver's seams to the owning ``Session``
-(TTS buffer, cooperative ``llm_barged`` flag, local message list) and pins the
-server strategy (``preamble_dedup="name"``, ``template_fastpath="all_join"``).
+(TTS buffer, cooperative ``llm_barged`` flag, local message list). The driver
+has a single behaviour (name dedup + all_join template fast-path); P2a removed
+the strategy params.
 
 Behaviour is byte-equivalent to the pre-extraction in-line pump. ``_on_asr_final``
 stays on ``Session`` (the ASR→LLM/TTS bridge) and drives this via the back-ref.
@@ -101,9 +102,10 @@ class _LLMTurn:
             the driver only appends assistant/tool messages;
           * ``TextSink`` → ``Session._tts`` (engine TTS buffer);
           * ``MessageSink`` → local append-only ``messages`` list;
-          * ``should_abort`` → ``sess.state.llm_barged`` (cooperative poll);
-          * server strategy pinned: ``preamble_dedup="name"``,
-            ``template_fastpath="all_join"``.
+          * ``should_abort`` → ``sess.state.llm_barged`` (cooperative poll).
+
+        The driver's single behaviour is name-keyed preamble dedup + the
+        all_join template fast-path (P2a).
 
         Only invoked when ``tool_registry`` is non-None, so the no-tool path in
         :meth:`Session._on_asr_final` is unaffected (Phase 1 contract).
@@ -136,8 +138,6 @@ class _LLMTurn:
             ctx=ctx,
             llm_params=sess.engine.llm_params,
             max_rounds=sess.engine.max_tool_rounds,
-            preamble_dedup="name",
-            template_fastpath="all_join",
             # Server P0: all client seams stay at their server-equivalent
             # defaults (None / False) so this adapter is byte-equivalent.
             # The driver's return value (final text) is intentionally
