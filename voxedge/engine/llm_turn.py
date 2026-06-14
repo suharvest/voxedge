@@ -138,4 +138,9 @@ class _LLMTurn:
             max_rounds=sess.engine.max_tool_rounds,
             preamble_dedup="name",
             template_fastpath="all_join",
+            # Server P0: all client seams stay at their server-equivalent
+            # defaults (None / False) so this adapter is byte-equivalent.
+            # The driver's return value (final text) is intentionally
+            # ignored here — the server speaks via the TTS sink.
+            reraise_errors=False,
         )
