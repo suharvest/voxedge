@@ -293,3 +293,114 @@ async def test_v2v_over_ws_raised_disconnect_returns():
     assert session.state.client_closed is True
     assert session.state.tts_flush is True
     assert ws.closed is True
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Test 6: half-open / silent client — idle watchdog must release the slot.
+#
+# THE ROOT-FIX CASE: the existing tests above all cover an EXPLICIT end of
+# stream (clean disconnect frame OR a raised WebSocketDisconnect). A truly
+# half-open client never sends another frame AND never raises — ws.receive()
+# would block forever, so _pump never enqueues _CLOSE, the engine's recv
+# iterators never return, and the SessionLimiter slot held by the caller
+# leaks until a manual restart. The idle watchdog (OVS_V2V_IDLE_TIMEOUT_S)
+# converts that infinite wait into an end-of-stream after the idle window.
+# ───────────────────────────────────────────────────────────────────────
+
+
+class _HalfOpenWS:
+    """A ws whose receive() yields a scripted prefix, then BLOCKS FOREVER on a
+    never-firing Event (no disconnect frame, no raised exception) — the exact
+    half-open / dead-socket shape that wedged ws.receive()."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._never = asyncio.Event()  # never set → receive() hangs forever
+        self.closed = False
+        self.receive_calls = 0
+
+    async def receive(self):
+        self.receive_calls += 1
+        if self._script:
+            item = self._script.pop(0)
+            return item
+        # Nothing left and no disconnect ever arrives: hang until cancelled.
+        await self._never.wait()
+        raise AssertionError("unreachable: _never is never set")
+
+    async def send_json(self, obj):  # pragma: no cover
+        pass
+
+    async def send_bytes(self, data):  # pragma: no cover
+        pass
+
+    async def close(self, code=None):
+        self.closed = True
+
+
+@run_async
+async def test_ws_pump_half_open_client_idle_timeout_enqueues_close():
+    """A half-open client (receive() blocks forever after the handshake) must
+    be torn down by the idle watchdog: _pump breaks on TimeoutError and the
+    finally enqueues _CLOSE so both recv iterators return. Pre-fix this hangs
+    until the outer wait_for cancels it (the slot-leak window)."""
+    ws = _HalfOpenWS([
+        {"type": "websocket.receive", "bytes": b"\x00\x01"},
+        # …then receive() blocks forever (no disconnect frame).
+    ])
+    # Tiny idle timeout so the test is fast; semantics identical to prod 90s.
+    t = WebSocketTransport(ws, idle_timeout_s=0.2)
+
+    # If the idle watchdog did NOT fire, these drains would hang forever;
+    # the outer timeout (well past the 0.2s idle window) converts the
+    # regression into a hard failure.
+    audio = await asyncio.wait_for(_drain_iter(t.recv_audio()), timeout=2.0)
+    events = await asyncio.wait_for(_drain_iter(t.recv_event()), timeout=2.0)
+
+    assert audio == [b"\x00\x01"]
+    assert events == []
+    assert t._closed is True
+
+
+@run_async
+async def test_v2v_over_ws_half_open_client_releases_within_timeout():
+    """End-to-end over WebSocketTransport: a half-open client mid audio stream
+    (no disconnect ever) must make Session.run() return via the idle watchdog,
+    so the caller's `finally` (which releases the SessionLimiter slot) runs.
+
+    We assert run() returns WELL WITHIN the outer budget — proving the slot is
+    freed within idle_timeout + epsilon rather than leaking forever — and that
+    the teardown flags / ws.close() match a normal disconnect exactly."""
+    engine = _v2v_engine()
+    audio_frame = _pcm(loud=True)
+    silent_frame = _pcm(loud=False)
+    # Same frame pattern as the raised-disconnect e2e test (a full spoken turn)
+    # so the ONLY difference under test is HOW the stream ends: idle watchdog
+    # vs an explicit disconnect. After the turn the client goes half-open:
+    # receive() blocks forever (no disconnect frame, no raised exception).
+    script = (
+        [{"type": "websocket.receive", "bytes": audio_frame} for _ in range(3)]
+        + [{"type": "websocket.receive", "bytes": silent_frame} for _ in range(3)]
+    )
+    ws = _HalfOpenWS(script)
+    transport = WebSocketTransport(ws, idle_timeout_s=0.3)
+    session = Session(engine, transport)
+
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    # Outer budget is far larger than the idle window; if the watchdog failed,
+    # this would only unwind at the 5s cancel (a hard failure for "released
+    # within timeout + epsilon").
+    await asyncio.wait_for(session.run(), timeout=5.0)
+    elapsed = loop.time() - t0
+
+    assert session.state.client_closed is True, (
+        "half-open client must funnel into the SAME client-closed teardown a "
+        "normal disconnect uses"
+    )
+    assert session.state.tts_flush is True
+    assert ws.closed is True
+    assert elapsed < 3.0, (
+        f"slot released too late ({elapsed:.2f}s): the idle watchdog "
+        f"(0.3s) must tear the session down promptly, not leak until cancel"
+    )
