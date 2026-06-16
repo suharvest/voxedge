@@ -32,6 +32,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
+import numpy as np
+
 from voxedge.backends.base import TTSBackend, TTSCapability
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,13 @@ class MossTtsNanoBackend(TTSBackend):
         self._max_seq_len = int(self._config.max_seq_len)
         self._sample_rate = int(self._config.sample_rate)
         self._channels = int(self._config.channels)
+        # The MOSS C++ worker ALWAYS emits interleaved stereo s16le. When the
+        # configured output is mono (channels == 1), downmix here. The v2v wire
+        # protocol carries sample_rate but NOT channel count, so a consumer that
+        # assumes mono (e.g. the reachy client) would otherwise read stereo
+        # bytes as mono -> pitch-doubled/echoey. Previously channels=1 only
+        # changed reported metadata; now it actually produces mono PCM.
+        self._downmix_to_mono = self._channels == 1
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._stdout_thread: threading.Thread | None = None
@@ -233,8 +242,24 @@ class MossTtsNanoBackend(TTSBackend):
     def unload(self) -> None:
         self.shutdown()
 
+    @staticmethod
+    def _stereo_to_mono_s16le(pcm: bytes) -> bytes:
+        """Downmix interleaved stereo s16le -> mono by averaging L/R.
+
+        ``pcm`` must contain a whole number of stereo frames (length a multiple
+        of 4 bytes); callers buffer any partial trailing frame across chunks.
+        """
+        if not pcm:
+            return b""
+        stereo = np.frombuffer(pcm, dtype=np.int16).reshape(-1, 2).astype(np.int32)
+        mono = ((stereo[:, 0] + stereo[:, 1]) // 2).astype(np.int16)
+        return mono.tobytes()
+
     def generate_streaming(self, text: str, **kwargs: Any) -> Iterator[bytes]:
-        """Yield raw stereo PCM s16le chunks from the worker."""
+        """Yield raw PCM s16le chunks from the worker.
+
+        The worker emits interleaved stereo; when ``channels == 1`` we downmix
+        to mono here (see ``self._downmix_to_mono``)."""
         request_id = uuid.uuid4().hex
         request = self._build_request(request_id, text, stream=True, kwargs=kwargs)
         attempt = 0
@@ -242,6 +267,7 @@ class MossTtsNanoBackend(TTSBackend):
             attempt += 1
             request_queue: queue.Queue[dict[str, Any]] = queue.Queue()
             first_chunk_ms: float | None = None
+            downmix_carry = b""  # partial trailing stereo frame across chunks
             start_time = time.monotonic()
             self._thread_local.last_stream_metadata = {}
             self._register_request_queue(request_id, request_queue)
@@ -274,6 +300,13 @@ class MossTtsNanoBackend(TTSBackend):
                             ) from exc
                         if first_chunk_ms is None:
                             first_chunk_ms = (time.monotonic() - start_time) * 1000.0
+                        if pcm and self._downmix_to_mono:
+                            # Keep whole stereo frames (4 bytes = 2ch * s16);
+                            # buffer any partial frame for the next chunk.
+                            buf = downmix_carry + pcm
+                            frame_bytes = (len(buf) // 4) * 4
+                            downmix_carry = buf[frame_bytes:]
+                            pcm = self._stereo_to_mono_s16le(buf[:frame_bytes])
                         if pcm:
                             yield pcm
                         continue
