@@ -157,6 +157,12 @@ class TRTEdgeLLMASRConfig:
     offline_segment_enabled: bool = True
     offline_segment_threshold_s: float = 6.0
     offline_segment_min_s: float = 0.4
+    # Empty/clipped-final offline rescue: a streaming final with this many
+    # whitespace-separated tokens OR fewer (and ≥ offline_segment_min_s of
+    # buffered audio) is re-transcribed offline. 1 catches the single-token
+    # "drop" → multi-word case while leaving every normal multi-token final on
+    # the zero-new-work fast path. 0 restricts the rescue to fully-empty finals.
+    offline_rescue_max_words: int = 1
 
     # Worker warmup.
     worker_warmup: bool = True
@@ -1137,19 +1143,45 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         # returned empty but we buffered ≥ offline_segment_min_s of audio, fall
         # back to the offline path. Non-empty finals (Chinese / long English) take
         # zero new code.
-        if not text.strip() and (
+        #
+        # Extended (2026-06-15): the worker can also commit a SINGLE token of a
+        # multi-word utterance ("drop" out of "drop it down" — real-machine)
+        # while withholding the rest, which the bare empty check misses. Also
+        # rescue a suspiciously SHORT streaming final (≤ offline_rescue_max_words
+        # tokens) when enough audio was buffered. The normal multi-token fast
+        # path is unchanged: zero new work, no offline call. If offline comes
+        # back empty or NOT longer, keep the streaming text (never regress).
+        stripped = text.strip()
+        word_count = len(stripped.split())
+        max_words = int(getattr(self._backend._config, "offline_rescue_max_words", 0))
+        enough_audio = (
             len(self._audio_accum) / self._sample_rate
             >= self._backend._config.offline_segment_min_s
-        ):
+        )
+        # CJK guard: the short-final rescue targets space-delimited languages
+        # (English "drop"). Chinese has no word spaces — a real one-character
+        # commit like "回家" is word_count==1 but NOT clipped (the worker
+        # commits enough CJK tokens to escape the hold), so never re-transcribe
+        # non-empty CJK finals; that keeps the existing Chinese fast path exact.
+        has_cjk = any("一" <= ch <= "鿿" for ch in stripped)
+        short_trigger = bool(stripped) and not has_cjk and word_count <= max_words
+        if (not stripped or short_trigger) and enough_audio:
             try:
                 wav_bytes = _float_audio_to_wav_bytes(self._audio_accum, self._sample_rate)
                 result = self._backend.transcribe(wav_bytes, language=self._language)
-                if result.text and result.text.strip():
+                offline = (result.text or "").strip()
+                # For empty finals: accept any non-empty offline text. For a
+                # short non-empty final: only replace when offline is strictly
+                # longer (more words) — never regress a real streaming token.
+                if offline and (
+                    not stripped or len(offline.split()) > word_count
+                ):
                     logging.getLogger(__name__).info(
-                        "streaming finalize empty → offline fallback recovered %d chars",
-                        len(result.text),
+                        "streaming finalize %s → offline fallback recovered %d chars",
+                        "empty" if not stripped else f"short({word_count}w)",
+                        len(offline),
                     )
-                    return result.text.strip(), (
+                    return offline, (
                         getattr(result, "language", None) or self._detected_language
                     )
             except Exception:

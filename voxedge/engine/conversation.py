@@ -749,6 +749,7 @@ class ConversationEngine:
         multi_utterance: bool = False,
         timeouts: Optional[dict] = None,
         silence_ms: int = 400,
+        vad_preroll_ms: int = 300,
         asr_language: str = "auto",
         tts_language: Optional[str] = None,
         tts_speaker_kwargs: Optional[dict] = None,
@@ -769,6 +770,11 @@ class ConversationEngine:
         self.multi_utterance = multi_utterance
         self.timeouts = timeouts or {}
         self.silence_ms = silence_ms
+        # First-word-drop fix (2026-06-15): Silero clips the ~200-300ms onset
+        # while it latches SPEECH_START, so the dispatcher buffers a short
+        # pre-speech ring and replays it as the first frames of the fresh ASR
+        # turn. 0 disables (behaviour byte-identical to the no-ring path).
+        self.vad_preroll_ms = max(0, int(vad_preroll_ms))
         self.asr_language = asr_language
         self.tts_language = tts_language
         # Engine-parity #15: TTS speaker / voice / speed + buffer selection.
