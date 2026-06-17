@@ -148,6 +148,10 @@ class MossTtsNanoBackend(TTSBackend):
     def sample_rate(self) -> int:
         return self._sample_rate
 
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # No native speed/pitch → both via DSP fallback.
+        return (False, False)
+
     def is_ready(self) -> bool:
         with self._proc_lock:
             return self._proc is not None and self._proc.poll() is None
@@ -255,7 +259,7 @@ class MossTtsNanoBackend(TTSBackend):
         mono = ((stereo[:, 0] + stereo[:, 1]) // 2).astype(np.int16)
         return mono.tobytes()
 
-    def generate_streaming(self, text: str, **kwargs: Any) -> Iterator[bytes]:
+    def _generate_streaming_impl(self, text: str, **kwargs: Any) -> Iterator[bytes]:
         """Yield raw PCM s16le chunks from the worker.
 
         The worker emits interleaved stereo; when ``channels == 1`` we downmix
@@ -333,7 +337,7 @@ class MossTtsNanoBackend(TTSBackend):
             finally:
                 self._forget_request_queue(request_id, request_queue)
 
-    def synthesize(
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -351,7 +355,7 @@ class MossTtsNanoBackend(TTSBackend):
             kwargs.setdefault("pitch_shift", pitch_shift)
 
         start_time = time.monotonic()
-        pcm_chunks = list(self.generate_streaming(text, language=language or "auto", **kwargs))
+        pcm_chunks = list(self._generate_streaming_impl(text, language=language or "auto", **kwargs))
         elapsed_ms = (time.monotonic() - start_time) * 1000.0
         pcm = b"".join(pcm_chunks)
         wav_bytes = self._pcm_to_wav(pcm, sample_rate=self._sample_rate, channels=self._channels)
@@ -386,7 +390,7 @@ class MossTtsNanoBackend(TTSBackend):
         if audio is None:
             raise ValueError("clone_voice requires reference_audio bytes")
         ref_audio_b64 = base64.b64encode(audio).decode("ascii")
-        return self.synthesize(
+        return self._synthesize_impl(
             text,
             language=language or "auto",
             ref_audio_b64=ref_audio_b64,

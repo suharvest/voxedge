@@ -751,10 +751,14 @@ class KokoroTRTBackend(TTSBackend):
     def _warmup(self) -> None:
         start = time.time()
         for text in ("OK.", "Hello."):
-            self.synthesize(text)
+            self._synthesize_impl(text)
         logger.info("Kokoro warmup: %.1fs", time.time() - start)
 
-    def synthesize(
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # Native speed via the model's speed input; pitch → DSP fallback.
+        return (True, False)
+
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -904,7 +908,7 @@ class KokoroTRTBackend(TTSBackend):
             "truncated": truncated,
         }
 
-    def generate_streaming(self, text: str, **kwargs):
+    def _generate_streaming_impl(self, text: str, **kwargs):
         voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
         sid = voice.get("speaker_id", self._config.default_speaker_id)
         segments = [text]
@@ -913,7 +917,7 @@ class KokoroTRTBackend(TTSBackend):
         chunk_ms = max(10, min(200, int(self._config.stream_chunk_ms)))
         chunk_bytes = max(2, int(SAMPLE_RATE * chunk_ms / 1000) * 2)
         for segment in segments:
-            wav, _meta = self.synthesize(
+            wav, _meta = self._synthesize_impl(
                 segment, speaker_id=sid, speed=kwargs.get("speed"),
             )
             if len(wav) <= 44:
