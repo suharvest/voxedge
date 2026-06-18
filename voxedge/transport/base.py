@@ -158,12 +158,29 @@ class WebSocketTransport(Transport):
     share a single underlying receive loop via an internal pump.
     """
 
-    def __init__(self, ws) -> None:
+    def __init__(self, ws, idle_timeout_s: Optional[float] = None) -> None:
         self._ws = ws
         self._audio_q: asyncio.Queue = asyncio.Queue()
         self._event_q: asyncio.Queue = asyncio.Queue()
         self._pump_task: Optional[asyncio.Task] = None
         self._closed = False
+        # Idle / half-open watchdog for the single un-timed ws.receive() in
+        # _pump. A dead client that never sends another frame would otherwise
+        # wedge receive() forever, so the engine's recv iterators never return,
+        # _watch_input_end never fires, and the SessionLimiter slot held by the
+        # caller leaks permanently. On timeout we treat the socket exactly like
+        # an end-of-stream (break → finally enqueues _CLOSE). Default 90s is
+        # longer than the agent thinking-watchdog / LLM stream-idle so a
+        # slow-but-alive turn is never killed. <=0 disables the watchdog.
+        import os as _os
+        if idle_timeout_s is None:
+            try:
+                idle_timeout_s = float(
+                    _os.environ.get("OVS_V2V_IDLE_TIMEOUT_S", 90.0)
+                )
+            except (TypeError, ValueError):
+                idle_timeout_s = 90.0
+        self._idle_timeout_s = idle_timeout_s
 
     def _ensure_pump(self) -> None:
         if self._pump_task is None:
@@ -183,7 +200,25 @@ class WebSocketTransport(Transport):
         """
         try:
             while not self._closed:
-                msg = await self._ws.receive()
+                if self._idle_timeout_s and self._idle_timeout_s > 0:
+                    try:
+                        msg = await asyncio.wait_for(
+                            self._ws.receive(), timeout=self._idle_timeout_s
+                        )
+                    except asyncio.TimeoutError:
+                        # Half-open / silent client: no frame for the idle
+                        # window. Treat exactly like an end-of-stream so the
+                        # finally below enqueues _CLOSE and the session tears
+                        # down (otherwise the limiter slot leaks).
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "voxedge ws transport idle timeout (%.1fs) — "
+                            "treating half-open client as end-of-stream",
+                            self._idle_timeout_s,
+                        )
+                        break
+                else:
+                    msg = await self._ws.receive()
                 mtype = msg.get("type")
                 if mtype == "websocket.disconnect":
                     break

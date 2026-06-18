@@ -42,6 +42,21 @@ class _AudioDispatcher:
         sess = self._sess
         state = sess.state
         multi = sess.engine.multi_utterance
+
+        # First-word-drop fix (2026-06-15, port of server/main.py:3800-3919):
+        # Silero clips the ~200-300ms speech onset while it latches
+        # SPEECH_START, so that onset reaches NEITHER the stream NOR the
+        # backend's _audio_accum (so the empty-final offline rescue can't
+        # recover it either). Keep a short rolling ring of the most recent
+        # pre-speech frames; on SPEECH_START replay them as the FIRST frames
+        # of the fresh ASR turn (chronological order: preroll first, then the
+        # trigger chunk via the normal accept_audio below). preroll=0 disables
+        # → behaviour byte-identical to the no-ring path (drain() returns []).
+        sample_rate = getattr(getattr(sess, "_asr_be", None), "sample_rate", 16000) or 16000
+        preroll_cap = int(sample_rate * sess.engine.vad_preroll_ms / 1000)
+        preroll: list[np.ndarray] = []
+        preroll_samples = 0
+
         try:
             async for data in sess.transport.recv_audio():
                 if state.client_closed:
@@ -62,6 +77,14 @@ class _AudioDispatcher:
                         await sess._bargein_tts()
                         if not await sess._asr.open_turn():
                             continue
+                        # Back-fill the onset: replay the pre-speech ring into
+                        # the fresh stream BEFORE this chunk. Fed exactly once;
+                        # the trigger chunk follows via accept_audio() below.
+                        if preroll and state.asr_active:
+                            pre = np.concatenate(preroll)
+                            await sess._asr_mgr.accept_audio(pre)
+                        preroll = []
+                        preroll_samples = 0
                     elif event == sess._vad.SPEECH_END:
                         # Defer endpoint flag until AFTER accepting this chunk
                         # (BUG 3, app/main.py:2894-2900).
@@ -74,6 +97,15 @@ class _AudioDispatcher:
 
                 if state.asr_active:
                     await sess._asr_mgr.accept_audio(samples)
+                elif sess._vad is not None and preroll_cap > 0:
+                    # No ASR turn open: keep a short rolling ring of recent
+                    # pre-speech frames so the next SPEECH_START can replay the
+                    # onset. Only buffered while inactive → the trigger chunk is
+                    # fed exactly once (above) and never double-counted.
+                    preroll.append(samples)
+                    preroll_samples += int(len(samples))
+                    while preroll_samples > preroll_cap and len(preroll) > 1:
+                        preroll_samples -= int(len(preroll.pop(0)))
 
                 # Now safe to latch endpoint (app/main.py:2929-2942).
                 if speech_ended_now:

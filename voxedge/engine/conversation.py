@@ -749,6 +749,7 @@ class ConversationEngine:
         multi_utterance: bool = False,
         timeouts: Optional[dict] = None,
         silence_ms: int = 400,
+        vad_preroll_ms: int = 300,
         asr_language: str = "auto",
         tts_language: Optional[str] = None,
         tts_speaker_kwargs: Optional[dict] = None,
@@ -769,6 +770,11 @@ class ConversationEngine:
         self.multi_utterance = multi_utterance
         self.timeouts = timeouts or {}
         self.silence_ms = silence_ms
+        # First-word-drop fix (2026-06-15): Silero clips the ~200-300ms onset
+        # while it latches SPEECH_START, so the dispatcher buffers a short
+        # pre-speech ring and replays it as the first frames of the fresh ASR
+        # turn. 0 disables (behaviour byte-identical to the no-ring path).
+        self.vad_preroll_ms = max(0, int(vad_preroll_ms))
         self.asr_language = asr_language
         self.tts_language = tts_language
         # Engine-parity #15: TTS speaker / voice / speed + buffer selection.
@@ -782,6 +788,16 @@ class ConversationEngine:
         self.asr_turn_timeout_s = float(self.timeouts.get("asr_turn", 45.0))
         self.tts_chunk_timeout_s = float(self.timeouts.get("tts_chunk", 10.0))
         self.tts_sentence_timeout_s = float(self.timeouts.get("tts_sentence", 15.0))
+        # P2b: server-loop LLM-stream watchdog — align the server pump to the
+        # client's semantic first-token / idle timeouts (vs only the backend's
+        # coarse httpx read timeout). On timeout the driver raises and, since
+        # the server adapter runs with reraise_errors=False, the turn ends
+        # gracefully (flush + log) rather than hanging. Defaults mirror the
+        # client (15s / 30s); injectable via the timeouts dict for tuning.
+        self.llm_first_token_timeout_s = float(
+            self.timeouts.get("llm_first_token", 15.0)
+        )
+        self.llm_idle_timeout_s = float(self.timeouts.get("llm_idle", 30.0))
 
         # Preload ready backends once (app/main.py does this at startup).
         for be in backends.values():
