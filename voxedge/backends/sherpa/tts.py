@@ -231,7 +231,12 @@ class SherpaTTSBackend(TTSBackend):
                 self._tts.generate(t, sid=cfg.default_speaker_id, speed=1.0)
         logger.info("TTS warmup: %.1fs", time.time() - start)
 
-    def synthesize(
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # Native speed (sherpa-onnx) + native pitch (_pitch_shift_samples). Do
+        # NOT route through the DSP fallback — keep this backend's own paths.
+        return (True, True)
+
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -282,7 +287,7 @@ class SherpaTTSBackend(TTSBackend):
         finally:
             self._ready = False
 
-    def generate_streaming(self, text: str, **kwargs):
+    def _generate_streaming_impl(self, text: str, **kwargs):
         """Yield PCM int16 chunks as the vocoder produces them (true streaming)."""
         import queue
         import threading

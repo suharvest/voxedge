@@ -507,7 +507,7 @@ class MatchaTRTBackend(TTSBackend):
         texts = ["你好", "你好世界"]
         start = time.time()
         for t in texts:
-            self.synthesize(t)
+            self._synthesize_impl(t)
         logger.info("Warmup: %.1fs", time.time() - start)
 
     _IPA_REPLACEMENTS = [
@@ -609,7 +609,11 @@ class MatchaTRTBackend(TTSBackend):
                 i += 1
         return tokens
 
-    def synthesize(
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # Native speed via length_scale; pitch → DSP fallback.
+        return (True, False)
+
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -751,15 +755,19 @@ class MatchaTRTBackend(TTSBackend):
                 except Exception:
                     pass
 
-    def generate_streaming(self, text: str, **kwargs):
-        """Yield raw PCM int16 chunks (chunk-level streaming)."""
+    def _generate_streaming_impl(self, text: str, **kwargs):
+        """Yield raw PCM int16 chunks (chunk-level streaming).
+
+        ``speed`` is native (length_scale); ``pitch`` is popped by the base
+        wrapper before this is called, so we only forward what we get.
+        """
         synth_kwargs = {
             "speaker_id": kwargs.get("speaker_id", kwargs.get("sid")),
             "speed": kwargs.get("speed"),
             "pitch_shift": kwargs.get("pitch_shift", kwargs.get("pitch")),
             "language": kwargs.get("language"),
         }
-        wav_bytes, _meta = self.synthesize(text, **synth_kwargs)
+        wav_bytes, _meta = self._synthesize_impl(text, **synth_kwargs)
         if len(wav_bytes) <= 44:
             return
 

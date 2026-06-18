@@ -948,7 +948,14 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         }
         return wav_bytes, meta
 
-    def generate_streaming(self, text: str, **kwargs):
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # No native speed/pitch → both via DSP fallback. (When a product
+        # backend is delegated to, the base wrapper has already popped
+        # speed/pitch, so the delegated public call is an identity pass-through
+        # and there is no double-apply.)
+        return (False, False)
+
+    def _generate_streaming_impl(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
         if self._product_backend is not None:
             yield from self._product_backend.generate_streaming(text, **kwargs)
@@ -966,7 +973,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 segment_kwargs["segment_text"] = False
                 segment_kwargs.setdefault("seed", self._config.seed)
                 for segment in segments:
-                    yield from self.generate_streaming(segment, **segment_kwargs)
+                    yield from self._generate_streaming_impl(segment, **segment_kwargs)
                 return
 
         yield from self._generate_streaming_single(text, **kwargs)
@@ -1147,7 +1154,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 text, meta_out=meta_out, _retry_empty=False, **kwargs
             )
 
-    def synthesize(
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -1182,7 +1189,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                 total_duration = 0.0
                 total_samples = 0
                 for segment in segments:
-                    wav, meta = self.synthesize(
+                    wav, meta = self._synthesize_impl(
                         segment, speaker_id=speaker_id, speed=speed,
                         pitch_shift=pitch_shift, language=language, **segment_kwargs,
                     )
@@ -1235,7 +1242,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             )
         if len(speaker_embedding) % 4 != 0:
             raise ValueError("speaker_embedding must be a float32 byte vector")
-        return self.synthesize(
+        return self._synthesize_impl(
             text, speed=speed, language=language,
             speaker_embedding=speaker_embedding, **kwargs,
         )

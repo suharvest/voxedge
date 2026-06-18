@@ -284,7 +284,29 @@ class TTSBackend(ABC):
         """Load models and warm up. Called once before use."""
         ...
 
-    @abstractmethod
+    # ── Unified speed / pitch interface ──────────────────────────────────
+    #
+    # Each backend declares which of (speed, pitch) it supports NATIVELY via
+    # :meth:`rate_pitch_caps`. The public ``synthesize`` / ``generate_streaming``
+    # below are WRAPPERS: they hand the natively-supported dimension to the
+    # backend impl and apply a pure-numpy DSP fallback (see
+    # ``voxedge.audio.rate``) for the rest. Concrete backends implement
+    # ``_synthesize_impl`` / ``_generate_streaming_impl`` instead of overriding
+    # the public methods.
+    #
+    # Backward compatibility: a backend (or test mock) that overrides
+    # ``synthesize`` / ``generate_streaming`` directly bypasses the wrapper
+    # entirely — its old behaviour is preserved (no DSP, no double-apply).
+
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        """Return ``(native_speed, native_pitch)`` for this backend.
+
+        Default ``(False, False)`` → both dimensions handled by the DSP
+        fallback. Backends with a native ``speed`` (e.g. Matcha ``length_scale``)
+        or native pitch override this.
+        """
+        return (False, False)
+
     def synthesize(
         self,
         text: str,
@@ -294,8 +316,60 @@ class TTSBackend(ABC):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        """Synthesize text to WAV bytes. Returns ``(wav_bytes, metadata)``."""
-        ...
+        """Synthesize text to WAV bytes. Returns ``(wav_bytes, metadata)``.
+
+        Wrapper: passes the natively-supported (speed, pitch) dims to
+        ``_synthesize_impl`` and DSP-post-processes the non-native dims on the
+        returned WAV. The identity request (no speed/pitch) is byte-identical
+        to the impl's output (DSP module's identity fast-path).
+        """
+        native_speed, native_pitch = self.rate_pitch_caps()
+        need_speed = speed not in (None, 1.0) and not native_speed
+        need_pitch = pitch_shift not in (None, 0.0) and not native_pitch
+
+        impl_speed = speed if native_speed else None
+        impl_pitch = pitch_shift if native_pitch else None
+
+        wav, meta = self._synthesize_impl(
+            text,
+            speaker_id=speaker_id,
+            speed=impl_speed,
+            pitch_shift=impl_pitch,
+            language=language,
+            **kwargs,
+        )
+        if need_speed or need_pitch:
+            from voxedge.audio.rate import apply_wav_rate_pitch
+
+            channels = None
+            if isinstance(meta, dict) and meta.get("channels"):
+                channels = int(meta["channels"])
+            wav = apply_wav_rate_pitch(
+                wav,
+                speed=speed if need_speed else None,
+                pitch_shift=pitch_shift if need_pitch else None,
+                channels=channels,
+            )
+        return wav, meta
+
+    def _synthesize_impl(
+        self,
+        text: str,
+        speaker_id: Optional[int] = None,
+        speed: Optional[float] = None,
+        pitch_shift: Optional[float] = None,
+        language: Optional[str] = None,
+        **kwargs,
+    ) -> tuple[bytes, dict]:
+        """Backend synthesis. Receives speed/pitch ONLY for natively-supported
+        dims (the wrapper pops the rest). Returns ``(wav_bytes, metadata)``.
+
+        NOT abstract: a backend (or mock) may instead override the public
+        ``synthesize`` directly, which bypasses the wrapper (and this method).
+        """
+        raise NotImplementedError(
+            f"Backend '{self.name}' must implement _synthesize_impl or override synthesize"
+        )
 
     def generate_streaming(
         self,
@@ -308,12 +382,64 @@ class TTSBackend(ABC):
     ) -> Iterator[bytes]:
         """Generator yielding raw PCM chunks. Requires STREAMING capability.
 
-        Signature per spec §3: explicit keyword-only ``language`` /
-        ``speaker`` / ``cancel_token`` instead of the production code's
-        ad-hoc ``**kwargs`` so adapters have a stable contract. ``cancel_token``
-        is any object with an ``is_set()`` method (e.g. ``threading.Event``);
-        the backend should stop yielding once it returns True.
+        Wrapper: routes the non-native (speed, pitch) dims through a streaming
+        :class:`~voxedge.audio.rate.TTSRateShifter` initialised from
+        ``self.sample_rate``. The identity request is a pass-through (chunks
+        yielded unchanged).
         """
+        speed = kwargs.get("speed")
+        pitch_shift = kwargs.get("pitch_shift", kwargs.get("pitch"))
+        native_speed, native_pitch = self.rate_pitch_caps()
+        need_speed = speed not in (None, 1.0) and not native_speed
+        need_pitch = pitch_shift not in (None, 0.0) and not native_pitch
+
+        impl_kwargs = dict(kwargs)
+        # Pop the dims we will DSP so the impl does not also apply them.
+        if need_speed:
+            impl_kwargs.pop("speed", None)
+        if need_pitch:
+            impl_kwargs.pop("pitch_shift", None)
+            impl_kwargs.pop("pitch", None)
+
+        impl_iter = self._generate_streaming_impl(
+            text,
+            language=language,
+            speaker=speaker,
+            cancel_token=cancel_token,
+            **impl_kwargs,
+        )
+
+        if not (need_speed or need_pitch):
+            yield from impl_iter
+            return
+
+        from voxedge.audio.rate import TTSRateShifter
+
+        shifter = TTSRateShifter(
+            sample_rate=self.sample_rate,
+            speed=speed if need_speed else 1.0,
+            pitch_shift=pitch_shift if need_pitch else 0.0,
+            channels=1,
+        )
+        for chunk in impl_iter:
+            out = shifter.push(chunk)
+            if out:
+                yield out
+        tail = shifter.flush()
+        if tail:
+            yield tail
+
+    def _generate_streaming_impl(
+        self,
+        text: str,
+        *,
+        language: Optional[str] = None,
+        speaker: Optional[str] = None,
+        cancel_token: Optional[Any] = None,
+        **kwargs,
+    ) -> Iterator[bytes]:
+        """Backend streaming impl. Receives speed/pitch (in kwargs) ONLY for
+        natively-supported dims. Default: not supported."""
         raise NotImplementedError(f"Backend '{self.name}' does not support streaming")
 
     def clone_voice(

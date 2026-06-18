@@ -183,7 +183,12 @@ class RKTTSBackend(TTSBackend):
         except Exception:
             logger.exception("RKTTSBackend.unload failed; continuing")
 
-    def synthesize(
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # rkvoice's native speed/pitch is bypassed (wrapper pops them) → DSP
+        # fallback handles both, so there is no double-apply with rkvoice.
+        return (False, False)
+
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -211,7 +216,7 @@ class RKTTSBackend(TTSBackend):
             **kwargs,
         )
 
-    def generate_streaming(self, text: str, **kwargs):
+    def _generate_streaming_impl(self, text: str, **kwargs):
         """Bridge our base-class generate_streaming() to rkvoice-stream's
         synthesize_stream().
 

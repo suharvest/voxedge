@@ -378,7 +378,11 @@ class Qwen3TRTBackend(TTSBackend):
             raise RuntimeError("Tokenizer not loaded")
         return self._tokenizer.encode(text).ids
 
-    def synthesize(
+    def rate_pitch_caps(self) -> tuple[bool, bool]:
+        # No native speed/pitch → both via DSP fallback.
+        return (False, False)
+
+    def _synthesize_impl(
         self,
         text: str,
         speaker_id: Optional[int] = None,
@@ -434,7 +438,7 @@ class Qwen3TRTBackend(TTSBackend):
                 segment_kwargs.pop("seed", None)
                 segment_kwargs.setdefault("max_audio_length", min(requested_max_frames, vocoder_cap if use_trt_vocoder else requested_max_frames))
                 for segment in segments:
-                    wav, meta = self.synthesize(
+                    wav, meta = self._synthesize_impl(
                         segment,
                         speaker_id=resolved_speaker_id if resolved_speaker_id is not None else speaker_id,
                         speed=speed,
@@ -481,7 +485,7 @@ class Qwen3TRTBackend(TTSBackend):
                 stream_kwargs["speaker"] = resolved_speaker_name
             if resolved_speaker_id is not None:
                 stream_kwargs["speaker_id"] = resolved_speaker_id
-            pcm = b"".join(self.generate_streaming(text, **stream_kwargs))
+            pcm = b"".join(self._generate_streaming_impl(text, **stream_kwargs))
             elapsed = time.time() - start
             duration = len(pcm) / 2 / self.sample_rate if pcm else 0.0
             return _pcm16_to_wav(pcm, self.sample_rate), {
@@ -572,7 +576,7 @@ class Qwen3TRTBackend(TTSBackend):
         }
         return wav_bytes, meta
 
-    def generate_streaming(self, text: str, **kwargs):
+    def _generate_streaming_impl(self, text: str, **kwargs):
         """Yield PCM int16 chunks via C++ callback-based streaming."""
         import queue as queue_mod
         import threading
