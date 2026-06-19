@@ -138,6 +138,13 @@ class TRTEdgeLLMTTSConfig:
     tokenizer_dir: str = ""
     code2wav_dir: str = ""
     speaker_encoder: str = ""
+    # Fixed BASE-model speaker conditioning. The Qwen3-TTS *base* checkpoint
+    # conditions on an external 1024-d speaker embedding (vs CustomVoice's named
+    # speaker ids). When set, this precomputed base64 embedding is injected as
+    # ``speaker_embedding_b64`` on every request that does not carry its own
+    # speaker (speaker_id / speaker / per-request speaker_embedding still win).
+    # Empty → unchanged CustomVoice/named-speaker behavior (backward compatible).
+    base_speaker_embedding_b64: str = ""
 
     model_id: str = "trt_edgellm"
     backend_mode: str = "edgellm_worker"
@@ -585,6 +592,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         self._code_predictor_dir = self._config.code_predictor_dir
         self._tokenizer_dir = self._config.tokenizer_dir
         self._speaker_encoder = self._config.speaker_encoder
+        # Decode the fixed base-model speaker embedding once (None if unset).
+        self._base_speaker_embedding: Optional[bytes] = None
+        _b64 = (self._config.base_speaker_embedding_b64 or "").strip()
+        if _b64:
+            try:
+                self._base_speaker_embedding = base64.b64decode(_b64)
+            except Exception:
+                logger.warning("invalid base_speaker_embedding_b64; ignoring")
+                self._base_speaker_embedding = None
         self._code2wav_dir = self._config.code2wav_dir
         self._worker_binary = self._config.worker_binary
         self._qwen3_runtime_profile = self._config.qwen3_runtime_profile
@@ -1364,7 +1380,17 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _resolve_voice_kwargs(self, kwargs: dict) -> dict:
         sid = kwargs.get("speaker_id", kwargs.get("sid"))
         forward = {k: v for k, v in kwargs.items() if k not in ("speaker_id", "sid")}
-        return resolve_speaker_kwargs(self.model_id, speaker_id=sid, **forward)
+        resolved = resolve_speaker_kwargs(self.model_id, speaker_id=sid, **forward)
+        # BASE model: default to the fixed precomputed speaker embedding when the
+        # caller supplied no speaker (no per-request embedding / id / name). A
+        # per-request speaker always wins. No-op for CustomVoice (base unset).
+        if self._base_speaker_embedding and not (resolved or {}).get("speaker_embedding") \
+                and "speaker_embedding" not in kwargs \
+                and not (resolved or {}).get("speaker_id") and "speaker_id" not in kwargs \
+                and not (resolved or {}).get("speaker"):
+            resolved = dict(resolved or {})
+            resolved["speaker_embedding"] = self._base_speaker_embedding
+        return resolved
 
     @staticmethod
     def _add_speaker_request_fields(request: dict, voice_kwargs: dict) -> None:
