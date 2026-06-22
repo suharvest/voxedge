@@ -1227,3 +1227,221 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         if self._closed:
             return self._join_committed(self._final_text), True
         return self._join_committed(self._partial_text), False
+
+
+def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMASRConfig:
+    """Build TRTEdgeLLMASRConfig from environment variables.
+
+    All path fields are resolved from the passed ``env`` dict (or
+    ``os.environ`` when None). Resolution logic mirrors the ``_deploy_paths``
+    module-level constants but uses the supplied dict so callers can pass an
+    explicit env override without touching the real process environment.
+    Mirrors ``server.core.voxedge_backend_config.build_trt_edge_llm_asr_config``
+    field-for-field (env → manifest → default precedence; manifest support
+    is retained: set EDGE_LLM_ASR_MANIFEST to a JSON path).
+    """
+    import json as _json
+    import os as _os
+
+    if env is None:
+        env = _os.environ
+
+    # ---------------------------------------------------------------------------
+    # Inline env-dict-aware path resolvers (mirror _deploy_paths but use ``env``)
+    # ---------------------------------------------------------------------------
+
+    def _prefer_existing_e(primary: str, fallback: str) -> str:
+        if primary and _os.path.exists(primary):
+            return primary
+        return fallback
+
+    def _first_existing_dir_e(*paths: str) -> str:
+        for p in paths:
+            if p and _os.path.exists(p):
+                return p
+        return paths[-1] if paths else ""
+
+    edge_base = env.get("EDGE_LLM_BASE", _os.path.expanduser("~/project/tensorrt-edge-llm"))
+    edge_build = _os.path.join(edge_base, env.get("EDGE_LLM_BUILD_DIR", "build_sm87"))
+    ovs_base = env.get("OVS_BASE", "")
+    ovs_build = env.get(
+        "OVS_WORKER_BUILD",
+        _os.path.join(ovs_base, "build", "edgellm_voice_worker", "workers") if ovs_base else "",
+    )
+
+    def _asr_binary_e() -> str:
+        explicit = env.get("EDGE_LLM_ASR_BIN")
+        if explicit:
+            return explicit
+        return _os.path.join(edge_build, "examples/llm/llm_inference")
+
+    def _asr_worker_binary_e() -> str:
+        explicit = env.get("EDGE_LLM_ASR_WORKER_BIN")
+        if explicit:
+            return explicit
+        return _prefer_existing_e(
+            _os.path.join(ovs_build, "qwen3_asr_worker") if ovs_build else "",
+            _os.path.join(edge_build, "examples/llm/qwen3_asr_worker"),
+        )
+
+    def _asr_plugin_path_e() -> str:
+        for key in ("EDGE_LLM_ASR_PLUGIN_PATH", "EDGELLM_ASR_PLUGIN_PATH", "EDGELLM_PLUGIN_PATH"):
+            v = env.get(key)
+            if v:
+                return v
+        return _os.path.join(edge_build, "libNvInfer_edgellm_plugin.so")
+
+    # ASR engine dir resolution (mirrors _deploy_paths module-level logic using env)
+    def _asr_engine_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_ASR_ENGINE_DIR")
+        if explicit:
+            return explicit
+        # Full engine dir
+        _fp8 = _os.path.expanduser("~/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_fp8embed_0510")
+        _small = _os.path.expanduser("~/qwen3-asr-edgellm-runtime/engines/thinker_full_in128_kv256_0510")
+        _dialog = _os.path.expanduser("~/qwen3-asr-edgellm-runtime/engines/thinker_kv512")
+        _export = _os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/thinker")
+        full_dir = env.get(
+            "EDGE_LLM_ASR_FULL_ENGINE_DIR",
+            _fp8 if _os.path.exists(_os.path.join(_fp8, "llm.engine"))
+            else _small if _os.path.exists(_os.path.join(_small, "llm.engine"))
+            else _dialog if _os.path.exists(_os.path.join(_dialog, "llm.engine"))
+            else _export,
+        )
+        # Pruned engine dir
+        _pruned = _os.path.expanduser("~/qwen3-asr-edgellm-runtime/engines/thinker_prunedembed35k_kv512")
+        _off_pruned = _os.path.expanduser("~/qwen3-asr-edgellm-runtime/engines/thinker_pruned35k_kv512")
+        pruned_dir = env.get(
+            "EDGE_LLM_ASR_PRUNED_ENGINE_DIR",
+            _pruned if _os.path.exists(_os.path.join(_pruned, "llm.engine")) else _off_pruned,
+        )
+        vocab = env.get("EDGE_LLM_ASR_VOCAB_PRUNED", "0").lower()
+        if vocab in ("1", "true", "yes"):
+            return pruned_dir
+        if vocab in ("0", "false", "no"):
+            return full_dir
+        # unrecognized: probe order
+        if _os.path.exists(_os.path.join(_pruned, "llm.engine")):
+            return _pruned
+        if _os.path.exists(_os.path.join(_off_pruned, "llm.engine")):
+            return _off_pruned
+        return full_dir
+
+    def _asr_audio_enc_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_ASR_AUDIO_ENC_DIR")
+        if explicit:
+            return explicit
+        return _os.path.expanduser("~/qwen3-asr-trt-edge-llm-export/engines/audio_encoder")
+
+    # ---------------------------------------------------------------------------
+
+    def _env_bool(name: str, default: bool) -> bool:
+        value = env.get(name)
+        if value is None:
+            return default
+        return value.lower() not in ("0", "false", "no")
+
+    # -- manifest (EDGE_LLM_ASR_MANIFEST) --
+    manifest: dict = {}
+    manifest_path = env.get("EDGE_LLM_ASR_MANIFEST")
+    if manifest_path:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = _json.load(f)
+    use_worker_default = bool(manifest.get("use_worker", True))
+
+    # -- slot ceiling: env → manifest → 1 --
+    max_slots_raw = env.get(
+        "EDGE_LLM_ASR_MAX_CONCURRENT",
+        str(manifest.get("asr_max_slots", manifest.get("max_concurrent", 1))),
+    )
+
+    # -- warmup: legacy gates on SKIP_ASR_WARMUP OR EDGE_LLM_ASR_WORKER_WARMUP --
+    skip_warmup = env.get("SKIP_ASR_WARMUP", "").lower() in ("1", "true", "yes")
+    warmup_disabled = env.get("EDGE_LLM_ASR_WORKER_WARMUP", "1").lower() in ("0", "false", "no")
+    worker_warmup = not (skip_warmup or warmup_disabled)
+
+    try:
+        prewarm_max = int(env.get("EDGE_LLM_ASR_PREWARM_MAX", "6"))
+    except ValueError:
+        prewarm_max = 6
+
+    try:
+        min_audio_frames = int(env.get("EDGE_LLM_ASR_MIN_AUDIO_FRAMES", "100"))
+    except ValueError:
+        min_audio_frames = 100
+
+    return TRTEdgeLLMASRConfig(
+        # --- paths (all resolved from passed env dict) ---
+        asr_binary=env.get("EDGE_LLM_ASR_BIN", manifest.get("asr_binary", _asr_binary_e())),
+        worker_binary=env.get(
+            "EDGE_LLM_ASR_WORKER_BIN", manifest.get("worker_binary", _asr_worker_binary_e())
+        ),
+        plugin_path=env.get(
+            "EDGE_LLM_ASR_PLUGIN_PATH",
+            env.get(
+                "EDGELLM_ASR_PLUGIN_PATH",
+                manifest.get("asr_plugin_path", manifest.get("plugin_path", _asr_plugin_path_e())),
+            ),
+        ),
+        engine_dir=env.get("EDGE_LLM_ASR_ENGINE_DIR", manifest.get("engine_dir", _asr_engine_dir_e())),
+        audio_encoder_dir=env.get(
+            "EDGE_LLM_ASR_AUDIO_ENC_DIR", manifest.get("audio_encoder_dir", _asr_audio_enc_dir_e())
+        ),
+        # --- flags ---
+        use_worker=_env_bool("EDGE_LLM_ASR_WORKER", use_worker_default),
+        mel_tensor_name=env.get(
+            "EDGE_LLM_ASR_MEL_TENSOR_NAME", manifest.get("mel_tensor_name", "mel")
+        ),
+        max_mel_frames=int(
+            env.get("EDGE_LLM_ASR_MAX_MEL_FRAMES", str(manifest.get("max_mel_frames", 6000)))
+        ),
+        max_slots=max(1, int(max_slots_raw)),
+        stream_mode=env.get(
+            "EDGE_LLM_ASR_STREAM_MODE", manifest.get("stream_mode", "accumulate")
+        ),
+        stream_chunk_sec=float(
+            env.get("EDGE_LLM_ASR_STREAM_CHUNK_SEC", str(manifest.get("stream_chunk_sec", 0.5)))
+        ),
+        stream_unfixed_chunks=int(
+            env.get(
+                "EDGE_LLM_ASR_STREAM_UNFIXED_CHUNKS",
+                str(manifest.get("stream_unfixed_chunks", 2)),
+            )
+        ),
+        stream_unfixed_tokens=int(
+            env.get(
+                "EDGE_LLM_ASR_STREAM_UNFIXED_TOKENS",
+                str(manifest.get("stream_unfixed_tokens", 5)),
+            )
+        ),
+        segment_cap_sec=float(
+            env.get(
+                "EDGE_LLM_ASR_SEGMENT_CAP_SEC",
+                str(manifest.get("segment_cap_sec", 5.5)),
+            )
+        ),
+        mel_settings_path=env.get(
+            "EDGE_LLM_ASR_MEL_SETTINGS", manifest.get("mel_settings_path", "")
+        ),
+        mel_filters_path=env.get(
+            "EDGE_LLM_ASR_MEL_FILTERS", manifest.get("mel_filters_path", "")
+        ),
+        # --- sampling ---
+        temperature=float(env.get("ASR_TEMPERATURE", "1.0")),
+        top_p=float(env.get("ASR_TOP_P", "1.0")),
+        top_k=int(env.get("ASR_TOP_K", "1")),
+        max_generate_length=int(env.get("ASR_MAX_GENERATE_LENGTH", "200")),
+        min_audio_frames=min_audio_frames,
+        # --- offline segmentation ---
+        offline_segment_enabled=_env_bool("EDGE_LLM_ASR_OFFLINE_SEGMENT", True),
+        offline_segment_threshold_s=float(
+            env.get("EDGE_LLM_ASR_OFFLINE_SEGMENT_SEC", "6.0")
+        ),
+        offline_segment_min_s=float(
+            env.get("EDGE_LLM_ASR_OFFLINE_MIN_SEGMENT_SEC", "0.4")
+        ),
+        # --- worker warmup ---
+        worker_warmup=worker_warmup,
+        prewarm_max=prewarm_max,
+        worker_cuda_graph=env.get("EDGE_LLM_ASR_CUDA_GRAPH", "0"),
+    )

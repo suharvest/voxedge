@@ -1314,3 +1314,293 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             request["speaker_id"] = int(voice_kwargs["speaker_id"])
         if "speaker" in voice_kwargs:
             request["speaker"] = str(voice_kwargs["speaker"])
+
+
+def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMTTSConfig:
+    """Build TRTEdgeLLMTTSConfig from environment variables.
+
+    All path fields are resolved from the passed ``env`` dict (or
+    ``os.environ`` when None). Resolution logic mirrors the ``_deploy_paths``
+    resolver functions but uses the supplied dict so callers can pass an
+    explicit env override without touching the real process environment.
+    Non-path fields (sampling, concurrency, streaming) are read the same way.
+    Mirrors ``server.core.voxedge_backend_config.build_trt_edge_llm_tts_config``
+    field-for-field.
+    """
+    import os as _os
+    from . import _deploy_paths as dp
+
+    if env is None:
+        env = _os.environ
+
+    # ---------------------------------------------------------------------------
+    # Inline env-dict-aware path resolvers (mirror _deploy_paths but use ``env``)
+    # ---------------------------------------------------------------------------
+
+    def _e(key: str, default: str = "") -> str:
+        return env.get(key, default) or default
+
+    def _prefer_existing_e(primary: str, fallback: str) -> str:
+        if primary and _os.path.exists(primary):
+            return primary
+        return fallback
+
+    def _first_existing_dir_e(*paths: str) -> str:
+        for p in paths:
+            if p and _os.path.exists(p):
+                return p
+        return paths[-1] if paths else ""
+
+    # qwen3 runtime profile (from env dict)
+    def _qwen3_profile_e() -> str:
+        raw = env.get("EDGE_LLM_QWEN3_PROFILE", env.get("OVS_QWEN3_PROFILE", "highperf"))
+        return (raw or "highperf").strip().lower().replace("-", "_")
+
+    def _highperf_e() -> bool:
+        return _qwen3_profile_e() in ("highperf", "perf", "performance", "v2v")
+
+    # TTS default root (env-based, mirrors dp._TTS_DEFAULT_ROOT logic)
+    _tts_fixed = _os.path.expanduser("~/qwen3-tts-edgellm-runtime")
+    _tts_export = _os.path.expanduser("~/qwen3-tts-trt-edge-llm-export")
+    _tts_root = (
+        _tts_fixed
+        if _os.path.exists(_os.path.join(_tts_fixed, "engines", "talker", "llm.engine"))
+        else _tts_export
+    )
+
+    # TTS worker binary
+    def _resolve_worker_binary_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_WORKER_BIN")
+        if explicit:
+            return explicit
+        edge_base = env.get("EDGE_LLM_BASE", _os.path.expanduser("~/project/tensorrt-edge-llm"))
+        edge_build = _os.path.join(edge_base, env.get("EDGE_LLM_BUILD_DIR", "build_sm87"))
+        ovs_base = env.get("OVS_BASE", "")
+        ovs_build = env.get(
+            "OVS_WORKER_BUILD",
+            _os.path.join(ovs_base, "build", "edgellm_voice_worker", "workers") if ovs_base else "",
+        )
+        return _prefer_existing_e(
+            _os.path.join(ovs_build, "qwen3_tts_worker") if ovs_build else "",
+            _os.path.join(edge_build, "examples/omni/qwen3_tts_worker"),
+        )
+
+    # TTS talker dir
+    def _resolve_talker_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_TALKER_DIR")
+        if explicit:
+            return explicit
+        default_talker = _os.path.join(_tts_root, "engines", "talker")
+        full_dir = env.get("EDGE_LLM_TTS_FULL_TALKER_DIR", default_talker)
+        pruned_dir = env.get("EDGE_LLM_TTS_PRUNED_TALKER_DIR", default_talker)
+        vocab = env.get("EDGE_LLM_TTS_VOCAB_PRUNED", env.get("QWEN3_TTS_VOCAB_PRUNED", "0")).lower()
+        if vocab in ("1", "true", "yes"):
+            return pruned_dir
+        if vocab in ("0", "false", "no"):
+            return full_dir
+        return default_talker
+
+    # TTS code-predictor dir
+    def _resolve_cp_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_CP_DIR")
+        if explicit:
+            return explicit
+        talker_dir = _resolve_talker_dir_e()
+        default_cp = _os.path.join(_os.path.dirname(talker_dir), "code_predictor")
+        bf16_io_cp = env.get(
+            "EDGE_LLM_TTS_CP_BF16_IO_DIR",
+            "/tmp/qwen3_tts_cp_lmhead_pretranspose_0510/cp_dir",
+        )
+        if _highperf_e():
+            return _first_existing_dir_e(bf16_io_cp, default_cp)
+        return default_cp
+
+    # TTS tokenizer dir
+    def _resolve_tokenizer_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_TOKENIZER_DIR")
+        if explicit:
+            return explicit
+        if _os.path.exists(_os.path.join(_tts_root, "processed_chat_template.json")):
+            return _tts_root
+        return _tts_export
+
+    # TTS code2wav dir
+    def _resolve_code2wav_dir_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_CODE2WAV_DIR")
+        if explicit:
+            return explicit
+        return _first_existing_dir_e(
+            _os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder_vocoder100_compat/code2wav"),
+            _os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder_vocoder50_compat/code2wav"),
+            _os.path.join(_tts_root, "engines", "code2wav"),
+            _os.path.expanduser("~/qwen3-tts-trt-edge-llm-export/engines/tokenizer_decoder/code2wav"),
+        )
+
+    # TTS binary / plugin (import-time constants from _deploy_paths, but env override wins)
+    def _tts_binary_e() -> str:
+        explicit = env.get("EDGE_LLM_TTS_BIN")
+        if explicit:
+            return explicit
+        edge_base = env.get("EDGE_LLM_BASE", _os.path.expanduser("~/project/tensorrt-edge-llm"))
+        edge_build = _os.path.join(edge_base, env.get("EDGE_LLM_BUILD_DIR", "build_sm87"))
+        return _os.path.join(edge_build, "examples/omni/qwen3_tts_inference")
+
+    def _plugin_path_e() -> str:
+        explicit = env.get("EDGELLM_PLUGIN_PATH")
+        if explicit:
+            return explicit
+        edge_base = env.get("EDGE_LLM_BASE", _os.path.expanduser("~/project/tensorrt-edge-llm"))
+        edge_build = _os.path.join(edge_base, env.get("EDGE_LLM_BUILD_DIR", "build_sm87"))
+        return _os.path.join(edge_build, "libNvInfer_edgellm_plugin.so")
+
+    # ---------------------------------------------------------------------------
+    # Non-path field helpers
+    # ---------------------------------------------------------------------------
+
+    def _first(*names: str, default: str = "") -> str:
+        """First non-empty env value among ``names``."""
+        for name in names:
+            v = env.get(name)
+            if v not in (None, ""):
+                return v
+        return default
+
+    def _fl(default: float, *names: str) -> float:
+        try:
+            return float(_first(*names, default=str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _in(default: int, *names: str) -> int:
+        try:
+            return int(_first(*names, default=str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _flag(name: str, default: bool) -> bool:
+        v = env.get(name)
+        if v is None:
+            return default
+        return v.lower() not in ("0", "false", "no", "off")
+
+    # -- speaker encoder: QWEN3_SPEAKER_ENCODER → QWEN3_ARTIFACT_ROOT probe →
+    #    <model_base>/onnx/speaker_encoder.onnx  (legacy _resolve_speaker_encoder)
+    qwen3_tts_model_base = _first(
+        "OVS_TTS_MODEL_BASE", "QWEN3_MODEL_BASE", default="/opt/models/qwen3-tts"
+    )
+    speaker_encoder = env.get("QWEN3_SPEAKER_ENCODER", "") or ""
+    if not speaker_encoder:
+        qwen3_root = env.get("QWEN3_ARTIFACT_ROOT", "")
+        candidate = ""
+        if qwen3_root:
+            candidate = _os.path.join(
+                qwen3_root, "tts", "speaker_encoder", "speaker_encoder.onnx"
+            )
+            if not _os.path.exists(candidate):
+                candidate = ""
+        speaker_encoder = candidate or _os.path.join(
+            qwen3_tts_model_base, "onnx", "speaker_encoder.onnx"
+        )
+
+    # -- worker_concurrency: env → 1.
+    env_conc = env.get("OVS_TTS_WORKER_CONCURRENCY")
+    if env_conc is not None:
+        try:
+            worker_concurrency = int(env_conc)
+        except ValueError:
+            worker_concurrency = 1
+    else:
+        worker_concurrency = 1
+    worker_concurrency = max(1, worker_concurrency)
+
+    # -- stateful_code2wav: leave None when unset so dataclass derives from
+    #    runtime profile; pass explicit bool otherwise.
+    stateful_raw = env.get("EDGE_LLM_TTS_STATEFUL_CODE2WAV")
+    if stateful_raw is None:
+        stateful_code2wav = None
+    else:
+        stateful_code2wav = stateful_raw.lower() not in ("0", "false", "no", "off")
+
+    model_id = env.get("OVS_TTS_MODEL_ID") or "trt_edgellm"
+
+    # BASE-model fixed speaker embedding
+    def _resolve_base_spk_embed_b64() -> str:
+        direct = (env.get("EDGE_LLM_TTS_BASE_SPK_EMBED_B64") or "").strip()
+        if direct:
+            return direct
+        path = (env.get("EDGE_LLM_TTS_BASE_SPK_EMBED_PATH") or "").strip()
+        if path and _os.path.exists(path):
+            try:
+                return open(path).read().strip()
+            except Exception:
+                return ""
+        return ""
+    base_speaker_embedding_b64 = _resolve_base_spk_embed_b64()
+
+    return TRTEdgeLLMTTSConfig(
+        # --- paths (all resolved from passed env dict) ---
+        tts_binary=_tts_binary_e(),
+        worker_binary=_resolve_worker_binary_e(),
+        plugin_path=_plugin_path_e(),
+        talker_dir=_resolve_talker_dir_e(),
+        talker_backend=_first("EDGE_LLM_TTS_TALKER_BACKEND"),
+        talker_engine=_first("EDGE_LLM_TTS_TALKER_ENGINE"),
+        code_predictor_backend=_first("EDGE_LLM_TTS_CODE_PREDICTOR_BACKEND"),
+        text_projection=_first("EDGE_LLM_TTS_TEXT_PROJECTION"),
+        prompt_kv_cache=_first("EDGE_LLM_TTS_PROMPT_KV_CACHE"),
+        code_predictor_dir=_resolve_cp_dir_e(),
+        tokenizer_dir=_resolve_tokenizer_dir_e(),
+        code2wav_dir=_resolve_code2wav_dir_e(),
+        speaker_encoder=speaker_encoder,
+        base_speaker_embedding_b64=base_speaker_embedding_b64,
+        # --- identity ---
+        model_id=model_id,
+        backend_mode=_first("OVS_TTS_BACKEND", "EDGE_LLM_TTS_BACKEND", default="edgellm_worker"),
+        # --- concurrency ---
+        use_worker=_flag("EDGE_LLM_TTS_WORKER", True),
+        worker_concurrency=worker_concurrency,
+        # --- runtime profile ---
+        qwen3_runtime_profile=_qwen3_profile_e(),
+        perf_profile=env.get("EDGE_LLM_TTS_PERF_PROFILE", "quality"),
+        stateful_code2wav=stateful_code2wav,
+        # --- sampling ---
+        seed=_in(42, "OVS_TTS_SEED"),
+        talker_temperature=_fl(0.9, "OVS_TTS_TALKER_TEMPERATURE", "TTS_TALKER_TEMPERATURE"),
+        talker_top_k=_in(50, "OVS_TTS_TALKER_TOP_K", "TTS_TALKER_TOP_K"),
+        talker_top_p=_fl(1.0, "OVS_TTS_TOP_P", "TTS_TOP_P"),
+        predictor_temperature=_fl(0.9, "OVS_TTS_PREDICTOR_TEMPERATURE", "TTS_PREDICTOR_TEMPERATURE"),
+        predictor_top_k=_in(50, "OVS_TTS_PREDICTOR_TOP_K", "TTS_PREDICTOR_TOP_K"),
+        predictor_top_p=_fl(1.0, "OVS_TTS_PREDICTOR_TOP_P", "TTS_PREDICTOR_TOP_P"),
+        max_audio_length=_in(1024, "TTS_MAX_AUDIO_LENGTH"),
+        min_audio_length=_in(30, "TTS_MIN_AUDIO_LENGTH"),
+        repetition_penalty=_fl(1.05, "TTS_REPETITION_PENALTY"),
+        codec_eos_logit_offset=_fl(0.0, "TTS_CODEC_EOS_LOGIT_OFFSET"),
+        # --- text segmentation ---
+        segment_text=_flag("EDGE_LLM_TTS_SEGMENT_TEXT", True),
+        segment_max_chars_latin=_in(120, "EDGE_LLM_TTS_SEGMENT_MAX_CHARS"),
+        segment_max_chars_cjk=_in(48, "EDGE_LLM_TTS_CJK_SEGMENT_MAX_CHARS"),
+        segment_pause_ms=_in(80, "EDGE_LLM_TTS_SEGMENT_PAUSE_MS"),
+        segment_hard_pause_ms=_in(120, "EDGE_LLM_TTS_HARD_SEGMENT_PAUSE_MS"),
+        # --- streaming ---
+        streaming_profile=env.get("EDGE_LLM_TTS_STREAMING_PROFILE", "continuous_playback"),
+        first_chunk_frames=(
+            int(env["EDGE_LLM_TTS_FIRST_CHUNK_FRAMES"])
+            if "EDGE_LLM_TTS_FIRST_CHUNK_FRAMES" in env else None
+        ),
+        chunk_frames=(
+            int(env["EDGE_LLM_TTS_CHUNK_FRAMES"])
+            if "EDGE_LLM_TTS_CHUNK_FRAMES" in env else None
+        ),
+        adaptive_chunks=(
+            env["EDGE_LLM_TTS_ADAPTIVE_CHUNKS"].strip().lower() in ("1", "true", "yes", "on")
+            if "EDGE_LLM_TTS_ADAPTIVE_CHUNKS" in env else None
+        ),
+        max_chunk_frames=(
+            int(env["EDGE_LLM_TTS_MAX_CHUNK_FRAMES"])
+            if "EDGE_LLM_TTS_MAX_CHUNK_FRAMES" in env else None
+        ),
+        chunk_growth_frames=(
+            int(env["EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES"])
+            if "EDGE_LLM_TTS_CHUNK_GROWTH_FRAMES" in env else None
+        ),
+    )
