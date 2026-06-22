@@ -6,7 +6,6 @@ Decoupled, additive copies of the production Jetson TRT backends:
 
   * :mod:`voxedge.backends.jetson.matcha_trt`     — Matcha TTS (TRT vocos + estimator)
   * :mod:`voxedge.backends.jetson.kokoro_trt`     — Kokoro TTS (engine / hybrid / split)
-  * :mod:`voxedge.backends.jetson.qwen3_trt`      — Qwen3-TTS (C++ pybind pipeline)
   * :mod:`voxedge.backends.jetson.moss_tts_nano`  — MOSS-TTS-Nano (JSONL subprocess worker)
   * :mod:`voxedge.backends.jetson.paraformer_trt` — Paraformer streaming ASR (TRT enc/dec)
 

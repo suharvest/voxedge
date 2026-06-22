@@ -24,12 +24,10 @@ import subprocess
 import wave
 
 import voxedge.backends.jetson.trt_edge_llm_tts as tts_mod
-import voxedge.backends.jetson.qwen3_trt as qwen3_mod
 from voxedge.backends.jetson.trt_edge_llm_tts import (
     TRTEdgeLLMTTSBackend,
     TRTEdgeLLMTTSConfig,
 )
-from voxedge.backends.jetson.qwen3_trt import Qwen3TRTBackend, Qwen3TRTConfig
 
 
 def _make_wav_bytes(frame_count: int, sample_rate: int = 24000) -> bytes:
@@ -140,99 +138,3 @@ def test_segmented_concatenates_one_shot_wavs(monkeypatch):
         assert reader.getnframes() == meta["samples"]
 
 
-# ── Qwen3 product segmentation ───────────────────────────────────────────────
-
-
-def _make_qwen3_backend(**config_kwargs):
-    cfg = Qwen3TRTConfig(
-        use_trt_vocoder=True,
-        vocoder_max_frames=100,
-        product_segment_text=True,
-        **config_kwargs,
-    )
-    backend = Qwen3TRTBackend.__new__(Qwen3TRTBackend)
-    backend._config = cfg
-    backend._ready = True
-    backend.supports_voice_cloning = bool(cfg.supports_voice_cloning)
-
-    class FakeTokenizer:
-        def encode(self, text):
-            import types as _t
-
-            return _t.SimpleNamespace(ids=[1, 2, 3])
-
-    class FakeEngine:
-        def __init__(self):
-            self.calls = []
-
-        def synthesize(self, **kwargs):
-            self.calls.append(kwargs)
-            return {
-                "wav_bytes": _make_wav_bytes(240),
-                "duration": 0.01,
-                "rtf": 0.5,
-                "n_frames": 10,
-                "per_step_ms": 1.0,
-            }
-
-    backend._tokenizer = FakeTokenizer()
-    backend._engine = FakeEngine()
-    return backend
-
-
-def test_qwen3_product_segments_cjk_punctuation():
-    backend = _make_qwen3_backend()
-    wav, meta = backend.synthesize("今天天气很好，我们一起测试语音合成。", max_audio_length=100, seed=42)
-
-    assert meta["product_segmented"] is True
-    assert [c["text"] for c in backend._engine.calls] == ["今天天气很好，", "我们一起测试语音合成。"]
-    assert all(c["seed"] == 42 for c in backend._engine.calls)
-    assert meta["segment_pauses_ms"] == [120]
-    with wave.open(io.BytesIO(wav), "rb") as reader:
-        assert reader.getnframes() == 480 + int(24000 * 0.12)
-
-
-# ── product_explicit_kv backend selection ────────────────────────────────────
-
-
-def test_product_explicit_kv_backend_is_selected_and_delegates(monkeypatch, tmp_path):
-    """backend_mode=product_explicit_kv → preload loads the in-process Qwen3
-    backend and synthesize delegates to it (no edgellm worker)."""
-    import types
-
-    calls = []
-
-    class FakeProductBackend:
-        def preload(self):
-            calls.append(("preload", None))
-
-        def synthesize(self, text, **kwargs):
-            calls.append(("synthesize", text))
-            return b"wav", {"backend": "product_explicit_kv"}
-
-    fake_module = types.SimpleNamespace(
-        Qwen3TRTBackend=lambda cfg: FakeProductBackend(),
-        Qwen3TRTConfig=lambda **kw: object(),
-    )
-    monkeypatch.setattr(tts_mod.importlib, "import_module", lambda name: fake_module)
-    monkeypatch.setattr(tts_mod.importlib, "reload", lambda module: module)
-
-    cfg = TRTEdgeLLMTTSConfig(
-        backend_mode="product_explicit_kv",
-        product_model_base=str(tmp_path / "qwen3-tts"),
-        product_overlay_dir=str(tmp_path / "overlay"),
-    )
-    backend = TRTEdgeLLMTTSBackend.__new__(TRTEdgeLLMTTSBackend)
-    backend._config = cfg
-    backend._product_backend = None
-    backend._resolved_mode = None
-    backend._ready = False
-
-    backend.preload()
-    assert backend.is_ready()
-    wav, meta = backend.synthesize("你好")
-
-    assert wav == b"wav"
-    assert meta["backend"] == "product_explicit_kv"
-    assert calls[0] == ("preload", None)
-    assert calls[1] == ("synthesize", "你好")

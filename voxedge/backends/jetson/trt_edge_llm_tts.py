@@ -17,10 +17,7 @@ Differences from the production copy (decoupling per spec §3.1 / §10):
     env reads.
   * ``WorkerIO`` imported from the sibling ``voxedge.backends.jetson.worker_io``;
     ``resolve_speaker_kwargs`` from ``._util`` (env-free, registry-free).
-  * The ``product_explicit_kv`` mode (in-process ``backends.qwen3_trt`` pybind
-    backend) is retained but its dynamic ``importlib`` stays lazy (method
-    scope) so this module imports without that optional product overlay; the
-    speaker-encoder ONNX path uses lazy ``import onnxruntime`` / ``soundfile``.
+  * The speaker-encoder ONNX path uses lazy ``import onnxruntime`` / ``soundfile``.
   * ``concurrency_capability`` is an instance method (voxedge base contract)
     reading ``config.worker_concurrency`` instead of env/profile; the N>1
     ``--max_slots`` conditional (main fix b1cb1a5) is preserved.
@@ -31,13 +28,11 @@ Supports: BASIC_TTS, MULTI_LANGUAGE, STREAMING (+ VOICE_CLONE in worker mode).
 from __future__ import annotations
 
 import base64
-import importlib
 import io
 import json
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -95,6 +90,7 @@ logger = logging.getLogger(__name__)
 #   EDGE_LLM_TTS_SEGMENT_PAUSE_MS/HARD_...           → segment_pause_ms/hard (80/120)
 #   EDGE_LLM_TTS_STREAMING_PROFILE                   → streaming_profile ("continuous_playback")
 #   EDGE_LLM_TTS_FIRST_CHUNK_FRAMES etc.             → chunk-frame overrides (None→profile-derived)
+#   (product_model_base / product_overlay_dir removed — product_explicit_kv mode deleted)
 
 
 _HIGHPERF_PROFILES = ("highperf", "perf", "performance", "v2v")
@@ -185,10 +181,6 @@ class TRTEdgeLLMTTSConfig:
     adaptive_chunks: Optional[bool] = None
     max_chunk_frames: Optional[int] = None
     chunk_growth_frames: Optional[int] = None
-
-    # product_explicit_kv mode paths (only used when backend_mode is that).
-    product_model_base: str = "/home/harvest/voice_test/models/qwen3-tts"
-    product_overlay_dir: str = "/home/harvest/voice_test/app_overlay"
 
     # Extra env passed through to the worker subprocess.
     extra_worker_env: dict = field(default_factory=dict)
@@ -565,16 +557,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     @property
     def supports_hot_reload(self) -> bool:  # type: ignore[override]
-        mode = getattr(self, "_resolved_mode", None) or self._backend_mode()
-        if mode in ("product_explicit_kv", "explicit_kv"):
-            return False
         return True
 
     def __init__(self, config: Optional[TRTEdgeLLMTTSConfig] = None):
         self._config = config or TRTEdgeLLMTTSConfig()
         self._ready = False
-        self._product_backend = None
-        self._resolved_mode: Optional[str] = None
         self._worker: Optional[subprocess.Popen] = None
         self._worker_lock = threading.Lock()
         self._worker_io: Optional[WorkerIO] = None
@@ -618,11 +605,8 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE, TTSCapability.STREAMING}
-        if self._product_backend is not None:
-            caps |= self._product_backend.capabilities
-        else:
-            caps.add(TTSCapability.VOICE_CLONE)
+        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE, TTSCapability.STREAMING,
+                TTSCapability.VOICE_CLONE}
         return caps
 
     @property
@@ -635,50 +619,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _backend_mode(self) -> str:
         return self._config.backend_mode
 
-    def _load_product_explicit_kv_backend(self):
-        model_base = self._config.product_model_base
-        overlay = self._config.product_overlay_dir
-        overlay_backends = os.path.join(overlay, "backends")
-        for path in (overlay, overlay_backends):
-            if os.path.isdir(path) and path not in sys.path:
-                sys.path.insert(0, path)
-
-        os.environ.setdefault("QWEN3_MODEL_BASE", model_base)
-        os.environ.setdefault("QWEN3_MODEL_DIR", os.path.join(model_base, "onnx"))
-        os.environ.setdefault("QWEN3_SHERPA_DIR", os.path.join(model_base, "onnx"))
-        os.environ.setdefault("QWEN3_TALKER_ENGINE", os.path.join(model_base, "engines", "talker_decode_bf16.engine"))
-        os.environ.setdefault("QWEN3_CP_ENGINE", os.path.join(model_base, "engines", "cp_bf16.engine"))
-        os.environ.setdefault("TTS_TALKER_CUDA_GRAPH", "0")
-
-        # Bridge to the decoupled voxedge jetson copy. The decoupled backend
-        # takes an explicit Qwen3TRTConfig (no env reads), so we build one from
-        # ``model_base`` + the CUDA-graph-off default this product path uses.
-        # The env setdefaults above are retained for the resident C++ engine /
-        # any overlay code that still reads process env.
-        module = importlib.import_module("voxedge.backends.jetson.qwen3_trt")
-        module = importlib.reload(module)
-        cfg = module.Qwen3TRTConfig(model_base=model_base, talker_cuda_graph=False)
-        backend = module.Qwen3TRTBackend(cfg)
-        logger.info(
-            "Using product_explicit_kv TTS backend (model_base=%s, talker=%s)",
-            model_base,
-            os.environ.get("QWEN3_TALKER_ENGINE"),
-        )
-        backend.preload()
-        return backend
-
     def preload(self) -> None:
         """Verify all required files exist."""
         mode = self._backend_mode()
-        self._resolved_mode = mode
-        if mode in ("product_explicit_kv", "explicit_kv"):
-            self._product_backend = self._load_product_explicit_kv_backend()
-            self._ready = True
-            return
         if mode not in ("edgellm", "edgellm_worker", "official"):
             raise ValueError(
-                f"Unsupported backend_mode {mode!r}; expected edgellm_worker "
-                "or product_explicit_kv"
+                f"Unsupported backend_mode {mode!r}; expected edgellm_worker"
             )
 
         required = [
@@ -717,11 +663,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     def unload(self) -> None:
         """Kill the resident worker subprocess so GPU memory is fully released."""
-        if (
-            not self._ready
-            and self._worker is None
-            and self._product_backend is None
-        ):
+        if not self._ready and self._worker is None:
             return
         try:
             with self._worker_lock:
@@ -742,13 +684,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         except Exception:
             logger.exception("TRTEdgeLLMTTSBackend.unload failed; continuing")
         finally:
-            if self._product_backend is not None:
-                try:
-                    self._product_backend.unload()
-                except Exception:
-                    logger.exception("product_backend.unload failed; continuing")
-                self._product_backend = None
-            self._resolved_mode = None
             self._ready = False
 
     def _use_worker(self) -> bool:
@@ -973,10 +908,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     def _generate_streaming_impl(self, text: str, **kwargs):
         """Yield raw PCM int16 chunks from the resident EdgeLLM TTS worker."""
-        if self._product_backend is not None:
-            yield from self._product_backend.generate_streaming(text, **kwargs)
-            return
-
         if self._config.segment_text and kwargs.get("segment_text", True):
             segments = _split_tts_text(
                 text,
@@ -1182,11 +1113,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         """Run TTS inference via subprocess. Returns (wav_bytes, meta_dict)."""
         if not self._ready:
             raise RuntimeError("TTS backend not preloaded")
-        if self._product_backend is not None:
-            return self._synthesize_single(
-                text, speaker_id=speaker_id, speed=speed,
-                pitch_shift=pitch_shift, language=language, **kwargs,
-            )
 
         if self._config.segment_text and kwargs.get("segment_text", True):
             segments = _split_tts_text(
@@ -1251,11 +1177,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         speed: Optional[float] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        if self._product_backend is not None:
-            return self._product_backend.clone_voice(
-                text=text, speaker_embedding=speaker_embedding,
-                language=language, speed=speed, **kwargs,
-            )
         if len(speaker_embedding) % 4 != 0:
             raise ValueError("speaker_embedding must be a float32 byte vector")
         return self._synthesize_impl(
@@ -1264,8 +1185,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         )
 
     def extract_speaker_embedding(self, audio_wav_bytes: bytes) -> bytes:
-        if self._product_backend is not None:
-            return self._product_backend.extract_speaker_embedding(audio_wav_bytes)
         if not self._speaker_encoder or not os.path.exists(self._speaker_encoder):
             raise NotImplementedError(f"speaker encoder not found: {self._speaker_encoder}")
         return _qwen3_speaker_embed_inproc(audio_wav_bytes, self._speaker_encoder)
@@ -1280,11 +1199,6 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         **kwargs,
     ) -> tuple[bytes, dict]:
         """Run one already-bounded TTS request."""
-        if self._product_backend is not None:
-            return self._product_backend.synthesize(
-                text, speaker_id=speaker_id, speed=speed,
-                pitch_shift=pitch_shift, language=language, **kwargs,
-            )
         if self._use_worker():
             return self._synthesize_worker(text, language, speaker_id=speaker_id, **kwargs)
 
