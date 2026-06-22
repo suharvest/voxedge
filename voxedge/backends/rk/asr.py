@@ -81,6 +81,21 @@ class RKASRConfig:
     ``platform`` mirrors the old ``RK_PLATFORM`` env (default ``"rk3576"``).
     The energy-split / long-audio-threshold fields were previously read from
     env *inside* the splitter on every call; they are now injected once.
+
+    **Encoder file requirement (streaming partials)**
+    chunk_confirm streaming mode requires at least one ≤4 s encoder model to
+    deliver partial transcriptions during the audio window.  The underlying
+    ``rkvoice_stream`` engine reads ``ASR_ENCODER_SIZES`` from the process
+    environment; when unset it loads every ``*.rknn`` file found under
+    ``<ASR_MODEL_DIR>/encoder/<platform>/``.
+
+    HF artifact sets (``harvestsu/seeed-local-voice-rk-artifacts``) ship all
+    three sizes (2 s / 4 s / 15 s).  If you mount a custom model directory,
+    ensure it contains the 2 s and 4 s encoder files **or** set
+    ``ASR_ENCODER_SIZES=2,4,15`` explicitly.  Deploying only the 15 s model
+    silently disables streaming partials (each hop takes ~6 s, longer than
+    real-time audio push); rkvoice_stream ≥2026-06-23 emits a WARNING on
+    startup when this condition is detected.
     """
 
     platform: str = "rk3576"
