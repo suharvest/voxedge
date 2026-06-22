@@ -230,6 +230,20 @@ async def _drain_iter(aiter):
     return out
 
 
+def test_ws_idle_timeout_is_injected_not_read_from_env(monkeypatch):
+    """The library reads NO env: idle_timeout_s comes only from the caller.
+
+    Default (param omitted) is the 90s library default; an explicit value is
+    honoured verbatim; and OVS_V2V_IDLE_TIMEOUT_S in the environment is IGNORED
+    (the product resolves env and injects the value — see server/main.py)."""
+    ws = _FakeWS([])
+    # Env set to a wildly different value — must NOT leak into the library.
+    monkeypatch.setenv("OVS_V2V_IDLE_TIMEOUT_S", "7")
+    assert WebSocketTransport(ws)._idle_timeout_s == 90.0          # pure default
+    assert WebSocketTransport(ws, idle_timeout_s=0.5)._idle_timeout_s == 0.5
+    assert WebSocketTransport(ws, idle_timeout_s=0)._idle_timeout_s == 0  # disables
+
+
 @run_async
 async def test_ws_pump_clean_disconnect_frame_enqueues_close():
     """A clean {'type':'websocket.disconnect'} frame ends both recv iterators
