@@ -313,6 +313,26 @@ class TestDeployPathsNoEnvFallback:
 
 
 # ---------------------------------------------------------------------------
+# 4. env=None path: build_config_from_env() reads os.environ by default
+# ---------------------------------------------------------------------------
+
+def test_tts_build_config_env_none_reads_os_environ(monkeypatch):
+    """env=None 时应读 os.environ（生产默认路径）。"""
+    monkeypatch.setenv("EDGE_LLM_TTS_WORKER_BIN", "/tmp/fake_tts_worker")
+    from voxedge.backends.jetson.trt_edge_llm_tts import build_config_from_env
+    cfg = build_config_from_env()  # env=None
+    assert cfg.worker_binary == "/tmp/fake_tts_worker"
+
+
+def test_asr_build_config_env_none_reads_os_environ(monkeypatch):
+    """env=None 时应读 os.environ（生产默认路径）。"""
+    monkeypatch.setenv("EDGE_LLM_ASR_WORKER_BIN", "/tmp/fake_asr_worker")
+    from voxedge.backends.jetson.trt_edge_llm_asr import build_config_from_env
+    cfg = build_config_from_env()  # env=None
+    assert cfg.worker_binary == "/tmp/fake_asr_worker"
+
+
+# ---------------------------------------------------------------------------
 # 3. Shim backward-compat: server.core.deploy_paths re-exports from voxedge
 # ---------------------------------------------------------------------------
 
