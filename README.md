@@ -1,5 +1,7 @@
 # voxedge
 
+> **English** | [中文](README.zh-CN.md)
+
 **Run real-time speech recognition and synthesis locally on edge devices — Jetson Orin, RK3576/RK3588, Raspberry Pi.** Low latency, multiple concurrent streams, and swap models without changing your code.
 
 ```bash
