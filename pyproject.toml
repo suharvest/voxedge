@@ -111,6 +111,15 @@ text = [
 artifacts = [
     "huggingface_hub>=0.20",
 ]
+# Installing `voxedge[llm]` pulls the httpx transport used by the generic
+# OpenAI-compatible LLM backend (`voxedge.backends.llm.OpenAICompatBackend`).
+# httpx is pure-Python and imported lazily inside the backend, so the core
+# stays installable without this extra; a consumer that drives an LLM service
+# installs it explicitly. Provider-specific request flags / endpoint resolution
+# are layered by the product (e.g. edge-llm), not declared here.
+llm = [
+    "httpx>=0.24",
+]
 
 [tool.setuptools]
 packages = [
@@ -119,6 +128,7 @@ packages = [
     "voxedge.backends.sherpa",
     "voxedge.backends.rk",
     "voxedge.backends.jetson",
+    "voxedge.backends.llm",
     "voxedge.capabilities",
     "voxedge.transport",
     "voxedge.engine",
@@ -127,3 +137,8 @@ packages = [
 
 [tool.setuptools.package-data]
 "voxedge.artifacts" = ["manifest.json"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

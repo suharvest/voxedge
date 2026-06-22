@@ -169,18 +169,14 @@ class WebSocketTransport(Transport):
         # wedge receive() forever, so the engine's recv iterators never return,
         # _watch_input_end never fires, and the SessionLimiter slot held by the
         # caller leaks permanently. On timeout we treat the socket exactly like
-        # an end-of-stream (break → finally enqueues _CLOSE). Default 90s is
+        # an end-of-stream (break → finally enqueues _CLOSE). The default 90s is
         # longer than the agent thinking-watchdog / LLM stream-idle so a
         # slow-but-alive turn is never killed. <=0 disables the watchdog.
-        import os as _os
-        if idle_timeout_s is None:
-            try:
-                idle_timeout_s = float(
-                    _os.environ.get("OVS_V2V_IDLE_TIMEOUT_S", 90.0)
-                )
-            except (TypeError, ValueError):
-                idle_timeout_s = 90.0
-        self._idle_timeout_s = idle_timeout_s
+        #
+        # The value is injected by the caller (the product resolves it from its
+        # own config/env — e.g. OVS_V2V_IDLE_TIMEOUT_S); the library reads no
+        # environment of its own. None → the 90s library default.
+        self._idle_timeout_s = 90.0 if idle_timeout_s is None else idle_timeout_s
 
     def _ensure_pump(self) -> None:
         if self._pump_task is None:
