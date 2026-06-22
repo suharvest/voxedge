@@ -76,7 +76,13 @@ class OpenAICompatBackend(LLMBackend):
 
     def _ensure_client(self):
         if self._client is None:
-            self._client = self._httpx.AsyncClient(timeout=self.request_timeout_s)
+            # Send the API key as a Bearer header when one is set, so the
+            # generic backend works against auth-requiring OpenAI-compatible
+            # servers. An empty key (e.g. a dummy "edge-llm") sends no header.
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+            self._client = self._httpx.AsyncClient(
+                timeout=self.request_timeout_s, headers=headers
+            )
         return self._client
 
     def _build_body(

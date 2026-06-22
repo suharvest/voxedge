@@ -119,6 +119,16 @@ async def test_finish_reason_error_raises():
     await be.aclose()
 
 
+def test_api_key_sent_as_bearer_header():
+    # A non-empty api_key → Authorization: Bearer <key> on the client.
+    be = OpenAICompatBackend("http://h/v1", api_key="sk-test")
+    client = be._ensure_client()
+    assert client.headers.get("Authorization") == "Bearer sk-test"
+    # Empty key → no Authorization header.
+    be2 = OpenAICompatBackend("http://h/v1")
+    assert "Authorization" not in be2._ensure_client().headers
+
+
 def test_chat_url_resolution():
     assert OpenAICompatBackend("http://h/v1")._chat_url == "http://h/v1/chat/completions"
     assert OpenAICompatBackend("http://h")._chat_url == "http://h/v1/chat/completions"
