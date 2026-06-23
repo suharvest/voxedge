@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxedge"
-version = "0.0.1a0"
+version = "0.0.2a0"
 description = "Pipecat for the edge — edge-native, local-first real-time voice conversation library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ rk = [
     # `rkvoice_stream` is the RK ASR/TTS engine package; it ships from the
     # engine repo / release artifacts (like the trt worker). Backends import it
     # lazily (inside __init__/methods), so the core stays installable elsewhere.
-    "rkvoice-stream>=0.1 ; platform_machine == 'aarch64'",
+    "rkvoice-stream>=0.1.1 ; platform_machine == 'aarch64'",
 ]
 # Installing `voxedge[sherpa]` pulls the sherpa-onnx CPU ASR/TTS adapter
 # (Paraformer/Zipformer/SenseVoice + Matcha/Kokoro ONNX). The adapter lives in
