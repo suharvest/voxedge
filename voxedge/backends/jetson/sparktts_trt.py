@@ -7,10 +7,22 @@ events keyed by request ``id``. We reuse :class:`WorkerIO` for the same request-
 multiplexing + ``threading.Semaphore(worker_concurrency)`` back-pressure used by the
 qwen3 TTS backend, and ``{"type":"cancel","id":...}`` for mid-stream cancel.
 
-SparkTTS is a CONTROLLABLE backend: voice is selected via ``gender`` / ``pitch`` /
-``speed`` style labels (not a speaker table / reference audio). The controllable prompt
-is built INSIDE the worker; this backend only forwards the three style fields. Output is
-16 kHz mono PCM s16le.
+SparkTTS supports TWO voice-selection modes over the SAME worker / LLM / vocoder
+(spec §7, they share the engine and differ only in the prompt the worker builds):
+
+  * CONTROLLABLE — voice selected via ``gender`` / ``pitch`` / ``speed`` style labels.
+    The controllable prompt is built INSIDE the worker; this backend forwards the three
+    style fields (``mode:"controllable"``, the worker default).
+  * CLONE (zero-shot) — voice selected via a ``voice``/``speaker`` value that names a
+    registered VoiceProfile (host-enrolled, spec §10). This backend looks the id up in a
+    :class:`VoiceRegistry` and forwards ``mode:"clone"`` + ``global_ids[32]`` (+ optional
+    strategy-B ``ref_semantic_ids`` / ``ref_text``); the worker conditions timbre on the
+    reference's global tokens. NO reference-audio analysis happens here or on-device — the
+    analysis chain runs once at enrollment on a GPU host (spec §3.2).
+
+Routing: a ``voice``/``speaker`` string that hits the registry → clone; otherwise it is
+parsed as a controllable ``gender_pitch_speed`` spec (back-compat). Output is 16 kHz mono
+PCM s16le for both modes.
 
 Zero env reads at import / construction (the ``trt_edge_llm_tts_env_staleness`` pitfall):
 every path/param is an explicit :class:`SparkTTSConfig` field, read once in ``preload`` /
@@ -34,6 +46,7 @@ from typing import Any, Iterator, Optional
 
 from voxedge.backends.base import TTSBackend, TTSCapability
 from voxedge.backends.jetson.worker_io import WorkerIO, WorkerExitError
+from voxedge.backends.jetson.voice_registry import VoiceRegistry, VoiceProfile
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
 logger = logging.getLogger(__name__)
@@ -78,6 +91,13 @@ class SparkTTSConfig:
     default_pitch: str = "moderate"
     default_speed: str = "moderate"
 
+    # voice clone (registry of host-enrolled VoiceProfiles; spec §4.3)
+    #   voices_dir: directory of <voice_id>.json + .npz pairs (None → clone disabled).
+    #   clone_use_ref_semantic: strategy B (ref-semantic in-context prefix) when a profile
+    #     carries it; False forces strategy A (global-only, shorter prompt / faster TTFA).
+    voices_dir: Optional[str] = None
+    clone_use_ref_semantic: bool = False  # spike P0: strategy A slightly better + faster
+
     # concurrency: gates worker --max_slots (N>1 enables supports_parallel)
     worker_concurrency: int = 1
 
@@ -105,6 +125,14 @@ class SparkTTSBackend(TTSBackend):
         self._worker_concurrency = max(1, int(self._config.worker_concurrency))
         self._worker_stderr_tail: deque[str] = deque(maxlen=80)
         self._sample_rate = int(self._config.sample_rate)
+        # Clone voice registry (spec §4.3); None voices_dir → empty registry (clone off).
+        self._voices = VoiceRegistry(self._config.voices_dir)
+
+    @property
+    def voices(self) -> VoiceRegistry:
+        """Clone voice registry (``voice_id`` → :class:`VoiceProfile`). The product/OVS
+        layer uses ``.reload()`` after registering/deleting a profile."""
+        return self._voices
 
     # -- TTSBackend interface ------------------------------------------------
     @property
@@ -117,11 +145,19 @@ class SparkTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        return {
+        caps = {
             TTSCapability.BASIC_TTS,
             TTSCapability.MULTI_LANGUAGE,
             TTSCapability.STREAMING,
         }
+        # Advertise voice clone only when a registry directory is configured. The
+        # selection key is a registered ``voice_id`` (NOT a raw speaker embedding):
+        # clone here is reference-token based (host-enrolled VoiceProfile), so this
+        # backend does not consume ``speaker_embedding`` bytes the way CustomVoice does.
+        if self._config.voices_dir:
+            caps.add(TTSCapability.VOICE_CLONE)
+            caps.add(TTSCapability.VOICE_CLONE_ICL)  # strategy B (ref-semantic in-context)
+        return caps
 
     @property
     def sample_rate(self) -> int:
@@ -295,15 +331,33 @@ class SparkTTSBackend(TTSBackend):
         speed = self._norm_level(kwargs.get("style_speed", speed), cfg.default_speed)
         return gender, pitch, speed
 
+    def _resolve_voice_profile(self, kwargs: dict) -> Optional[VoiceProfile]:
+        """Return a clone VoiceProfile if the request selects a registered voice.
+
+        Selection keys (first hit wins):
+          1. ``voice_profile`` — an already-loaded :class:`VoiceProfile` (callers may
+             inject one directly, bypassing the registry).
+          2. ``voice_id`` — explicit registry key.
+          3. ``voice`` / ``speaker`` — the generic selection string; a hit in the
+             registry means clone, a miss falls through to controllable style parsing.
+        Returns ``None`` → controllable mode.
+        """
+        vp = kwargs.get("voice_profile")
+        if isinstance(vp, VoiceProfile):
+            return vp
+        for key in ("voice_id", "voice", "speaker"):
+            val = kwargs.get(key)
+            if isinstance(val, str) and val.strip():
+                prof = self._voices.get(val.strip())
+                if prof is not None:
+                    return prof
+        return None
+
     def _build_request(self, req_id: str, text: str, *, stream: bool, kwargs: dict) -> dict:
         cfg = self._config
-        gender, pitch, speed = self._parse_style(kwargs)
         req = {
             "id": req_id,
             "text": text,
-            "gender": gender,
-            "pitch": pitch,
-            "speed": speed,
             "top_k": int(kwargs.get("top_k", cfg.top_k)),
             "temperature": float(kwargs.get("temperature", cfg.temperature)),
             "top_p": float(kwargs.get("top_p", cfg.top_p)),
@@ -315,6 +369,18 @@ class SparkTTSBackend(TTSBackend):
             "left_overlap_tokens": int(kwargs.get("left_overlap_tokens", cfg.left_overlap_tokens)),
             "chunk_transport": "base64",
         }
+        profile = self._resolve_voice_profile(kwargs)
+        if profile is not None:
+            # CLONE: forward mode + global_ids[32] (+ strategy-B ref-semantic/ref-text).
+            # Per-request override of strategy B via use_ref_semantic kwarg.
+            use_ref = bool(kwargs.get("use_ref_semantic", cfg.clone_use_ref_semantic))
+            req.update(profile.worker_request_fields(use_ref_semantic=use_ref))
+        else:
+            # CONTROLLABLE: gender/pitch/speed style labels (worker default mode).
+            gender, pitch, speed = self._parse_style(kwargs)
+            req["gender"] = gender
+            req["pitch"] = pitch
+            req["speed"] = speed
         return req
 
     def _worker_io_locked(self) -> WorkerIO:
@@ -336,6 +402,10 @@ class SparkTTSBackend(TTSBackend):
         """Yield raw PCM s16le @16k chunks from the resident SparkTTS worker."""
         if not text or not text.strip():
             return
+        # ``speaker`` is captured as a named kwarg by the public wrapper; fold it back
+        # so voice/clone routing in _build_request sees it (registry hit → clone).
+        if speaker is not None:
+            kwargs.setdefault("speaker", speaker)
         req_id = uuid.uuid4().hex
         request = self._build_request(req_id, text, stream=True, kwargs=kwargs)
         worker_io = self._worker_io_locked()
