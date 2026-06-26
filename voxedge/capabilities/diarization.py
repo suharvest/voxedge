@@ -186,7 +186,10 @@ class OfflineDiarizer:
                 return []
             if len(items) == 1:
                 emb, start, end = items[0]
-                return [SpeakerSegment(float(start), float(end), "spk_0", 1.0)]
+                return [SpeakerSegment(
+                    float(start), float(end), "spk_0", 1.0,
+                    embedding=_l2_normalize(emb),
+                )]
 
             embs = np.stack([_l2_normalize(e) for (e, _, _) in items]).astype(np.float32)
             starts = np.array([float(s) for (_, s, _) in items], dtype=np.float64)
@@ -303,6 +306,7 @@ class OfflineDiarizer:
                     float(ends[i]),
                     f"spk_{remap[c]}",
                     conf,
+                    embedding=embs[i],
                 )
             )
         # Return in time order for a stable, readable transcript.
