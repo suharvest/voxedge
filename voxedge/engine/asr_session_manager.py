@@ -145,6 +145,12 @@ class ASRSessionManager:
         self._state: SessionState = SessionState.IDLE
         self._stream: Any = None
         self._generation: int = 0
+        # Lock-free preemption signal. ``cancel``/``on_speech_start`` bump this
+        # BEFORE contending for ``_lock`` so an in-flight ``finalize`` (which,
+        # per F1, holds ``_lock`` across its whole worker op) can detect that it
+        # was preempted and discard its now-stale result instead of committing a
+        # barge-in/old-utterance final. Mutated only from the event loop thread.
+        self._abort_epoch: int = 0
         self._last_error: Optional[BaseException] = None
         self._recovery_in_progress: bool = False
         self._recovery_future: Optional[asyncio.Future] = None
@@ -189,6 +195,9 @@ class ASRSessionManager:
         Returns the new generation id. Stale finals from a previous
         generation must be ignored by the caller.
         """
+        # Preempt any in-flight finalize before blocking on the lock (see
+        # ``_abort_epoch``): U2 starting while U1 is finalizing must discard U1.
+        self._abort_epoch += 1
         async with self._lock:
             if self._state in (SessionState.ACTIVE, SessionState.FINALIZING):
                 await self._inner_cancel(reason="speech_start_preempt")
@@ -259,6 +268,8 @@ class ASRSessionManager:
                 return self._generation, "", False, None
             gen = self._generation
             self._state = SessionState.FINALIZING
+            # Snapshot the preemption signal before the (lock-held) worker op.
+            abort_epoch0 = self._abort_epoch
             stream = self._stream
             if stream is None:
                 self._state = SessionState.IDLE
@@ -270,8 +281,18 @@ class ASRSessionManager:
                 return gen, "", False, None
             # Backends MUST return ``(text, language)`` per the ASRStream ABC.
             final_text, detected_language = raw
-            # State/gen can't change under us now (lock held throughout), but
-            # keep the guards as defensive invariants.
+            # A cancel()/on_speech_start() that arrived while we held the lock
+            # bumped _abort_epoch (lock-free, before it blocked on the lock).
+            # Discard the now-stale result so a barge-in / preempting utterance
+            # does not leak the old final downstream — the caller suppresses on
+            # accepted=False. (F1 holds the lock across the whole finalize, so
+            # this lock-free epoch is the only signal that can reach us here.)
+            if self._abort_epoch != abort_epoch0:
+                logger.info(
+                    "ASRSessionManager: finalize result discarded (preempted mid-flight)"
+                )
+                return gen, "", False, None
+            # Defensive invariants (kept; normally unreachable under the lock).
             if self._state != SessionState.FINALIZING:
                 logger.info("ASRSessionManager: finalize result discarded (state=%s)", self._state)
                 return gen, "", False, None
@@ -338,6 +359,9 @@ class ASRSessionManager:
             return gen, partial or "", bool(is_endpoint)
 
     async def cancel(self, reason: str = "bargein") -> None:
+        # Flag the in-flight finalize (if any) before contending for the lock so
+        # a barge-in discards rather than commits its result (see _abort_epoch).
+        self._abort_epoch += 1
         async with self._lock:
             await self._inner_cancel(reason=reason)
 
