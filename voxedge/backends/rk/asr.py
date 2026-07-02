@@ -213,6 +213,21 @@ def _to_str(value) -> str:
     return str(value)
 
 
+def _unpack_inner_final(raw) -> tuple[str, Optional[str]]:
+    """Normalise an inner backend's ``finalize()`` return.
+
+    qwen3_rk returns ``(text, language)`` per the newer ASRStream contract;
+    every other rkvoice backend returns a plain string. Without this, the
+    tuple reaches ``_clean_segment_text``/``str()`` and captions render as
+    ``"('今天天气怎么样？', '')"``.
+    """
+    if isinstance(raw, tuple):
+        text = raw[0] if raw else ""
+        lang = raw[1] if len(raw) > 1 else None
+        return (text or ""), (lang or None)
+    return (raw or ""), None
+
+
 def _clean_segment_text(text) -> str:
     """Drop model-bailout placeholders. Tolerates dict/str/None inputs."""
     s = _to_str(text)
@@ -319,12 +334,13 @@ class _RKASRStreamAdapter(ASRStream):
     def finalize(self):
         inner = self._live_inner()
         if not self._chunks:
-            return (inner.finalize() or ""), None
+            text, lang = _unpack_inner_final(inner.finalize())
+            return text, lang
         audio = np.concatenate(self._chunks)
         dur_s = len(audio) / max(self._sample_rate, 1)
         if dur_s <= self._long_audio_threshold_s:
-            text = inner.finalize() or ""
-            return _clean_segment_text(text), None
+            text, lang = _unpack_inner_final(inner.finalize())
+            return _clean_segment_text(text), lang
 
         # Long path: segment + per-segment offline transcribe via inner.
         audio = _resample_to_16k(audio, self._sample_rate)
