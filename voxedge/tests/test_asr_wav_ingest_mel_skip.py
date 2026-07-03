@@ -67,6 +67,24 @@ def test_worker_env_propagates_wav_flag():
     assert env2["EDGELLM_REQUEST_AUDIO_WAV"] == "0"
 
 
+def test_offline_prepare_audio_writes_wav_in_wav_mode(tmp_path):
+    # WAV-ingest mode: the offline transcribe path hands the worker a raw WAV
+    # (worker extracts mel internally) — NOT a mel safetensors. This is the
+    # completeness fix for the offline /asr path (streaming already worked).
+    import numpy as np
+    from voxedge.backends.jetson.trt_edge_llm_asr import _float_audio_to_wav_bytes
+
+    cfg = TRTEdgeLLMASRConfig(request_audio_wav=True)
+    be = TRTEdgeLLMASRBackend(cfg)
+    wav_in = _float_audio_to_wav_bytes(np.zeros(16000, dtype=np.float32), 16000)
+    path, elapsed = be._prepare_worker_audio(wav_in, str(tmp_path))
+    assert path.endswith("audio.wav")
+    assert os.path.exists(path)
+    with open(path, "rb") as f:
+        assert f.read(4) == b"RIFF"  # a real WAV, not a safetensors mel tensor
+    assert elapsed >= 0.0
+
+
 def test_worker_env_explicit_env_wins():
     # An explicit ambient value is not clobbered (setdefault semantics).
     cfg = TRTEdgeLLMASRConfig(request_audio_wav=False, plugin_path="/tmp/plugin.so")
