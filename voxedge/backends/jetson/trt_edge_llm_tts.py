@@ -149,6 +149,13 @@ class TRTEdgeLLMTTSConfig:
     qwen3_runtime_profile: str = "highperf"
     perf_profile: str = "quality"
     stateful_code2wav: Optional[bool] = None
+    # Streaming-native worker (TensorRT-Edge-LLM v0.9.0 lean code2wav): the
+    # worker only emits audio via streamingChunkFrames/onChunkReady and has no
+    # output_file (write-whole-WAV) mode. When True, the non-streaming synth
+    # path aggregates streaming chunks into a WAV instead of requesting an
+    # output_file (which the v090 worker rejects with KeyError('output_file')).
+    # Defaults False to preserve the v0.8.0 non-stateful output_file path.
+    streaming_only_worker: bool = False
     seed: int = 42
 
     # Sampling.
@@ -800,7 +807,9 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         self._ensure_worker()
 
     def _synthesize_worker(self, text: str, language: Optional[str], **kwargs) -> tuple[bytes, dict]:
-        if self._config.stateful_code2wav_enabled():
+        if self._config.stateful_code2wav_enabled() or self._config.streaming_only_worker:
+            # Streaming worker (stateful v080, or streaming-native v090 lean):
+            # no output_file mode → aggregate streaming chunks into a WAV.
             return self._synthesize_worker_via_stream(text, language=language, **kwargs)
         req_id = uuid.uuid4().hex
         with tempfile.NamedTemporaryFile(prefix="trt_edgellm_tts_", suffix=".wav", delete=False) as f:
@@ -1521,6 +1530,11 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMTTSConfig:
     else:
         stateful_code2wav = stateful_raw.lower() not in ("0", "false", "no", "off")
 
+    # Streaming-native worker (v0.9.0 lean code2wav has no output_file mode).
+    streaming_only_worker = str(
+        env.get("EDGE_LLM_TTS_STREAMING_ONLY", "0")
+    ).lower() not in ("0", "false", "no", "off", "")
+
     model_id = env.get("OVS_TTS_MODEL_ID") or "trt_edgellm"
 
     # BASE-model fixed speaker embedding
@@ -1563,6 +1577,7 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMTTSConfig:
         qwen3_runtime_profile=_qwen3_profile_e(),
         perf_profile=env.get("EDGE_LLM_TTS_PERF_PROFILE", "quality"),
         stateful_code2wav=stateful_code2wav,
+        streaming_only_worker=streaming_only_worker,
         # --- sampling ---
         seed=_in(42, "OVS_TTS_SEED"),
         talker_temperature=_fl(0.9, "OVS_TTS_TALKER_TEMPERATURE", "TTS_TALKER_TEMPERATURE"),
