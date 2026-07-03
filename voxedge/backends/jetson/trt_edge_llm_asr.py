@@ -144,6 +144,12 @@ class TRTEdgeLLMASRConfig:
     segment_cap_sec: float = 5.5
     mel_settings_path: str = ""
     mel_filters_path: str = ""
+    # WAV-ingest mode (TensorRT-Edge-LLM v0.9.0+): the worker writes the
+    # received PCM to a temp WAV and lets the runtime's audio front-end extract
+    # mel internally, so the host-side mel_settings/mel_filters assets are not
+    # required. Defaults False to preserve the v0.8.0 mel-asset contract; the
+    # v090 profiles set EDGELLM_REQUEST_AUDIO_WAV=1 to opt in.
+    request_audio_wav: bool = False
 
     # Sampling.
     temperature: float = 1.0
@@ -389,6 +395,15 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     def _require_streaming_worker_assets(self) -> None:
         if not self._use_streaming_worker():
             return
+        if self._config.request_audio_wav:
+            # WAV-ingest mode (v0.9.0+): the worker extracts mel internally from
+            # a temp WAV, so host-side mel assets are not needed. _ensure_worker
+            # already omits --melSettings/--melFilters when they are unset.
+            logger.info(
+                "ASR WAV-ingest mode (EDGELLM_REQUEST_AUDIO_WAV=1): "
+                "skipping host-side mel-asset requirement."
+            )
+            return
         missing = []
         if not self._use_worker():
             missing.append("use_worker=True is required for streaming worker mode")
@@ -409,6 +424,12 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         env.update(self._config.extra_worker_env)
         env["EDGELLM_PLUGIN_PATH"] = self._config.plugin_path
         env.setdefault("EDGE_LLM_ASR_CUDA_GRAPH", self._config.worker_cuda_graph)
+        # Keep the worker's audio-ingest mode consistent with the preload guard
+        # (setdefault so an explicit profile/env value still wins).
+        env.setdefault(
+            "EDGELLM_REQUEST_AUDIO_WAV",
+            "1" if self._config.request_audio_wav else "0",
+        )
         return env
 
     def _drain_worker_stderr(self, worker: subprocess.Popen) -> None:
@@ -1426,6 +1447,7 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMASRConfig:
         mel_filters_path=env.get(
             "EDGE_LLM_ASR_MEL_FILTERS", manifest.get("mel_filters_path", "")
         ),
+        request_audio_wav=_env_bool("EDGELLM_REQUEST_AUDIO_WAV", False),
         # --- sampling ---
         temperature=float(env.get("ASR_TEMPERATURE", "1.0")),
         top_p=float(env.get("ASR_TOP_P", "1.0")),
