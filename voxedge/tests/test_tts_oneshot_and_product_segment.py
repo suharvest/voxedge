@@ -58,6 +58,12 @@ def _make_oneshot_backend(**config_kwargs):
     backend._code_predictor_dir = "/models/code_predictor"
     backend._tokenizer_dir = "/models/tokenizer"
     backend._code2wav_dir = "/models/code2wav"
+    # Explicit-KV flag inputs (default empty → legacy generic-runner path).
+    backend._talker_backend = ""
+    backend._talker_engine = ""
+    backend._code_predictor_backend = ""
+    backend._text_projection = ""
+    backend._prompt_kv_cache = ""
     return backend
 
 

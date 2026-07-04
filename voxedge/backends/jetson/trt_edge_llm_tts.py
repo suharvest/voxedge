@@ -1307,12 +1307,15 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         # BASE model: default to the fixed precomputed speaker embedding when the
         # caller supplied no speaker (no per-request embedding / id / name). A
         # per-request speaker always wins. No-op for CustomVoice (base unset).
-        if self._base_speaker_embedding and not (resolved or {}).get("speaker_embedding") \
+        # getattr guard: __new__-constructed test backends skip __init__ where
+        # _base_speaker_embedding is set.
+        base_speaker_embedding = getattr(self, "_base_speaker_embedding", None)
+        if base_speaker_embedding and not (resolved or {}).get("speaker_embedding") \
                 and "speaker_embedding" not in kwargs \
                 and not (resolved or {}).get("speaker_id") and "speaker_id" not in kwargs \
                 and not (resolved or {}).get("speaker"):
             resolved = dict(resolved or {})
-            resolved["speaker_embedding"] = self._base_speaker_embedding
+            resolved["speaker_embedding"] = base_speaker_embedding
         return resolved
 
     @staticmethod
