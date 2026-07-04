@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxedge"
-version = "0.0.2a0"
+version = "0.0.4a0"
 description = "Pipecat for the edge — edge-native, local-first real-time voice conversation library"
 readme = "README.md"
 requires-python = ">=3.10"

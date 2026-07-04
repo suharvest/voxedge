@@ -144,6 +144,12 @@ class TRTEdgeLLMASRConfig:
     segment_cap_sec: float = 5.5
     mel_settings_path: str = ""
     mel_filters_path: str = ""
+    # WAV-ingest mode (TensorRT-Edge-LLM v0.9.0+): the worker writes the
+    # received PCM to a temp WAV and lets the runtime's audio front-end extract
+    # mel internally, so the host-side mel_settings/mel_filters assets are not
+    # required. Defaults False to preserve the v0.8.0 mel-asset contract; the
+    # v090 profiles set EDGELLM_REQUEST_AUDIO_WAV=1 to opt in.
+    request_audio_wav: bool = False
 
     # Sampling.
     temperature: float = 1.0
@@ -389,6 +395,15 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     def _require_streaming_worker_assets(self) -> None:
         if not self._use_streaming_worker():
             return
+        if self._config.request_audio_wav:
+            # WAV-ingest mode (v0.9.0+): the worker extracts mel internally from
+            # a temp WAV, so host-side mel assets are not needed. _ensure_worker
+            # already omits --melSettings/--melFilters when they are unset.
+            logger.info(
+                "ASR WAV-ingest mode (EDGELLM_REQUEST_AUDIO_WAV=1): "
+                "skipping host-side mel-asset requirement."
+            )
+            return
         missing = []
         if not self._use_worker():
             missing.append("use_worker=True is required for streaming worker mode")
@@ -409,6 +424,12 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         env.update(self._config.extra_worker_env)
         env["EDGELLM_PLUGIN_PATH"] = self._config.plugin_path
         env.setdefault("EDGE_LLM_ASR_CUDA_GRAPH", self._config.worker_cuda_graph)
+        # Keep the worker's audio-ingest mode consistent with the preload guard
+        # (setdefault so an explicit profile/env value still wins).
+        env.setdefault(
+            "EDGELLM_REQUEST_AUDIO_WAV",
+            "1" if self._config.request_audio_wav else "0",
+        )
         return env
 
     def _drain_worker_stderr(self, worker: subprocess.Popen) -> None:
@@ -634,6 +655,58 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             },
         )
 
+    def _prepare_worker_audio(
+        self, audio_bytes: bytes, tmpdir: str
+    ) -> "tuple[str, float]":
+        """Write the per-request audio file the worker ingests.
+
+        WAV-ingest mode (v0.9.0+): a raw 16 kHz mono WAV — the worker extracts
+        mel internally. Legacy mode: a host-computed mel safetensors tensor.
+        Returns (path, elapsed_prep_s). Both the resident-worker and one-shot
+        paths just forward the path as ``{"type": "audio", "audio": <path>}``.
+        """
+        t0 = time.time()
+        if self._config.request_audio_wav:
+            audio, sr = _wav_bytes_to_float_audio(audio_bytes)
+            if sr != 16000:
+                ratio = 16000 / sr
+                new_len = max(1, int(round(len(audio) * ratio)))
+                audio = np.interp(
+                    np.linspace(0, len(audio) - 1, new_len),
+                    np.arange(len(audio)),
+                    audio,
+                ).astype(np.float32)
+            wav_bytes = _float_audio_to_wav_bytes(audio, 16000)
+            wav_path = os.path.join(tmpdir, "audio.wav")
+            with open(wav_path, "wb") as f:
+                f.write(wav_bytes)
+            elapsed = time.time() - t0
+            logger.info(
+                "WAV-ingest audio written: %d bytes -> %s", len(wav_bytes), wav_path
+            )
+            return wav_path, elapsed
+
+        mel = audio_bytes_to_mel(
+            audio_bytes, min_audio_frames=self._config.min_audio_frames
+        )  # [1, 128, T] float32
+        max_mel_frames = int(self._config.max_mel_frames)
+        if mel.shape[2] > max_mel_frames:
+            raise ValueError(
+                f"Audio too long: {mel.shape[2]} frames (~{mel.shape[2]*0.01:.0f}s). "
+                f"Max {max_mel_frames} frames (~{max_mel_frames*0.01:.0f}s). Split into smaller chunks."
+            )
+        mel_fp16 = mel.astype(np.float16)
+        mel_path = os.path.join(tmpdir, "mel.safetensors")
+        write_safetensors(mel_fp16, self._config.mel_tensor_name, mel_path)
+        elapsed = time.time() - t0
+        logger.info(
+            "Mel computed: shape=%s size=%s -> %s",
+            list(mel_fp16.shape),
+            mel_fp16.nbytes,
+            mel_path,
+        )
+        return mel_path, elapsed
+
     def transcribe(
         self,
         audio_bytes: bytes,
@@ -655,30 +728,10 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 return self._transcribe_segmented_offline(audio, sample_rate, language)
 
         with tempfile.TemporaryDirectory(prefix="trt_edgellm_asr_") as tmpdir:
-            mel_t0 = time.time()
-            mel = audio_bytes_to_mel(
-                audio_bytes, min_audio_frames=self._config.min_audio_frames
-            )  # [1, 128, T] float32
-            max_mel_frames = int(self._config.max_mel_frames)
-            if mel.shape[2] > max_mel_frames:
-                raise ValueError(
-                    f"Audio too long: {mel.shape[2]} frames (~{mel.shape[2]*0.01:.0f}s). "
-                    f"Max {max_mel_frames} frames (~{max_mel_frames*0.01:.0f}s). Split into smaller chunks."
-                )
-
-            mel_fp16 = mel.astype(np.float16)
-            mel_path = os.path.join(tmpdir, "mel.safetensors")
-            write_safetensors(mel_fp16, self._config.mel_tensor_name, mel_path)
-            elapsed_mel_s = time.time() - mel_t0
-            logger.info(
-                "Mel computed: shape=%s size=%s -> %s",
-                list(mel_fp16.shape),
-                mel_fp16.nbytes,
-                mel_path,
-            )
+            audio_path, elapsed_prep_s = self._prepare_worker_audio(audio_bytes, tmpdir)
 
             if self._use_worker():
-                return self._transcribe_worker(mel_path, elapsed_mel_s)
+                return self._transcribe_worker(audio_path, elapsed_prep_s)
 
             input_data = {
                 "requests": [
@@ -686,7 +739,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                         "messages": [
                             {
                                 "role": "user",
-                                "content": [{"type": "audio", "audio": mel_path}],
+                                "content": [{"type": "audio", "audio": audio_path}],
                             }
                         ],
                     }
@@ -1426,6 +1479,7 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMASRConfig:
         mel_filters_path=env.get(
             "EDGE_LLM_ASR_MEL_FILTERS", manifest.get("mel_filters_path", "")
         ),
+        request_audio_wav=_env_bool("EDGELLM_REQUEST_AUDIO_WAV", False),
         # --- sampling ---
         temperature=float(env.get("ASR_TEMPERATURE", "1.0")),
         top_p=float(env.get("ASR_TOP_P", "1.0")),
