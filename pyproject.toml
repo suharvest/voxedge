@@ -124,6 +124,7 @@ llm = [
 [tool.setuptools]
 packages = [
     "voxedge",
+    "voxedge.audio",
     "voxedge.backends",
     "voxedge.backends.sherpa",
     "voxedge.backends.rk",
