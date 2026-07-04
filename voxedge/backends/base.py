@@ -260,6 +260,13 @@ class TTSBackend(ABC):
 
     supports_hot_reload: bool = False
 
+    # Honest device-side enrollment signal. True only when the backend can turn
+    # a reference WAV into a speaker embedding *on this host* (e.g. a CPU-ONNX
+    # speaker encoder is present). Distinct from ``VOICE_CLONE`` capability,
+    # which only means the backend can *consume* a raw embedding. Backends
+    # override this (usually as a property gated on the encoder file existing).
+    supports_voice_enrollment: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

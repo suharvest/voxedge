@@ -566,6 +566,17 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def supports_hot_reload(self) -> bool:  # type: ignore[override]
         return True
 
+    @property
+    def supports_voice_enrollment(self) -> bool:  # type: ignore[override]
+        """True only when the CPU-ONNX speaker encoder is present on this host.
+
+        Gated on the encoder file existing so the signal is honest on torch-less
+        Jetson TRT deployments: enrollment (WAV → embedding) can run purely on
+        ONNX Runtime here, no PyTorch / Spark-TTS stack required. Mirrors the
+        guard in :meth:`extract_speaker_embedding`.
+        """
+        return bool(self._speaker_encoder) and os.path.exists(self._speaker_encoder)
+
     def __init__(self, config: Optional[TRTEdgeLLMTTSConfig] = None):
         self._config = config or TRTEdgeLLMTTSConfig()
         self._ready = False
