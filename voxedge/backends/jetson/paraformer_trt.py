@@ -623,6 +623,11 @@ class ParaformerTRTStream(ASRStream):
 
 class ParaformerTRTBackend(ASRBackend):
 
+    # Hot-swap: releasing the shared enc/dec TRT engines is enough to switch
+    # this backend out (per-stream contexts + CUDA buffers live in
+    # _ParaformerCtxBundle and are freed as streams drain — see unload()).
+    supports_hot_reload: bool = True
+
     def concurrency_capability(self) -> ConcurrencyCapability:
         # Per-stream _ParaformerCtxBundle: each ASRStream owns its own enc/dec
         # TRT execution contexts + buffer cache. Backend holds shared engines
@@ -674,6 +679,50 @@ class ParaformerTRTBackend(ASRBackend):
 
     def is_ready(self) -> bool:
         return self._ready
+
+    def unload(self) -> None:
+        """Release the shared enc/dec TRT engines + optional ORT session.
+
+        Per-stream execution contexts + CUDA device buffers live in
+        _ParaformerCtxBundle and are freed by each stream's destroy()/__del__;
+        the BackendManager drains active streams before calling unload, so by
+        the time we get here only the backend-held engines remain. Idempotent —
+        safe to call when never preloaded or already unloaded.
+        """
+        if not self._ready and not self._engines and self._enc_ort_session is None:
+            return
+
+        try:
+            try:
+                from cuda import cudart
+                cudart.cudaDeviceSynchronize()
+            except Exception:
+                logger.exception("Paraformer unload: cudaDeviceSynchronize failed; continuing")
+
+            for key in ("enc", "dec"):
+                eng = self._engines.pop(key, None)
+                if eng is not None:
+                    try:
+                        del eng
+                    except Exception:
+                        logger.exception("Paraformer unload: %s engine del raised", key)
+            self._engines = {}
+            self._enc_profile_ranges = []
+
+            if self._enc_ort_session is not None:
+                try:
+                    del self._enc_ort_session
+                except Exception:
+                    logger.exception("Paraformer unload: ORT session del raised")
+                self._enc_ort_session = None
+
+            import gc
+            gc.collect()
+            gc.collect()
+        except Exception:
+            logger.exception("ParaformerTRTBackend.unload outer-try failed; continuing")
+        finally:
+            self._ready = False
 
     def preload(self) -> None:
         import os
