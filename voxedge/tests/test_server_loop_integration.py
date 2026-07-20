@@ -54,6 +54,7 @@ class ScriptedToolLLM(LLMBackend):
         self.round2_sentences = round2_sentences
         self.gate = gate
         self.calls = 0
+        self.system_prompts: list[str] = []
 
     @property
     def name(self) -> str:
@@ -65,6 +66,12 @@ class ScriptedToolLLM(LLMBackend):
 
     async def stream_events(self, messages, *, tools=None, **kw) -> AsyncIterator[LLMEvent]:
         self.calls += 1
+        self.system_prompts.append(
+            next(
+                (str(m.get("content") or "") for m in messages if m.get("role") == "system"),
+                "",
+            )
+        )
         last_role = messages[-1].get("role") if messages else None
         if last_role != "tool":
             yield LLMEvent(kind="tool_call_delta", tool_call_index=0,
@@ -89,12 +96,13 @@ def _remote_registry(tool_name: str, preamble: str = "好的。") -> ToolRegistr
 
 
 class _Sim:
-    def __init__(self, llm, registry):
+    def __init__(self, llm, registry, *, auto_create_response: bool = True):
         self.transport = InProcessTransport()
         self.engine = ConversationEngine(
             backends={"asr": MockASR(transcript="挥手"), "vad": MockVAD(silence_chunks=2),
                       "llm": llm, "tts": MockTTS()},
             tool_registry=registry, system_prompt="SYS /no_think", multi_utterance=True,
+            auto_create_response=auto_create_response,
         )
         self.timeline: list[tuple[str, str]] = []
         self.tool_calls_seen = 0
@@ -177,6 +185,34 @@ class _Sim:
 
     def sentences(self):
         return [d for t, d in self.timeline if t == "tts_sentence_done"]
+
+
+@run_async
+async def test_manual_response_waits_for_prompt_update_then_create():
+    llm = ScriptedToolLLM("wave", ["更新后的回复。"])
+    sim = _Sim(
+        llm,
+        _remote_registry("wave"),
+        auto_create_response=False,
+    )
+    sim.start()
+    await sim.utter()
+    await sim.wait_for("asr_final")
+    await asyncio.sleep(0)
+    assert llm.calls == 0, "LLM must not start before response.create"
+
+    await sim.transport.feed_event({
+        "type": "tool_advertise",
+        "tools": [],
+        "system_prompt": "UPDATED [Faces: Alice] /no_think",
+        "warm_prefix": False,
+    })
+    await sim.transport.feed_event({"type": "response.create"})
+    await sim.wait_for("tts_sentence_done", "更新后的回复")
+    await sim.finish()
+
+    assert llm.calls == 2
+    assert llm.system_prompts[0] == "UPDATED [Faces: Alice] /no_think"
 
 
 # ── S1: preamble before reply ─────────────────────────────────────────

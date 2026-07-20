@@ -26,6 +26,7 @@ CLIENT_TOOL_RESULT = "tool_result"
 # and proxy execution back to the client via SERVER_TOOL_CALL. Additive — a
 # legacy client that never enables the server loop never sends this.
 CLIENT_TOOL_ADVERTISE = "tool_advertise"
+CLIENT_RESPONSE_CREATE = "response.create"
 
 # ── server → client frame types ────────────────────────────────────────
 SERVER_ASR_PARTIAL = "asr_partial"
