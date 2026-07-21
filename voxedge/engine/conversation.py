@@ -257,6 +257,10 @@ class Session:
         # prefix signature so reconnect re-advertises don't re-warm needlessly.
         self._warmed_prefix_sig: "tuple | None" = None
         self._warm_task: "asyncio.Task | None" = None
+        # Manual Realtime V2 response gate. ASR completion is still emitted,
+        # but LLM/TTS waits for response.create after turn-scoped updates.
+        self._pending_response_text: str | None = None
+        self._manual_response_task: "asyncio.Task | None" = None
 
     def _make_tts_buffer(self):
         """Build the TTS chunk buffer for this session (engine-parity #15).
@@ -333,6 +337,8 @@ class Session:
           * ``system_prompt`` — optional; overrides the engine system prompt for
             this session (read per-turn by the tool pump).
           * ``llm_params`` — optional dict merged into the engine LLM params.
+          * ``warm_prefix`` — optional bool; False for turn-scoped prompt-only
+            updates that are immediately followed by response.create.
 
         No-op (logged) when no registry is wired (server loop off). Re-advertise
         is allowed: a tool name already present is overwritten (re-registration),
@@ -381,7 +387,8 @@ class Session:
         # (system_prompt + tools) is known — otherwise the FIRST user turn pays
         # a cold prefill + CUDA-graph capture. Fire-and-forget, gated per prefix
         # signature so reconnect re-advertises don't re-warm.
-        self._maybe_warm_llm_prefix(registered)
+        if payload.get("warm_prefix", True):
+            self._maybe_warm_llm_prefix(registered)
 
     def _maybe_warm_llm_prefix(self, tool_names: list[str]) -> None:
         """Schedule a one-shot edge-llm prefix warm-up if the advertised prefix
@@ -503,6 +510,64 @@ class Session:
         """
         if self._llm_be is None or not text.strip():
             return
+        if not self.engine.auto_create_response:
+            if self._pending_response_text is not None:
+                logger.warning(
+                    "manual response: replacing unconsumed ASR turn %r with %r",
+                    self._pending_response_text[:80], text[:80],
+                )
+            self._pending_response_text = text
+            logger.info("manual response: ASR final held until response.create")
+            return
+        await self._run_response(text)
+
+    async def _handle_response_create(self, _payload: dict) -> None:
+        """Start one held turn without blocking remote tool-result events."""
+        if self.engine.auto_create_response:
+            await self._send_event({
+                "type": SERVER_ERROR,
+                "error": "response.create is invalid when auto response is enabled",
+                "code": "response_already_automatic",
+            })
+            return
+        active = self._manual_response_task
+        if active is not None and not active.done():
+            await self._send_event({
+                "type": SERVER_ERROR,
+                "error": "a response is already in progress",
+                "code": "response_in_progress",
+            })
+            return
+        text = self._pending_response_text
+        if not text:
+            await self._send_event({
+                "type": SERVER_ERROR,
+                "error": "response.create has no committed ASR turn",
+                "code": "no_pending_response",
+            })
+            return
+        self._pending_response_text = None
+        task = asyncio.create_task(
+            self._run_response(text), name="voxedge-manual-response"
+        )
+        self._manual_response_task = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._manual_response_task is done:
+                self._manual_response_task = None
+            if not done.cancelled():
+                exc = done.exception()
+                if exc is not None:
+                    logger.error(
+                        "manual response task failed: %s",
+                        exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+
+        task.add_done_callback(_clear)
+
+    async def _run_response(self, text: str) -> None:
+        """Run the existing streaming LLM/tool/TTS response for one turn."""
         if self._tts.buffer is None:
             return
         if self.engine.tool_registry is not None:
@@ -658,6 +723,11 @@ class Session:
             # session (fire-and-forget; harmless if already done).
             if self._warm_task is not None and not self._warm_task.done():
                 self._warm_task.cancel()
+            if (
+                self._manual_response_task is not None
+                and not self._manual_response_task.done()
+            ):
+                self._manual_response_task.cancel()
             # (b) signal the synth thread to bail so the TTS executor frees up
             # (app/main.py:3513-3517).
             stop = self.state.current_tts_stop
@@ -668,7 +738,11 @@ class Session:
                     pass
             # (c) await the cancelled work tasks before releasing the backend
             # slot (app/main.py:3518-3528, race #6).
-            _extra = [self._warm_task] if self._warm_task is not None else []
+            _extra = [
+                task
+                for task in (self._warm_task, self._manual_response_task)
+                if task is not None
+            ]
             await asyncio.gather(
                 end_watcher, *recv_tasks, *work_tasks, *_extra, return_exceptions=True
             )
@@ -729,6 +803,9 @@ class ConversationEngine:
             (app/main.py:2961-2970). Default ``False`` keeps the existing
             ``_SentenceBuffer`` behavior (back-compat; existing tests
             unchanged).
+        auto_create_response: when False, hold each completed ASR transcript
+            until a canonical ``response.create`` control event arrives. This
+            lets a client apply turn-scoped ``session.update`` first.
         coordinator: optional :class:`BackendCoordinator` (concurrency
             abstraction, spec §3.1). When provided, ASR/TTS backend calls are
             wrapped in ``coord.acquire(...)`` so serialized/exclusive modes
@@ -756,6 +833,7 @@ class ConversationEngine:
         tts_voice: Optional[str] = None,
         tts_speed: Optional[float] = None,
         low_latency_tts: bool = False,
+        auto_create_response: bool = True,
         coordinator: Optional[BackendCoordinator] = None,
     ):
         self.backends = backends
@@ -782,6 +860,7 @@ class ConversationEngine:
         self.tts_voice = tts_voice
         self.tts_speed = tts_speed
         self.low_latency_tts = low_latency_tts
+        self.auto_create_response = bool(auto_create_response)
         self.coordinator = coordinator
 
         # M1/M3: resolve watchdog thresholds from the injected dict (env-free).

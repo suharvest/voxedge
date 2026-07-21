@@ -18,6 +18,7 @@ from voxedge.engine.protocol import (
     CLIENT_ABORT,
     CLIENT_ASR_EOS,
     CLIENT_TEXT,
+    CLIENT_RESPONSE_CREATE,
     CLIENT_TOOL_ADVERTISE,
     CLIENT_TOOL_RESULT,
     CLIENT_TTS_FLUSH,
@@ -55,6 +56,7 @@ class _ClientEvents:
                     if not multi:
                         state.asr_session_closed = True
                 elif typ == CLIENT_ABORT:
+                    sess._pending_response_text = None
                     # _bargein_tts now owns the full TTS cleanup (cancel synth +
                     # LLM turn, drain queue, reset buffer) for both barge-in
                     # paths. Here we additionally cancel the ASR turn — the user
@@ -85,6 +87,8 @@ class _ClientEvents:
                                 )
                 elif typ == CLIENT_TOOL_ADVERTISE:
                     sess._handle_tool_advertise(payload)
+                elif typ == CLIENT_RESPONSE_CREATE:
+                    await sess._handle_response_create(payload)
         except Exception:
             logger.exception("voxedge event_loop error")
             state.client_closed = True
