@@ -279,3 +279,48 @@ def test_worker_io_cancel_event_interrupts_blocking_queue_wait():
         "cancel_ack",
         "cancelled",
     ]
+
+
+def test_cancelled_prefetch_never_writes_after_semaphore_wait():
+    """A queued sentence cancelled before slot acquisition is never dispatched."""
+    from voxedge.backends.jetson.worker_io import WorkerIO
+
+    proc = _FakeProc()
+    wio = WorkerIO(proc, concurrency=1)
+    first_events: list[dict] = []
+
+    def _hold_first_slot():
+        first_events.extend(wio.request({"id": "active"}))
+
+    first = threading.Thread(target=_hold_first_slot)
+    first.start()
+    for _ in range(100):
+        if proc.stdin.writes:
+            break
+        time.sleep(0.005)
+    assert len(proc.stdin.writes) == 1
+
+    cancelled = threading.Event()
+    queued_events: list[dict] = []
+
+    def _queue_prefetch():
+        queued_events.extend(
+            wio.request({"id": "prefetch"}, cancel_event=cancelled)
+        )
+
+    queued = threading.Thread(target=_queue_prefetch)
+    queued.start()
+    time.sleep(0.02)
+    cancelled.set()
+    queued.join(timeout=0.5)
+
+    assert not queued.is_alive()
+    assert queued_events == []
+    assert len(proc.stdin.writes) == 1
+
+    proc.stdout.feed(json.dumps({
+        "event": "done", "id": "active", "ok": True,
+    }))
+    first.join(timeout=1.0)
+    assert not first.is_alive()
+    assert [event["event"] for event in first_events] == ["done"]

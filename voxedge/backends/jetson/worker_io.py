@@ -222,13 +222,26 @@ class WorkerIO:
         from the ASGI event-loop thread cannot interrupt a generator that is
         already executing in another thread.
         """
-        self._sem.acquire()
+        if cancel_event is None:
+            self._sem.acquire()
+        else:
+            # A prefetched sentence can already be waiting for a Python
+            # WorkerIO slot when its HTTP client disconnects. Do not let that
+            # stale task acquire a later slot and write a brand-new worker
+            # request after cancellation.
+            while not self._sem.acquire(timeout=0.1):
+                if cancel_event.is_set():
+                    return
         req_id: str | None = None
         cancel_sent = False
         last_event_at = time.monotonic()
         try:
             if self._closed:
                 raise WorkerExitError("WorkerIO closed before request could start")
+            # Close the race between the successful semaphore acquire and the
+            # first stdin write.
+            if cancel_event is not None and cancel_event.is_set():
+                return
             req_id = payload["id"]
             q: "queue.Queue" = queue.Queue()
             # CRITICAL ordering: insert the queue BEFORE writing stdin so
