@@ -35,6 +35,7 @@ from typing import Any, Iterator, Optional
 import numpy as np
 
 from voxedge.backends.base import TTSBackend, TTSCapability
+from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,17 @@ class MossTtsNanoBackend(TTSBackend):
     _CONTROL_TIMEOUT_S = 30.0
     _REQUEST_TIMEOUT_S = 30.0
     _SHUTDOWN_TIMEOUT_S = 5.0
+
+    def concurrency_capability(self) -> ConcurrencyCapability:
+        """Declare the native worker's configured request-slot ceiling."""
+        n = max(1, int(self._max_slots))
+        return ConcurrencyCapability(
+            supports_parallel=n > 1,
+            max_concurrent=n,
+            is_stateful=True,
+            requires_exclusive_device=True,
+            scaling_mode="single_runtime_multiplex",
+        )
 
     def __init__(self, config: Optional[MossTtsNanoConfig] = None):
         self._config = config or MossTtsNanoConfig()
