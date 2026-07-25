@@ -970,6 +970,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _generate_streaming_single(self, text: str, meta_out: Optional[dict] = None, **kwargs):
         """Yield raw PCM int16 chunks for one already-bounded TTS request."""
         retry_empty = bool(kwargs.pop("_retry_empty", True))
+        cancel_event = kwargs.pop("cancel_event", None)
         req_id = uuid.uuid4().hex
         streaming_profile = str(
             kwargs.get("streaming_profile", self._config.streaming_profile)
@@ -1071,7 +1072,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             assert self._worker_io is not None
             worker_io = self._worker_io
         try:
-            for event in worker_io.request(request):
+            for event in worker_io.request(request, cancel_event=cancel_event):
                 event_rid = _event_request_id(event)
                 if event_rid is not None and event_rid != req_id and event_rid != "__worker__":
                     logger.debug(
@@ -1084,6 +1085,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                         req_id, event.get("reason"),
                     )
                     return
+                if event.get("event") == "cancel_ack":
+                    logger.info(
+                        "TTS worker cancel ack for %s (tripped=%s)",
+                        req_id, event.get("tripped"),
+                    )
+                    continue
                 saturated = _tts_pool_saturated_error(event)
                 if saturated is not None:
                     raise saturated

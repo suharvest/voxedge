@@ -218,3 +218,64 @@ def test_base64_chunk_decoded_to_pcm():
     ]
     out = list(be.generate_streaming("你好", segment_text=False, _retry_empty=False))
     assert out == [b"pcm"]
+
+
+def test_cancel_ack_is_control_event_not_synthesis_error():
+    be = _make_streaming_backend(stateful_code2wav=True)
+    be._feed_chunks = [
+        {
+            "event": "cancel_ack",
+            "tripped": True,
+        }
+    ]
+    assert list(
+        be.generate_streaming("你好", segment_text=False, _retry_empty=False)
+    ) == []
+
+
+def test_worker_io_cancel_event_interrupts_blocking_queue_wait():
+    """Cancellation reaches worker stdin without cross-thread generator.close."""
+    from voxedge.backends.jetson.worker_io import WorkerIO
+
+    proc = _FakeProc()
+    wio = WorkerIO(proc, concurrency=1)
+    cancel_event = threading.Event()
+    observed: list[dict] = []
+
+    def _consume():
+        observed.extend(
+            wio.request({"id": "cancel-me"}, cancel_event=cancel_event)
+        )
+
+    consumer = threading.Thread(target=_consume)
+    consumer.start()
+
+    for _ in range(100):
+        if proc.stdin.writes:
+            break
+        time.sleep(0.005)
+    assert json.loads(proc.stdin.writes[0])["id"] == "cancel-me"
+
+    cancel_event.set()
+    for _ in range(100):
+        if len(proc.stdin.writes) >= 2:
+            break
+        time.sleep(0.005)
+    assert json.loads(proc.stdin.writes[1]) == {
+        "type": "cancel",
+        "id": "cancel-me",
+    }
+
+    proc.stdout.feed(json.dumps({
+        "event": "cancel_ack", "id": "cancel-me", "tripped": True,
+    }))
+    proc.stdout.feed(json.dumps({
+        "event": "cancelled", "id": "cancel-me", "ok": True,
+    }))
+    consumer.join(timeout=1.0)
+
+    assert not consumer.is_alive()
+    assert [event["event"] for event in observed] == [
+        "cancel_ack",
+        "cancelled",
+    ]
