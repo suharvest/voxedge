@@ -102,7 +102,10 @@ class MossTtsNanoBackend(TTSBackend):
 
     def concurrency_capability(self) -> ConcurrencyCapability:
         """Declare the native worker's configured request-slot ceiling."""
-        n = max(1, int(self._max_slots))
+        # Read the injected config directly: the product capability resolver
+        # intentionally probes a cheap ``__new__`` stub without running this
+        # backend's process-owning ``__init__``.
+        n = max(1, int(self._config.max_slots))
         return ConcurrencyCapability(
             supports_parallel=n > 1,
             max_concurrent=n,
