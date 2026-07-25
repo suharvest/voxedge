@@ -276,6 +276,7 @@ class MossTtsNanoBackend(TTSBackend):
 
         The worker emits interleaved stereo; when ``channels == 1`` we downmix
         to mono here (see ``self._downmix_to_mono``)."""
+        cancel_event = kwargs.pop("cancel_event", None)
         request_id = uuid.uuid4().hex
         request = self._build_request(request_id, text, stream=True, kwargs=kwargs)
         attempt = 0
@@ -287,21 +288,58 @@ class MossTtsNanoBackend(TTSBackend):
             start_time = time.monotonic()
             self._thread_local.last_stream_metadata = {}
             self._register_request_queue(request_id, request_queue)
+            cancel_sent = False
+            last_event_at = time.monotonic()
             try:
                 self._send_request(request)
                 while True:
+                    if (
+                        cancel_event is not None
+                        and cancel_event.is_set()
+                        and not cancel_sent
+                    ):
+                        self._send_request({"type": "cancel", "id": request_id})
+                        cancel_sent = True
                     try:
-                        event = request_queue.get(timeout=self._REQUEST_TIMEOUT_S)
+                        event = request_queue.get(
+                            timeout=0.1 if cancel_event is not None
+                            else self._REQUEST_TIMEOUT_S
+                        )
                     except queue.Empty as exc:
+                        if cancel_event is not None:
+                            if (
+                                time.monotonic() - last_event_at
+                                >= self._REQUEST_TIMEOUT_S
+                            ):
+                                raise TimeoutError(
+                                    "Timed out waiting for MOSS-TTS-Nano "
+                                    f"event for request {request_id}"
+                                ) from exc
+                            continue
                         self._forget_request_queue(request_id, request_queue)
                         raise TimeoutError(
                             f"Timed out waiting for MOSS-TTS-Nano chunk for request {request_id}"
                         ) from exc
 
                     kind = event.get("event")
+                    last_event_at = time.monotonic()
                     if kind == "ready":
                         logger.debug("MOSS-TTS-Nano request ready: id=%s", request_id)
                         continue
+                    if kind == "cancel_ack":
+                        logger.info(
+                            "MOSS-TTS-Nano cancel ack: id=%s tripped=%s",
+                            request_id, event.get("tripped"),
+                        )
+                        if event.get("tripped") is False:
+                            cancel_sent = False
+                        continue
+                    if kind == "cancelled":
+                        logger.info(
+                            "MOSS-TTS-Nano request cancelled: id=%s reason=%s",
+                            request_id, event.get("reason"),
+                        )
+                        return
                     if kind == "chunk":
                         data = event.get("audio_b64") or event.get("data")
                         if not isinstance(data, str):
