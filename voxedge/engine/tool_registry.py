@@ -1,18 +1,27 @@
-"""Engine-owned tool registry + ``@tool`` decorator (Phase 1).
+"""Engine-owned tool registry + ``@tool`` decorator.
 
 Ported from an in-process agent tool registry. Builds OpenAI-style
 ``tools[]`` schemas from Python type hints and dispatches function calls
-(sync or async) with per-tool timeout + error isolation. Designed for local,
-in-process tools — every entry is trusted code in the same Python process
-(no sandboxing, no MCP).
+(sync or async) with per-tool timeout + error isolation.
+
+Two dispatch modes, with DIFFERENT trust models — mind the difference:
+  * ``local``  — the handler is trusted code called in this Python process.
+    No sandboxing, no MCP, no subprocess.
+  * ``remote`` — the tool is only a SCHEMA here; execution is proxied over the
+    ``/v2v`` wire to the device client that advertised it (spec §4 Mode B), so
+    the code runs outside this process and outside our control. Advertised
+    schemas are not validated or authenticated — see ``_dispatch_remote``.
+
+Both modes funnel every failure (timeout, transport error, client error,
+barge-in cancel) into the same ``{"success": False, "error": ...}`` shape, so a
+misbehaving tool degrades the turn instead of breaking the LLM tool loop.
 
 Changes vs the agent source:
   * ``ctx`` injected at dispatch is a :class:`ToolContext` dataclass
     (session_id / conversation / remote_send) instead of the agent's
     ``ToolCallCtx`` — no agent / app coupling.
-  * Each :class:`Tool` carries a ``dispatch_mode`` ("local" | "remote").
-    Phase 1 implements only the ``local`` path; the ``remote`` wire dispatch
-    (``/v2v`` tool_call/tool_result frames) is Phase 2 (spec §4 Mode B).
+  * Adds ``dispatch_mode`` and the remote wire path (the agent registry is
+    local-only).
   * No module-level ``default_registry`` side-effect import of builtins — the
     engine owns its registry instance explicitly.
 """
@@ -53,10 +62,12 @@ class ToolContext:
       * ``session_id``   — opaque per-connection id (transport/session key).
       * ``conversation`` — the voxedge ``Session`` driving this turn (or any
         conversation-history object), for tools that inspect/mutate dialog.
-      * ``remote_send``  — Phase 2 hook: an awaitable used by remote-dispatch
-        proxy handlers to push a ``tool_call`` frame to the device client and
-        await a correlated ``tool_result`` (spec §4 Mode B). ``None`` for the
-        Phase 1 local path.
+      * ``remote_send``  — awaitable used by ``dispatch_mode="remote"`` tools to
+        push a ``tool_call`` frame to the device client and await a correlated
+        ``tool_result`` (spec §4 Mode B). ``None`` when the session has no wire
+        transport, which makes every remote dispatch fail fast with
+        ``{"success": False, "error": "no remote transport"}``. Unused by local
+        tools.
     """
 
     session_id: Optional[str] = None
@@ -86,7 +97,9 @@ class Tool:
     #                  while the physical side-effect overlaps the spoken ack.
     #   * "template" — skip LLM round 2; speak ``completion_text`` directly.
     response_mode: str = "await"
-    # Phase 1 implements "local" only; "remote" proxies over /v2v (Phase 2).
+    # "local" calls ``fn`` in this process; "remote" ignores ``fn`` entirely and
+    # proxies the call to the device client over /v2v (see _dispatch_remote).
+    # Client-advertised tools are registered as "remote" with a no-op ``fn``.
     dispatch_mode: DispatchMode = "local"
 
 
@@ -384,7 +397,7 @@ class ToolRegistry:
         error: str | None = None,
     ) -> None:
         """Deliver a remote ``tool_result`` frame back to the awaiting
-        ``_dispatch_remote`` future (Phase 2 wire-receive hook).
+        ``_dispatch_remote`` future.
 
         Called by the product /v2v receive side when a ``tool_result`` /
         ``tool_error`` frame arrives. Unknown or already-resolved ``call_id``

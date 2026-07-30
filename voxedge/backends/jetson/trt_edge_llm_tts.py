@@ -22,7 +22,8 @@ Differences from the production copy (decoupling per spec §3.1 / §10):
     reading ``config.worker_concurrency`` instead of env/profile; the N>1
     ``--max_slots`` conditional (main fix b1cb1a5) is preserved.
 
-Supports: BASIC_TTS, MULTI_LANGUAGE, STREAMING (+ VOICE_CLONE in worker mode).
+Supports: BASIC_TTS, MULTI_LANGUAGE, STREAMING (+ VOICE_CLONE for embedding-
+conditioned variants; CustomVoice uses built-in speakers and cannot clone).
 """
 
 from __future__ import annotations
@@ -545,6 +546,18 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
 class TRTEdgeLLMTTSBackend(TTSBackend):
     """TTS via TRT-Edge-LLM qwen3_tts_worker subprocess."""
 
+    @property
+    def supports_voice_cloning(self) -> bool:  # type: ignore[override]
+        """Whether this model variant accepts an external speaker embedding.
+
+        Qwen3-TTS CustomVoice only supports its built-in named speakers.  The
+        Base variant accepts the embedding used by ``clone_voice``.  Keep the
+        negative check narrow so existing embedding-conditioned model IDs
+        retain their previous behaviour.
+        """
+        model_id = (self._config.model_id or "").strip().lower().replace("_", "-")
+        return model_id != "qwen3-tts-customvoice"
+
     def concurrency_capability(self) -> ConcurrencyCapability:
         """Declare the TTS slot-pool ceiling.
 
@@ -575,7 +588,11 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         ONNX Runtime here, no PyTorch / Spark-TTS stack required. Mirrors the
         guard in :meth:`extract_speaker_embedding`.
         """
-        return bool(self._speaker_encoder) and os.path.exists(self._speaker_encoder)
+        return (
+            self.supports_voice_cloning
+            and bool(self._speaker_encoder)
+            and os.path.exists(self._speaker_encoder)
+        )
 
     def __init__(self, config: Optional[TRTEdgeLLMTTSConfig] = None):
         self._config = config or TRTEdgeLLMTTSConfig()
@@ -623,8 +640,13 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        caps = {TTSCapability.BASIC_TTS, TTSCapability.MULTI_LANGUAGE, TTSCapability.STREAMING,
-                TTSCapability.VOICE_CLONE}
+        caps = {
+            TTSCapability.BASIC_TTS,
+            TTSCapability.MULTI_LANGUAGE,
+            TTSCapability.STREAMING,
+        }
+        if self.supports_voice_cloning:
+            caps.add(TTSCapability.VOICE_CLONE)
         return caps
 
     @property
@@ -948,6 +970,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _generate_streaming_single(self, text: str, meta_out: Optional[dict] = None, **kwargs):
         """Yield raw PCM int16 chunks for one already-bounded TTS request."""
         retry_empty = bool(kwargs.pop("_retry_empty", True))
+        cancel_event = kwargs.pop("cancel_event", None)
         req_id = uuid.uuid4().hex
         streaming_profile = str(
             kwargs.get("streaming_profile", self._config.streaming_profile)
@@ -1049,7 +1072,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             assert self._worker_io is not None
             worker_io = self._worker_io
         try:
-            for event in worker_io.request(request):
+            for event in worker_io.request(request, cancel_event=cancel_event):
                 event_rid = _event_request_id(event)
                 if event_rid is not None and event_rid != req_id and event_rid != "__worker__":
                     logger.debug(
@@ -1062,6 +1085,12 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
                         req_id, event.get("reason"),
                     )
                     return
+                if event.get("event") == "cancel_ack":
+                    logger.info(
+                        "TTS worker cancel ack for %s (tripped=%s)",
+                        req_id, event.get("tripped"),
+                    )
+                    continue
                 saturated = _tts_pool_saturated_error(event)
                 if saturated is not None:
                     raise saturated
@@ -1197,6 +1226,10 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         speed: Optional[float] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
+        if not self.supports_voice_cloning:
+            raise NotImplementedError(
+                f"{self.model_id} supports built-in speakers, not voice cloning"
+            )
         if len(speaker_embedding) % 4 != 0:
             raise ValueError("speaker_embedding must be a float32 byte vector")
         return self._synthesize_impl(

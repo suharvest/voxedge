@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import struct
 import threading
 from typing import TYPE_CHECKING
@@ -32,6 +33,48 @@ if TYPE_CHECKING:  # pragma: no cover
     from voxedge.engine.conversation import Session
 
 logger = logging.getLogger(__name__)
+
+
+# ── markdown → speakable text ─────────────────────────────────────────
+# An LLM answering a spoken turn still tends to reply in Markdown (bold,
+# ATX headings, bullets, code spans). The sentence buffer splits on
+# punctuation, so a reply like "### 1. **如果想表达的是：**" yields fragments
+# that are pure markup — '**', '：**', '”**'. A TTS backend has nothing to
+# say for those: matcha logs "No audio produced for text" and returns 0.1 s
+# of silence per fragment, which both wastes NPU time and injects audible
+# gaps. Stripping the markup is not cosmetic — it is what makes the text
+# speakable at all.
+#
+# Deliberately conservative: only structural markers are removed, prose is
+# never rewritten. A system prompt should also ask for plain speech, but
+# prompt compliance is not guaranteed, so this is the backstop.
+_MD_FENCE_RE = re.compile(r"```[^`]*```|`([^`]*)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
+_MD_QUOTE_RE = re.compile(r"(?m)^\s{0,3}>\s*")
+_MD_BULLET_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d{1,3}[.)])\s+")
+_MD_EMPHASIS_RE = re.compile(r"\*{1,3}|__")
+# Speakable = at least one letter, digit or CJK codepoint. Anything else is
+# punctuation/markup only and must not reach the backend.
+_SPEAKABLE_RE = re.compile(r"[0-9A-Za-z぀-ヿ一-鿿가-힯]")
+
+
+def _to_speakable(text: str) -> str:
+    """Strip Markdown markup; return "" if nothing speakable remains.
+
+    Returning "" is the signal to drop the fragment entirely rather than
+    hand the backend something it can only answer with silence.
+    """
+    if not text:
+        return ""
+    s = _MD_FENCE_RE.sub(lambda m: m.group(1) or " ", text)
+    s = _MD_LINK_RE.sub(r"\1", s)
+    s = _MD_HEADING_RE.sub("", s)
+    s = _MD_QUOTE_RE.sub("", s)
+    s = _MD_BULLET_RE.sub("", s)
+    s = _MD_EMPHASIS_RE.sub("", s)
+    s = s.strip()
+    return s if _SPEAKABLE_RE.search(s) else ""
 
 
 class _TTSChannel:
@@ -56,7 +99,7 @@ class _TTSChannel:
         if not chunk or self.buffer is None:
             return
         for sentence in self.buffer.add(chunk):
-            await self.q.put(sentence)
+            await self._put_speakable(sentence)
 
     async def flush_and_signal(self) -> None:
         """Flush the buffer remainder to the queue and signal end-of-input so
@@ -65,8 +108,20 @@ class _TTSChannel:
         that was repeated at six sites."""
         if self.buffer is not None:
             for sentence in self.buffer.flush():
-                await self.q.put(sentence)
+                await self._put_speakable(sentence)
         self._sess.state.tts_flush = True
+
+    async def _put_speakable(self, sentence: str) -> None:
+        """Queue a sentence for synthesis, dropping markup-only fragments.
+
+        Single choke point for both enqueue paths: nothing reaches the synth
+        queue that the backend can only answer with silence.
+        """
+        speakable = _to_speakable(sentence)
+        if not speakable:
+            logger.debug("voxedge tts: dropped non-speakable fragment %r", sentence[:40])
+            return
+        await self.q.put(speakable)
 
     def interrupt_synth(self) -> None:
         """Barge-in step 1: stop the in-flight synth task + signal its stop

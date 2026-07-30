@@ -37,6 +37,7 @@ import logging
 import queue
 import subprocess
 import threading
+import time
 from typing import AsyncIterator, Iterator
 
 logger = logging.getLogger(__name__)
@@ -203,18 +204,44 @@ class WorkerIO:
         for q in queues:
             q.put({"event": "_worker_exit"})
 
-    def request(self, payload: dict) -> Iterator[dict]:
+    def request(
+        self,
+        payload: dict,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[dict]:
         """Send ``payload`` to the worker and yield response events until ``done``.
 
         Caller must include a unique ``id`` field in ``payload``. The generator
         terminates when an ``event=="done"`` or ``event=="cancelled"`` is
         received, or raises ``WorkerExitError`` if the worker dies mid-request.
+
+        ``cancel_event`` provides out-of-band cancellation for a generator
+        currently blocked inside ``q.get``. This is required by synchronous
+        TTS generators running in an executor: calling ``generator.close()``
+        from the ASGI event-loop thread cannot interrupt a generator that is
+        already executing in another thread.
         """
-        self._sem.acquire()
+        if cancel_event is None:
+            self._sem.acquire()
+        else:
+            # A prefetched sentence can already be waiting for a Python
+            # WorkerIO slot when its HTTP client disconnects. Do not let that
+            # stale task acquire a later slot and write a brand-new worker
+            # request after cancellation.
+            while not self._sem.acquire(timeout=0.1):
+                if cancel_event.is_set():
+                    return
         req_id: str | None = None
+        cancel_sent = False
+        last_event_at = time.monotonic()
         try:
             if self._closed:
                 raise WorkerExitError("WorkerIO closed before request could start")
+            # Close the race between the successful semaphore acquire and the
+            # first stdin write.
+            if cancel_event is not None and cancel_event.is_set():
+                return
             req_id = payload["id"]
             q: "queue.Queue" = queue.Queue()
             # CRITICAL ordering: insert the queue BEFORE writing stdin so
@@ -231,9 +258,32 @@ class WorkerIO:
                 self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 self._proc.stdin.flush()
             while True:
-                event = q.get(timeout=60.0)
+                if (
+                    cancel_event is not None
+                    and cancel_event.is_set()
+                    and not cancel_sent
+                ):
+                    self.cancel(req_id)
+                    cancel_sent = True
+                try:
+                    event = q.get(timeout=0.1 if cancel_event is not None else 60.0)
+                except queue.Empty:
+                    if time.monotonic() - last_event_at >= 60.0:
+                        raise
+                    continue
+                last_event_at = time.monotonic()
                 if event.get("event") == "_worker_exit":
                     raise WorkerExitError("worker subprocess died mid-request")
+                # A cancel can race the worker thread's per-request
+                # registration. Retry until it reports tripped=true or a
+                # terminal event arrives.
+                if (
+                    event.get("event") == "cancel_ack"
+                    and event.get("tripped") is False
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    cancel_sent = False
                 yield event
                 if event.get("event") in ("done", "cancelled"):
                     return
