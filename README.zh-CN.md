@@ -158,7 +158,7 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 ## 状态
 
-本源码树的 voxedge 版本为 **0.0.6a0**；当前 OVS 生产线仍 pin 在 voxedge **0.0.5a0**。调整生产 pin 前，应将 0.0.6a0 的 adapter/API 集成视为待验证项；特别是上述 OpenAI HTTP route 属于 OVS 行为，不是 voxedge 0.0.6a0 的兼容性承诺。mock 测试套件可在无 CUDA 环境运行，但不能替代目标设备验证。
+本源码树的 voxedge 版本为 **0.0.6a1**；当前 OVS 生产线仍 pin 在 voxedge **0.0.5a0**，直到 0.0.6a1 运行镜像通过目标设备验证。特别是上述 OpenAI HTTP route 属于 OVS 行为，不是 voxedge 的兼容性承诺。mock 测试套件可在无 CUDA 环境运行，但不能替代目标设备验。
 
 ## 参与贡献
 

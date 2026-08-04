@@ -158,7 +158,7 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-This source tree reports voxedge **0.0.6a0**. The current OVS production line remains pinned to voxedge **0.0.5a0**. Treat the 0.0.6a0 adapter/API integration as pending validation before changing that production pin; in particular, the OpenAI HTTP routes above are OVS behavior, not a voxedge 0.0.6a0 compatibility promise. The mock-based suite runs without CUDA, but it does not replace target-device validation.
+This source tree reports voxedge **0.0.6a1**. The current OVS production line remains pinned to voxedge **0.0.5a0** until the 0.0.6a1 runtime image passes target-device qualification. In particular, the OpenAI HTTP routes above are OVS behavior, not a voxedge compatibility promise. The mock-based suite runs without CUDA, but it does not replace target-device validation.
 
 ## Contributing
 
