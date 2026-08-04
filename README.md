@@ -158,7 +158,11 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-This source tree reports voxedge **0.0.6a1**. The current OVS production line remains pinned to voxedge **0.0.5a0** until the 0.0.6a1 runtime image passes target-device qualification. In particular, the OpenAI HTTP routes above are OVS behavior, not a voxedge compatibility promise. The mock-based suite runs without CUDA, but it does not replace target-device validation.
+voxedge **0.0.6a1** is published on PyPI and is the version pinned by the
+qualified TensorRT Edge-LLM v0.9.1 OVS runtime. The release passed the mock
+suite and Orin NX target-device qualification; platform runtimes, workers, and
+model engines remain separate deployment artifacts. In particular, the
+OpenAI HTTP routes above are OVS behavior, not a voxedge compatibility promise.
 
 ## Contributing
 
