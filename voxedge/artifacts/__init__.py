@@ -1,8 +1,8 @@
-"""Backend-agnostic runtime artifact manifest + env-free download helper.
+"""Backend-agnostic runtime artifact manifest + verified download helper.
 
-The package is
-pure-Python and env-free; ``huggingface_hub`` is an optional dependency only
-needed for the default network downloader (``voxedge[artifacts]``).
+The schema and verification code are pure Python; ``huggingface_hub`` is an
+optional dependency needed only for the default network downloader
+(``voxedge[artifacts]``). Endpoint selection may honor ``HF_ENDPOINT``.
 
 Public API::
 

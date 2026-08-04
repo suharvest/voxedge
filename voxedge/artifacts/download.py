@@ -1,4 +1,4 @@
-"""Env-free, backend-agnostic artifact download + install helper.
+"""Backend-agnostic artifact download + install helper.
 
 Generalises the RK-specific ``ensure_rk_artifacts`` prototype
 (``voxedge/backends/rk/artifacts.py``) into a backend-agnostic helper keyed by
@@ -16,9 +16,10 @@ which:
   5. returns an :class:`ArtifactInstallResult` recording what was installed vs
      skipped.
 
-**Env-free**: every input is a function argument; nothing reads ``os.environ``.
-The install root is supplied by the caller (product / profile) — the manifest
-only stores artifact-relative paths.
+Endpoint selection follows the conventional Hugging Face override chain:
+explicit argument, ``HF_ENDPOINT``, manifest endpoint, then the safe mirror
+default.  The install root is supplied by the caller (product / profile) —
+the manifest only stores artifact-relative paths.
 
 ``huggingface_hub`` is an OPTIONAL dependency. The default downloader uses it,
 but tests (and offline callers) inject a local downloader via the
@@ -28,6 +29,7 @@ but tests (and offline callers) inject a local downloader via the
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -36,11 +38,10 @@ from .manifest import (
     ArtifactFile,
     ArtifactManifest,
     ArtifactSpec,
-    default_manifest_path,
     load_manifest,
 )
 
-DEFAULT_HF_ENDPOINT = "https://huggingface.co"
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 
 # A downloader fetches one file from an HF repo into ``dest``.
 # Signature: (repo_id, revision, source_path, dest, endpoint) -> None
@@ -83,6 +84,22 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _select_hf_endpoint(
+    explicit: Optional[str], manifest_endpoint: Optional[str]
+) -> str:
+    """Select and normalize the first non-empty endpoint by precedence."""
+    for candidate in (
+        explicit,
+        os.environ.get("HF_ENDPOINT"),
+        manifest_endpoint,
+        DEFAULT_HF_ENDPOINT,
+    ):
+        normalized = str(candidate or "").strip().rstrip("/")
+        if normalized:
+            return normalized
+    return DEFAULT_HF_ENDPOINT  # defensive: the constant is intentionally non-empty
 
 
 def _hf_download(
@@ -172,7 +189,7 @@ def resolve_artifact(
     *,
     manifest_path: Optional[str | Path] = None,
     manifest: Optional[ArtifactManifest] = None,
-    hf_endpoint: str = DEFAULT_HF_ENDPOINT,
+    hf_endpoint: Optional[str] = None,
     download_fn: Optional[DownloadFn] = None,
 ) -> ArtifactInstallResult:
     """Resolve, download, SHA-verify and install a named artifact.
@@ -181,10 +198,13 @@ def resolve_artifact(
         artifact_ref: stable artifact name to resolve in the manifest.
         install_root: caller-chosen base dir; files land at
             ``install_root/<file.path>`` (manifest stores relative paths only).
-        manifest_path: path to a JSON manifest. Defaults to the bundled sample
-            manifest when neither ``manifest_path`` nor ``manifest`` is given.
+        manifest_path: path to a JSON manifest. Required when ``manifest`` is
+            not supplied. The bundled manifest is schema documentation only
+            and is never selected implicitly.
         manifest: a pre-parsed manifest (takes precedence over ``manifest_path``).
-        hf_endpoint: HF endpoint base URL (env-free; passed by the caller).
+        hf_endpoint: explicit HF endpoint base URL. When omitted, selection is
+            ``HF_ENDPOINT`` environment variable, then manifest endpoint, then
+            :data:`DEFAULT_HF_ENDPOINT`.
         download_fn: per-file downloader override. Defaults to a
             ``huggingface_hub``-backed downloader. Tests inject a local one.
 
@@ -196,13 +216,17 @@ def resolve_artifact(
             repo to fetch it, a download fails, or a SHA-256 mismatch occurs.
     """
     if manifest is None:
-        path = manifest_path if manifest_path is not None else default_manifest_path()
-        manifest = load_manifest(path)
+        if manifest_path is None:
+            raise ArtifactError(
+                "no artifact manifest supplied; the bundled manifest is an "
+                "example only. Pass manifest_path=... or manifest=... explicitly."
+            )
+        manifest = load_manifest(manifest_path)
 
     spec = manifest.get(artifact_ref)
 
     root = Path(install_root)
-    endpoint = (hf_endpoint or manifest.hf_endpoint or DEFAULT_HF_ENDPOINT).rstrip("/")
+    endpoint = _select_hf_endpoint(hf_endpoint, manifest.hf_endpoint)
     repo_id = spec.hf_repo
     revision = spec.revision or "main"
     dl = download_fn or _hf_download

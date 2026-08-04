@@ -61,15 +61,13 @@ sherpa = [
     "sherpa-onnx>=1.10",
     "soundfile>=0.12",
 ]
-# Installing `voxedge[jetson]` pulls the Jetson native TensorRT backend
-# adapters in `voxedge/backends/jetson/` (matcha_trt / kokoro_trt / qwen3_trt /
-# moss_tts_nano / paraformer_trt). Like the trt extra these drive PREBUILT TRT
-# engines / a C++ pybind pipeline / a JSONL subprocess worker — the Python side
-# imports tensorrt / cuda / onnxruntime / piper_phonemize / tokenizers /
-# qwen3_speech_engine LAZILY (inside methods), so the modules still import on a
-# CUDA-less dev box. These wheels are aarch64 (Jetson) only — they will NOT
-# install on x86_64 / Apple Silicon, but the adapter modules import there
-# because every heavy runtime import is deferred.
+# `voxedge[jetson]` installs only the index-available Python-side dependencies
+# used by adapters in `voxedge/backends/jetson/`. It DOES NOT provide a complete
+# Jetson runtime: TensorRT/CUDA, native workers/pybind modules, plugins, engines,
+# and model artifacts must be installed from JetPack and the engine/artifact
+# release. Installing this extra alone is therefore not a runnable deployment.
+# Heavy imports remain lazy so adapter modules can still be inspected on a
+# CUDA-less development machine.
 #
 # Real Python-side deps (numpy is already a core dep):
 jetson = [
@@ -107,7 +105,8 @@ text = [
 # The manifest schema + SHA-256 verification logic itself is pure stdlib and
 # needs NO network dependency — callers can inject their own `download_fn`
 # (e.g. a local copy for tests), so this stays an OPTIONAL extra and never
-# enters the core dependency list.
+# enters the core dependency list. Endpoint precedence is explicit argument,
+# HF_ENDPOINT, manifest endpoint, then the safe hf-mirror default.
 artifacts = [
     "huggingface_hub>=0.20",
 ]

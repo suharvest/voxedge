@@ -16,7 +16,7 @@
 
 ## voxedge 是什么？
 
-voxedge 是一个可嵌入的 Python 库，通过直接调用各平台原生推理运行时来驱动实时、端侧语音对话 —— Jetson Orin 上是 TensorRT，RK3576/RK3588 上是 RKNN，CPU 上是 sherpa-onnx。无需云端 STT/TTS API，运行时不依赖网络，没有中间抽象层的性能损耗。同一套 `ConversationEngine` API 可跨三套后端运行，只需替换构造器 —— 已在 Orin Nano 8 GB 上验证 N=2 并发会话，输出逐字节一致，零 CUDA 错误。
+voxedge 是一个可嵌入的 Python 库，通过直接调用各平台原生推理运行时来驱动实时、端侧语音对话 —— Jetson Orin 上是 TensorRT，RK3576/RK3588 上是 RKNN，CPU 上是 sherpa-onnx。无需云端 STT/TTS API，运行时不依赖网络，没有中间抽象层的性能损耗。同一套 `ConversationEngine` 契约横跨三类后端，但具体功能与并发上限仍取决于模型、运行时和产物组合。
 
 voxedge 是已上线产品 **[OpenVoiceStream](https://github.com/suharvest/openvoicestream)** 的开源内核（产品侧含 FastAPI/WebSocket 服务、设备 profile、部署工具与 agent 库）。想要可部署的容器？从那里开始。想把实时边缘语音嵌进自己的应用？这里就是对的地方。
 
@@ -24,7 +24,7 @@ voxedge 是已上线产品 **[OpenVoiceStream](https://github.com/suharvest/open
 
 - **原生运行时，充分发挥性能** —— 直接调用 TensorRT（Jetson）、RKNN（瑞芯微）、sherpa-onnx（CPU），无封装开销，无跨平台抽象损耗
 - **完全离线** —— 无需语音 API key，无按次计费，运行时不依赖网络
-- **在真实硬件上验证** —— Orin Nano 8 GB 实测 N=2 并发会话：与单路输出逐字节一致，零 CUDA 错误
+- **硬件证据有明确边界** —— 部分 Jetson slot-pool 组合已在 Orin Nano 8 GB 通过 N=2 冒烟测试；这不是对所有后端、模型、设备或产物构建的普遍 N=2 保证
 - **流式 + 打断（barge-in）** —— 用户说话时即出 partial + final ASR；句级 TTS 流式输出，首音延迟低到足以支撑实时对话与协作式打断
 - **换硬件，不换代码** —— 同一套 `ConversationEngine` API 横跨 Jetson、瑞芯微、sherpa-onnx CPU，只需替换后端构造器
 - **任何机器均可测试** —— mock 后端只依赖 numpy；整个引擎在无 CUDA、无 GPU 的 Mac 上即可端到端运行
@@ -87,7 +87,19 @@ pip install voxedge[rk]        # 瑞芯微 RK3576/RK3588 NPU（aarch64）
 pip install voxedge[llm]       # OpenAI 兼容 LLM 后端（httpx）
 ```
 
-`jetson` / `rk` extras 只声明纯 Python 依赖；CUDA/TensorRT 与 RKNN 运行时 wheel 来自平台（JetPack L4T / 瑞芯微 NPU 用户态）或引擎仓库 —— 平台运行时由你自带。
+`jetson` extra 只安装包索引中可获取的 Python 侧依赖；它**不会**安装 TensorRT/CUDA、C++/pybind worker、plugin、TensorRT engine 或模型产物。这些需来自 JetPack 与引擎/产物 release。因此，单独执行 `pip install voxedge[jetson]` 不会得到可运行的 Jetson 部署。RKNN 与 `voxedge[rk]` 同样存在平台运行时边界。
+
+## Python 库与服务端的边界
+
+voxedge 是 Python 库：提供后端接口、对话引擎以及进程内/WebSocket 传输适配器。它不会启动 FastAPI，也不直接暴露 HTTP route。**OpenVoiceStream（OVS）**才是可部署的服务/产品层，负责 profile 选择、产物、容器和网络 API。
+
+OVS 提供的 OpenAI 兼容语音接口包括：
+
+- `POST /v1/audio/speech` —— 通过 HTTP chunked transfer 流式返回音频，而不是缓冲完整音频后一次返回；
+- `GET /v1/models` —— 列出该 OVS 部署可用的模型；
+- `GET /v1/capabilities` —— 返回该部署检测到的运行时/后端能力。
+
+上述 route 属于 OVS，不是本仓库实现的 endpoint。
 
 ## 架构
 
@@ -112,6 +124,18 @@ pip install voxedge[llm]       # OpenAI 兼容 LLM 后端（httpx）
 | `backends/llm/` | 任意 | OpenAI 兼容 LLM（httpx） | `voxedge[llm]` | — |
 | `backends/mock.py` | 开发 / CI | MockASR、MockTTS、MockVAD、MockLLM | 核心包 | — |
 
+### Jetson TTS 音色、克隆与速度能力矩阵
+
+| 模型/后端 | 音色选择 | 音色克隆 / 录入 | 速度行为 |
+|---|---|---|---|
+| Matcha TRT | 固定/单音色 | 不支持克隆 | 原生连续速度（`length_scale`） |
+| Qwen3-TTS Base | speaker embedding；可选配置固定 base embedding 作为默认音色 | 可消费可复用 embedding；只有存在 speaker-encoder 产物时才能从参考 WAV 录入 | 连续速度走 numpy DSP fallback |
+| Qwen3-TTS CustomVoice | 内置 named speakers | 不支持外部音色克隆或录入 | 连续速度走 numpy DSP fallback |
+| MOSS-TTS-Nano | 每次请求用参考音频条件化 | 支持 reference-audio prompt-prefix 克隆；不提供可复用 speaker embedding API | 连续速度走 numpy DSP fallback |
+| SparkTTS | 可控 gender/pitch/speed **离散 style label** | 仅配置 `voices_dir` 时启用 registry clone，通过已录入 `voice_id` 选择 | 离散 speed label 是原生控制；连续倍率走 DSP fallback |
+
+“DSP fallback”表示 voxedge 对 PCM 做后处理，它不是模型原生控制，音质和时延特性可能不同。
+
 ### 传输层（`voxedge/transport/`）
 
 `Transport` ABC + 两个实现：
@@ -130,11 +154,11 @@ pip install voxedge[llm]       # OpenAI 兼容 LLM 后端（httpx）
 ## 设计约束
 
 - **纯 Python 核心** —— `import voxedge` 只依赖 numpy。重型适配器位于 `backends/{jetson,rk,sherpa}/`，运行时导入被推迟。
-- **库内不读 env** —— 所有配置以显式参数注入。profile、环境变量、部署开关是产品（[OpenVoiceStream](https://github.com/suharvest/openvoicestream)）的职责，不是引擎的。
+- **显式运行时配置** —— 后端配置以参数注入；profile 和部署开关属于 [OpenVoiceStream](https://github.com/suharvest/openvoicestream)。可选 artifact downloader 是唯一明确的例外：它在显式 endpoint 之后、manifest endpoint 之前遵循 `HF_ENDPOINT`。
 
 ## 状态
 
-已上线 —— 一个已发货的边缘语音栈背后的开源内核。约 270 个基于 mock 的测试；整个引擎能在无 CUDA 的 Mac 上端到端运行。
+本源码树的 voxedge 版本为 **0.0.6a0**；当前 OVS 生产线仍 pin 在 voxedge **0.0.5a0**。调整生产 pin 前，应将 0.0.6a0 的 adapter/API 集成视为待验证项；特别是上述 OpenAI HTTP route 属于 OVS 行为，不是 voxedge 0.0.6a0 的兼容性承诺。mock 测试套件可在无 CUDA 环境运行，但不能替代目标设备验证。
 
 ## 参与贡献
 

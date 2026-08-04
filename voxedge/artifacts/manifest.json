@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
-  "hf_endpoint": "https://huggingface.co",
+  "example_only": true,
+  "description": "Schema example only; supply a production manifest explicitly to resolve_artifact.",
+  "hf_endpoint": "https://hf-mirror.com",
   "artifacts": {
     "rk3588-kokoro-hybrid-2026-05-23": {
       "artifact_ref": "rk3588-kokoro-hybrid-2026-05-23",

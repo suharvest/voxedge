@@ -1,4 +1,4 @@
-"""Tests for the backend-agnostic artifact manifest + env-free download helper.
+"""Tests for the backend-agnostic artifact manifest + verified downloader.
 
 All tests are offline: a local directory stands in for the "HF source" and a
 local ``download_fn`` copies files from it, so the manifest/SHA logic is
@@ -79,7 +79,10 @@ def _write_manifest(path: Path, data: dict) -> Path:
 # ── manifest parsing / schema validation ─────────────────────────────────────
 
 
-def test_bundled_sample_manifest_parses_and_includes_style_npy():
+def test_bundled_example_manifest_is_marked_example_only_and_parses():
+    raw = json.loads(default_manifest_path().read_text())
+    assert raw["example_only"] is True
+    assert raw["hf_endpoint"] == "https://hf-mirror.com"
     manifest = load_manifest(default_manifest_path())
     spec = manifest.get("rk3588-kokoro-hybrid-2026-05-23")
     assert spec.backend_key == "rk.tts"
@@ -88,6 +91,11 @@ def test_bundled_sample_manifest_parses_and_includes_style_npy():
     rels = [f.rel_path for f in spec.file_list]
     # style.npy MUST be present — demonstrates voice-pack preflight coverage.
     assert any(p.endswith("style.npy") for p in rels), rels
+
+
+def test_resolve_without_explicit_manifest_fails_closed(tmp_path):
+    with pytest.raises(ArtifactError, match="example only"):
+        resolve_artifact("demo-artifact", tmp_path / "install")
 
 
 def test_parse_rejects_wrong_schema_version():
@@ -327,6 +335,76 @@ def test_resolve_unknown_artifact_ref(tmp_path):
         resolve_artifact(
             "nope", tmp_path / "install", manifest_path=manifest_path
         )
+
+
+# ── endpoint precedence ─────────────────────────────────────────────────
+
+
+def _capture_endpoint_download(calls):
+    def _dl(repo_id, revision, source_path, dest, endpoint):
+        calls.append(endpoint)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"endpoint-test")
+
+    return _dl
+
+
+def _endpoint_manifest(endpoint: str = ""):
+    data = _manifest_dict(
+        [{"path": "endpoint.bin", "sha256": _sha256_bytes(b"endpoint-test")}]
+    )
+    if endpoint:
+        data["hf_endpoint"] = endpoint
+    return parse_manifest(data)
+
+
+def test_endpoint_explicit_overrides_env_and_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_ENDPOINT", "https://env.example/")
+    calls = []
+    resolve_artifact(
+        "demo-artifact",
+        tmp_path,
+        manifest=_endpoint_manifest("https://manifest.example/"),
+        hf_endpoint="https://explicit.example/",
+        download_fn=_capture_endpoint_download(calls),
+    )
+    assert calls == ["https://explicit.example"]
+
+
+def test_endpoint_env_overrides_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_ENDPOINT", "https://env.example/")
+    calls = []
+    resolve_artifact(
+        "demo-artifact",
+        tmp_path,
+        manifest=_endpoint_manifest("https://manifest.example/"),
+        download_fn=_capture_endpoint_download(calls),
+    )
+    assert calls == ["https://env.example"]
+
+
+def test_endpoint_uses_manifest_when_no_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    calls = []
+    resolve_artifact(
+        "demo-artifact",
+        tmp_path,
+        manifest=_endpoint_manifest("https://manifest.example/"),
+        download_fn=_capture_endpoint_download(calls),
+    )
+    assert calls == ["https://manifest.example"]
+
+
+def test_endpoint_defaults_to_hf_mirror(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    calls = []
+    resolve_artifact(
+        "demo-artifact",
+        tmp_path,
+        manifest=_endpoint_manifest(),
+        download_fn=_capture_endpoint_download(calls),
+    )
+    assert calls == ["https://hf-mirror.com"]
 
 
 # ── style.npy preflight semantics ────────────────────────────────────────────

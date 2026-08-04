@@ -16,7 +16,7 @@
 
 ## What is voxedge?
 
-voxedge is an embeddable Python library that drives real-time, on-device voice conversations by calling directly into each platform's native inference runtime — TensorRT on Jetson Orin, RKNN on RK3576/RK3588, sherpa-onnx on CPU. No cloud STT/TTS APIs, no internet at runtime, no intermediate abstraction overhead. The same `ConversationEngine` API works across all three backends; you swap only the backend constructor — N=2 concurrent sessions verified on Orin Nano 8 GB, byte-identical output, zero CUDA errors.
+voxedge is an embeddable Python library that drives real-time, on-device voice conversations by calling directly into each platform's native inference runtime — TensorRT on Jetson Orin, RKNN on RK3576/RK3588, sherpa-onnx on CPU. No cloud STT/TTS APIs, no internet at runtime, no intermediate abstraction overhead. The same `ConversationEngine` contract spans the three backend families; the exact model/runtime configuration still determines which features and concurrency level are available.
 
 voxedge is the open-core engine behind **[OpenVoiceStream](https://github.com/suharvest/openvoicestream)** — the deployable FastAPI/WebSocket server, device profiles, and agent gallery. Want a container? Start there. Want to embed real-time edge voice in your own app? You're in the right place.
 
@@ -24,7 +24,7 @@ voxedge is the open-core engine behind **[OpenVoiceStream](https://github.com/su
 
 - **Native runtimes, full performance** — calls directly into TensorRT (Jetson), RKNN (Rockchip), and sherpa-onnx (CPU); no wrapper overhead, no cross-platform abstraction tax
 - **Fully on-device** — no speech API key, no per-call bill, no internet dependency at runtime
-- **Verified on real hardware** — N=2 concurrent sessions on Orin Nano 8 GB: byte-identical output vs. single-stream, zero CUDA errors
+- **Hardware evidence, narrowly scoped** — selected Jetson slot-pool configurations have passed N=2 smoke tests on Orin Nano 8 GB; this is not a blanket N=2 guarantee for every backend, model, device, or artifact build
 - **Streaming + barge-in** — partial + final ASR while the user speaks; sentence-level TTS streaming with first-audio latency low enough for live dialogue and cooperative barge-in
 - **Swap hardware, not code** — same `ConversationEngine` API across Jetson, Rockchip, and sherpa-onnx CPU; only the backend constructor changes
 - **Test on any machine** — mock backends require only numpy; the whole engine runs end-to-end on a Mac with no CUDA or GPU
@@ -87,7 +87,19 @@ pip install voxedge[rk]        # Rockchip RK3576/RK3588 NPU (aarch64)
 pip install voxedge[llm]       # OpenAI-compatible LLM backend (httpx)
 ```
 
-The `jetson` / `rk` extras declare only pure-Python deps; the CUDA/TensorRT and RKNN runtime wheels ship from the platform (JetPack L4T / Rockchip NPU userspace) or the engine repos — you bring the platform runtime.
+The `jetson` extra installs only Python-side dependencies available from the package index. It does **not** install TensorRT/CUDA, the C++/pybind workers, plugins, TensorRT engines, or model artifacts; those come from JetPack and the engine/artifact release. Therefore `pip install voxedge[jetson]` alone does not produce a runnable Jetson deployment. The same platform-runtime caveat applies to RKNN and `voxedge[rk]`.
+
+## Library versus server
+
+voxedge is a Python library: backend interfaces, the conversation engine, and in-process/websocket transport adapters. It does not start FastAPI or expose HTTP routes. **OpenVoiceStream (OVS)** is the deployable server/product layer that selects profiles, owns artifacts and containers, and exposes network APIs.
+
+OVS provides an OpenAI-compatible speech surface including:
+
+- `POST /v1/audio/speech` — audio is streamed with HTTP chunked transfer rather than buffered into one response;
+- `GET /v1/models` — models available from that OVS deployment;
+- `GET /v1/capabilities` — runtime/backend capabilities detected by that deployment.
+
+These routes describe OVS, not endpoints implemented by this repository.
 
 ## Architecture
 
@@ -112,6 +124,18 @@ Concrete adapters live under `backends/{jetson,rk,sherpa}/` and import their hea
 | `backends/llm/` | Any | OpenAI-compatible LLM over httpx | `voxedge[llm]` | — |
 | `backends/mock.py` | Dev / CI | MockASR, MockTTS, MockVAD, MockLLM | core | — |
 
+### Jetson TTS voice, clone, and speed matrix
+
+| Model/backend | Voice selection | Voice cloning / enrollment | Speed behavior |
+|---|---|---|---|
+| Matcha TRT | Fixed/single model voice | No cloning | Native continuous speed (`length_scale`) |
+| Qwen3-TTS Base | Speaker embedding; an optional configured fixed base embedding may be the default | Consumes reusable embeddings; reference-WAV enrollment is available only when the speaker-encoder artifact is present | Continuous speed through the numpy DSP fallback |
+| Qwen3-TTS CustomVoice | Built-in named speakers | No external voice cloning or enrollment | Continuous speed through the numpy DSP fallback |
+| MOSS-TTS-Nano | Reference audio conditions each request | Prompt-prefix cloning from reference audio; no reusable speaker-embedding API | Continuous speed through the numpy DSP fallback |
+| SparkTTS | Controllable gender/pitch/speed **style labels** | Registry-based clone voices only when `voices_dir` is configured; selection uses an enrolled `voice_id` | Discrete speed labels are native; continuous factors use the DSP fallback |
+
+"DSP fallback" means voxedge post-processes PCM; it is not a native model control and may have different quality/latency characteristics.
+
 ### Transport (`voxedge/transport/`)
 
 `Transport` ABC + two implementations:
@@ -130,11 +154,11 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 ## Design Constraints
 
 - **Pure Python core** — `import voxedge` is numpy-only. Heavy adapters live under `backends/{jetson,rk,sherpa}/` with deferred runtime imports.
-- **No env reads in the library** — all config injected as explicit params. Profiles and deployment knobs are the product's job ([OpenVoiceStream](https://github.com/suharvest/openvoicestream)).
+- **Explicit runtime config** — backend configuration is injected as params; profiles and deployment knobs belong to [OpenVoiceStream](https://github.com/suharvest/openvoicestream). The optional artifact downloader deliberately honors `HF_ENDPOINT` after an explicit endpoint and before the manifest endpoint.
 
 ## Status
 
-In production — the open-core engine behind a shipped edge voice stack. ~270 mock-based tests; the whole engine runs end-to-end on a Mac with no CUDA.
+This source tree reports voxedge **0.0.6a0**. The current OVS production line remains pinned to voxedge **0.0.5a0**. Treat the 0.0.6a0 adapter/API integration as pending validation before changing that production pin; in particular, the OpenAI HTTP routes above are OVS behavior, not a voxedge 0.0.6a0 compatibility promise. The mock-based suite runs without CUDA, but it does not replace target-device validation.
 
 ## Contributing
 
