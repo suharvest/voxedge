@@ -82,18 +82,21 @@ def _is_worker_protocol_error(exc: BaseException) -> bool:
 def _safe_close_stream(stream: Any) -> None:
     """Release per-stream backend resources (TRT contexts, device buffers).
 
-    Default ASRStream.close() is a no-op; backends like paraformer_trt
-    override it to drop per-stream TRT IExecutionContext + cudaMalloc'd
-    buffers. We swallow any exception so close() never breaks lifecycle
-    teardown.
+    每个 ASRStream 子类都必须显式声明 OWNS_RESOURCES：True 的实现真正释放资源
+    （如 paraformer_trt 丢弃每流 TRT IExecutionContext 与 cudaMalloc 缓冲、
+    trt_edge_llm 归还 worker 槽位），False 的沿用基类空实现。两种情况下无条件调用
+    都是安全的。
+
+    这里不再写 ``getattr(stream, "close", None)`` 的鸭子类型兜底 —— 基类始终提供
+    close，那个判断永远为真、从来拦不住任何东西，只会让"忘了实现"看起来像
+    "不需要实现"。契约现在由 ASRStream.__init_subclass__ 在类定义时强制。
+
+    仍然吞掉异常：close 失败不该打断生命周期收尾。
     """
     if stream is None:
         return
-    close = getattr(stream, "close", None)
-    if close is None:
-        return
     try:
-        close()
+        stream.close()
     except Exception:
         logger.exception("ASRSessionManager: stream.close raised; ignoring")
 

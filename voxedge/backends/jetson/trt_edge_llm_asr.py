@@ -951,6 +951,10 @@ def _join_segment_texts(texts: list[str], language: str | None) -> str:
 
 
 class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
+
+    #: 只持有 Python 侧的 _chunks 列表，没有 worker 会话/槽位（不发 begin），
+    #: 随对象回收即可。
+    OWNS_RESOURCES = False
     def __init__(self, backend: TRTEdgeLLMASRBackend, language: str = "auto"):
         self._backend = backend
         self._language = language
@@ -1041,6 +1045,9 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
     Enabled only with stream_mode=worker. The worker receives cumulative
     float32 PCM via ``pcm_b64`` and emits partial/final JSON events.
     """
+
+    #: close() 必须向 worker 发 end 归还槽位（max_slots=1，漏一个 ASR 就死）。
+    OWNS_RESOURCES = True
 
     def __init__(self, backend: TRTEdgeLLMASRBackend, language: str = "auto"):
         self._backend = backend

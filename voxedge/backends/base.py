@@ -22,7 +22,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, AsyncIterator, Iterator, Literal, Optional
+from typing import Any, AsyncIterator, ClassVar, Iterator, Literal, Optional
 
 import numpy as np
 
@@ -63,6 +63,36 @@ class ASRStream(ABC):
     immediate_client_eos_cancel_safe: bool = False
     """Whether partial abort can run outside normal ASR serialization."""
 
+    #: 本类的 ``close()`` 是否需要释放东西。**每个子类必须显式声明。**
+    #:
+    #: 这不是样板：``close()`` 在基类里曾是空实现，于是
+    #: ``close = getattr(stream, "close", None); if close is not None: close()``
+    #: 这种鸭子类型兜底永远拿得到一个什么都不做的方法，判断从来拦不住任何东西。
+    #: 子类忘了实现 close 会静默继承空壳 —— 调用"成功"、资源不释放、零报错。
+    #: 2026-08-06 的 ASR worker 槽位泄漏正是这么活下来的：
+    #: ``_TRTEdgeLLMStreamingASRStream`` 从没实现 close，服务端每次都"成功"调用了
+    #: 继承来的空函数，而 max_slots=1 的槽位一直漏，第二轮起 ASR 直接死掉。
+    #:
+    #: 声明为 True 却没实现 ``close()`` 会在**类定义时**（即 import 时）抛
+    #: TypeError —— 漏写立刻炸，而不是几个月后有人去查延迟才发现。
+    OWNS_RESOURCES: ClassVar[Optional[bool]] = None
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        owns = getattr(cls, "OWNS_RESOURCES", None)
+        if owns is None:
+            raise TypeError(
+                f"{cls.__name__} 必须显式声明 OWNS_RESOURCES："
+                "True 表示 close() 要释放资源（并且必须实现 close），"
+                "False 表示确认没有需要释放的每流资源。"
+                "不允许留空 —— 那正是让忘记实现 close 变得不可察觉的原因。"
+            )
+        if owns and cls.close is ASRStream.close:
+            raise TypeError(
+                f"{cls.__name__} 声明了 OWNS_RESOURCES=True 却没有实现 close()，"
+                "继承来的基类实现是空操作，资源不会被释放。"
+            )
+
     @abstractmethod
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         """Feed audio samples (float32, [-1,1]) into the stream."""
@@ -92,7 +122,13 @@ class ASRStream(ABC):
         self.cancel_and_finalize()
 
     def close(self) -> None:
-        """Release per-stream resources. Default no-op; safe to call twice."""
+        """Release per-stream resources. Safe to call twice.
+
+        Subclasses declaring ``OWNS_RESOURCES = True`` must override this;
+        ``__init_subclass__`` refuses to define a class that declares ownership
+        without implementing it. For ``OWNS_RESOURCES = False`` this no-op is
+        the correct behaviour and callers can invoke it unconditionally.
+        """
 
 
 class OfflineAccumulateStream(ASRStream):
@@ -107,6 +143,9 @@ class OfflineAccumulateStream(ASRStream):
     Any backend that sets ``supports_offline_streaming = True`` gets a streaming
     session for free via ``ASRBackend.create_stream`` — no per-backend stream code.
     """
+
+    #: 每流累积缓冲 + 自实现 close 清理它。
+    OWNS_RESOURCES = True
 
     def __init__(self, backend: "ASRBackend", language: str = "auto") -> None:
         self._backend = backend

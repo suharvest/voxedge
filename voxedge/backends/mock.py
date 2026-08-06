@@ -53,6 +53,9 @@ class MockASRStream(ASRStream):
     exercised. ``transcript`` lets a test pin the final text.
     """
 
+    #: 测试替身，无任何外部资源。
+    OWNS_RESOURCES = False
+
     def __init__(
         self,
         transcript: str = "hello world",

@@ -272,6 +272,10 @@ class _RKASRStreamAdapter(ASRStream):
     threshold, segment + per-segment transcribe instead of trusting the inner's
     sliding-window decoder (which snowballs garbage past ~10s)."""
 
+    #: 内层 ParaformerRKNNStream 没有任何释放接口；NPU 运行时是
+    #: _RknnRuntime.release()，归 backend 所有且跨流共享，不由单个流释放。
+    OWNS_RESOURCES = False
+
     def __init__(self, inner, backend: "RKASRBackend", language: str = "auto"):
         self._inner = inner
         self._backend = backend

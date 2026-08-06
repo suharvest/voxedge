@@ -354,6 +354,9 @@ class _ParaformerCtxBundle:
 class ParaformerTRTStream(ASRStream):
     """Streaming ASR session backed by TRT encoder + decoder."""
 
+    #: close() 释放每流的 TRT IExecutionContext 与 cudaMalloc 缓冲。
+    OWNS_RESOURCES = True
+
     def __init__(self, backend: "ParaformerTRTBackend"):
         self._backend = backend
         self._tokens = backend._tokens

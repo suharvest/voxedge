@@ -148,6 +148,9 @@ def _fix_bpe_splits(text: str) -> str:
 class SherpaASRStream(ASRStream):
     """Streaming ASR session backed by a sherpa_onnx OnlineRecognizer."""
 
+    #: 纯进程内 recognizer，无池、无 begin/end 配对。
+    OWNS_RESOURCES = False
+
     def __init__(self, recognizer, language_mode: str = "zh_en"):
         self._recognizer = recognizer
         self._language_mode = language_mode
