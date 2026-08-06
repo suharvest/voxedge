@@ -42,6 +42,7 @@ from typing import Optional
 
 import numpy as np
 
+from voxedge.text import zh_numbers
 from voxedge.backends.base import TTSBackend, TTSCapability
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
@@ -539,6 +540,15 @@ class MatchaTRTBackend(TTSBackend):
 
     def _text_to_tokens(self, text: str) -> list[int]:
         import re
+
+        # Digits must become Chinese numerals before any lookup happens.
+        # tokens.txt / lexicon.txt for matcha-icefall-zh-en carry every Chinese
+        # numeral and no Arabic digit, and a lookup miss below is silently
+        # skipped — so "945" is not mispronounced, it is dropped. Measured on
+        # Orin NX: "库存945个" renders 1.47 s against 2.24 s for
+        # "库存九百四十五个", i.e. the number contributes no audio at all.
+        text = zh_numbers.normalize(text)
+
         tokens: list[int] = []
         space_id = self._token_to_id.get(" ")
         prev_was_english = False
