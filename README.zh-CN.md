@@ -158,8 +158,20 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 ## 状态
 
-voxedge **0.0.6a1** 已发布到 PyPI，也是通过 TensorRT Edge-LLM v0.9.1
-验收的 OVS 运行时所固定的版本。该版本已通过 mock 测试套件和 Orin NX
+voxedge **0.0.7a0** 为当前版本；通过 TensorRT Edge-LLM v0.9.1 验收的 OVS 运行时
+目前仍固定在 **0.0.6a1**。
+
+0.0.7a0 含两处现场修复与一处**破坏性**变更：
+
+* 阿拉伯数字在查词典前转成中文读法。matcha-icefall-zh-en 的 token 表里没有阿拉伯
+  数字，查表未命中会被静默跳过 —— 于是数字不是读错，而是**完全不发音**。
+* 流式 ASR 的 worker 槽位现在在所有 finalize 路径上都会归还。此前只有「零音频」
+  分支会归还，于是在 `max_slots=1` 下每次成功识别都漏一个槽位，第二轮起必然
+  `PoolSaturatedError`。
+* **破坏性**：所有 `ASRStream` 子类必须显式声明 `OWNS_RESOURCES`。不声明、或声明
+  `True` 却未实现 `close()`，会在**类定义时**抛 `TypeError`。此前 `close()` 是空
+  实现，使得「忘了实现」与「无需实现」无法区分 —— 上面那个槽位泄漏正是因此长期
+  未被发现。该版本已通过 mock 测试套件和 Orin NX
 目标设备验证；平台运行时、worker 与模型 engine 仍作为独立部署产物提供。
 特别是上述 OpenAI HTTP route 属于 OVS 行为，不是 voxedge 的兼容性承诺。
 

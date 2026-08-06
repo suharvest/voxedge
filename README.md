@@ -158,8 +158,24 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-voxedge **0.0.6a1** is published on PyPI and is the version pinned by the
-qualified TensorRT Edge-LLM v0.9.1 OVS runtime. The release passed the mock
+voxedge **0.0.7a0** is the current release; **0.0.6a1** is what the qualified
+TensorRT Edge-LLM v0.9.1 OVS runtime still pins.
+
+0.0.7a0 carries two field fixes and one **breaking** change:
+
+* Arabic digits are normalized to spoken Chinese before lexicon lookup. The
+  matcha-icefall-zh-en token table contains no Arabic digit, and a lookup miss
+  is silently skipped — so digits produced *no audio at all* rather than being
+  mispronounced.
+* The streaming ASR worker slot is now returned on every finalize path. It was
+  only returned on the zero-audio branch, so with `max_slots=1` every successful
+  recognition leaked a slot and the second utterance onward failed with
+  `PoolSaturatedError`.
+* **Breaking:** every `ASRStream` subclass must now declare `OWNS_RESOURCES`.
+  Omitting it — or declaring `True` without implementing `close()` — raises
+  `TypeError` at class definition time. The previous no-op `close()` made
+  "forgot to implement" indistinguishable from "nothing to release", which is
+  how the slot leak above survived unnoticed. The release passed the mock
 suite and Orin NX target-device qualification; platform runtimes, workers, and
 model engines remain separate deployment artifacts. In particular, the
 OpenAI HTTP routes above are OVS behavior, not a voxedge compatibility promise.

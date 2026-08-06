@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxedge"
-version = "0.0.6a1"
+version = "0.0.7a0"
 description = "Pipecat for the edge — edge-native, local-first real-time voice conversation library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -133,7 +133,13 @@ packages = [
     "voxedge.transport",
     "voxedge.engine",
     "voxedge.artifacts",
+    "voxedge.text",
 ]
+
+# 注意：这是**显式**包列表，不是自动发现。新增子包必须手工加进来 ——
+# 漏加时 wheel 照常构建成功，但装上去 import 就炸。0.0.7a0 构建时
+# voxedge.text 就漏过一次（matcha_trt.py 已经 import 它了）。
+# tests/test_packaging.py 会比对磁盘上的包与本列表，漏加即测试失败。
 
 [tool.setuptools.package-data]
 "voxedge.artifacts" = ["manifest.json"]
