@@ -1181,6 +1181,17 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
     def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled or self._closed:
             return self._join_committed(self._final_text), self._detected_language
+        try:
+            return self._finalize_inner()
+        finally:
+            # 正常路径以前从不发 ``end``：只有「零音频」分支和 cancel_and_finalize()
+            # 会发。于是每一次成功的识别都漏掉一个 worker 槽位，而 max_slots=1 ——
+            # 第一轮之后所有 create_stream 都抛 PoolSaturatedError，设备永远停在
+            # 「聆听中」。实测：05:58:52 opened → 05:58:53 closed → 之后每次连接
+            # 都 pool_saturated，直到重启容器。
+            self.close()
+
+    def _finalize_inner(self) -> tuple[str, Optional[str]]:
         if len(self._audio_accum) == 0:
             self._backend._worker_request({"event": "end", "id": self._session_id})
             self._closed = True
@@ -1242,6 +1253,28 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                     "streaming finalize offline fallback failed", exc_info=True
                 )
         return text, self._detected_language
+
+    def close(self) -> None:
+        """释放 worker 槽位。幂等，finalize()/cancel 之后再调也安全。
+
+        server 的 ASR handler 在 finally 里做 ``getattr(stream, "close", None)``
+        并调用它 —— 但这个流类此前没有 ``close``，getattr 拿到 None，整段兜底
+        形同虚设。ws 在 finalize 之外的任何路径结束（客户端先断、异常、取消）
+        都会让槽位永久泄漏。
+        """
+        if self._closed:
+            return
+        try:
+            self._backend._worker_request(
+                {"event": "end", "id": self._session_id}
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "ASR stream close: end event failed; worker slot may leak",
+                exc_info=True,
+            )
+        finally:
+            self._closed = True
 
     def cancel_and_finalize(self) -> None:
         self._final_text = self._partial_text
