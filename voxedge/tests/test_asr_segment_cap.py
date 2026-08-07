@@ -19,6 +19,7 @@ from __future__ import annotations
 import numpy as np
 
 from voxedge.backends.jetson.trt_edge_llm_asr import (
+    TRTEdgeLLMASRBackend,
     TRTEdgeLLMASRConfig,
     _TRTEdgeLLMStreamingASRStream,
 )
@@ -56,6 +57,11 @@ class _MockBackend:
 
     def _strip_language_prefix(self, text):
         return text, None
+
+    # 流式路径统一走 _postprocess_text（剥语言前缀 + 退化塌缩）。这里委托到真实
+    # 实现而不是返回原文，否则 mock 会悄悄绕过塌缩守卫，测试就盖不住它。
+    def _postprocess_text(self, text):
+        return TRTEdgeLLMASRBackend._postprocess_text(self, text)
 
 
 def _feed(stream, seconds, sr=16000, chunk_s=0.25):

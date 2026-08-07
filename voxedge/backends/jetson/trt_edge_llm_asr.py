@@ -51,6 +51,7 @@ from typing import Optional
 
 import numpy as np
 
+from voxedge.text.degenerate import collapse_repetition
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -158,6 +159,8 @@ class TRTEdgeLLMASRConfig:
     max_generate_length: int = 200
 
     min_audio_frames: int = 100
+    # 关掉后退化输出原样透传（排查用）。见 voxedge/text/degenerate.py
+    collapse_repetition: bool = True
 
     # Offline long-audio segmentation.
     offline_segment_enabled: bool = True
@@ -569,6 +572,23 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 logger.warning("restart_worker: kill failed: %s", exc)
         logger.info("ASR worker restarted (will respawn on next request)")
 
+    def _postprocess_text(self, text: str) -> tuple[str, Optional[str]]:
+        """所有 ASR 文本的公共出口：剥语言前缀 + 收掉自回归退化的整段复读。
+
+        离线与流式都经过这里 —— 两条路径在短音频上产出逐字相同的退化输出
+        （2026-08-08 orin-nx 实测），所以守卫必须放在共用位置而非流式那一侧。
+        """
+        text, language_detected = self._strip_language_prefix(text)
+        if text and getattr(self._config, "collapse_repetition", True):
+            collapsed, did = collapse_repetition(text)
+            if did:
+                logger.warning(
+                    "ASR 输出疑似解码退化，已塌缩: %r -> %r",
+                    text[:80], collapsed,
+                )
+                text = collapsed
+        return text, language_detected
+
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
         language_detected = None
@@ -642,7 +662,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         text = responses[0].get("output_text", "")
         if text == "TensorRT Edge LLM cannot handle this request. Fails.":
             raise RuntimeError(f"ASR inference failed (model returned error): {responses[0]}")
-        text, language_detected = self._strip_language_prefix(text)
+        text, language_detected = self._postprocess_text(text)
         total_s = elapsed_mel_s + elapsed_worker
         return TranscriptionResult(
             text=text,
@@ -790,7 +810,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             if text == "TensorRT Edge LLM cannot handle this request. Fails.":
                 raise RuntimeError(f"ASR inference failed (model returned error): {r}")
 
-            text, language_detected = self._strip_language_prefix(text)
+            text, language_detected = self._postprocess_text(text)
             return TranscriptionResult(
                 text=text,
                 language=language_detected,
@@ -1105,13 +1125,13 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                 self._audio_accum = self._audio_accum[-carry_samples:].copy()
             return resp
         if event == "partial":
-            stripped, lang = self._backend._strip_language_prefix(resp.get("text", "") or "")
+            stripped, lang = self._backend._postprocess_text(resp.get("text", "") or "")
             self._partial_text = stripped.strip()
             if lang:
                 self._detected_language = lang
             return resp
         if event == "final":
-            stripped, lang = self._backend._strip_language_prefix(resp.get("text", "") or "")
+            stripped, lang = self._backend._postprocess_text(resp.get("text", "") or "")
             self._final_text = stripped.strip()
             if lang:
                 self._detected_language = lang
