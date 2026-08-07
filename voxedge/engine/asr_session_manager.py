@@ -401,9 +401,14 @@ class ASRSessionManager:
         except asyncio.TimeoutError:
             logger.warning(
                 "ASRSessionManager: cancel(%s) timed out from state=%s; restarting "
-                "worker (NOT closing stream — _cancel_call thread may still hold it)",
+                "worker (NOT closing stream now — _cancel_call thread may still hold it)",
                 reason, prev_state,
             )
+            # 这里不能同步 close（见上面 P3 注释），但也不能就此撒手：只有
+            # trt_edge_llm 实现了 restart_worker，其他后端走到这里就永久漏掉
+            # 这一段的 stream。挂一个延迟回收 —— 等 _cancel_call 线程真正返回
+            # 后再 close，那时已无并发访问，不构成竞争。
+            self._schedule_deferred_close(fut, stream)
             await self._maybe_restart_worker()
         except Exception as exc:  # noqa: BLE001
             thread_done = True  # future raised → the executor call has returned
@@ -498,10 +503,38 @@ class ASRSessionManager:
             self._stream = None
             self._state = SessionState.IDLE
 
+    def _schedule_deferred_close(self, fut: "asyncio.Future", stream: Any) -> None:
+        """超时后把 stream 的回收推迟到 _cancel_call 线程返回之时。
+
+        close 本身可能阻塞（C++ 侧同步调用），所以不在 done_callback 里直接跑，
+        而是丢给默认线程池 —— 不能用 self._executor，那正是可能被卡住的那个槽。
+        若该线程永不返回，回收也就无从谈起，这是卡死线程的固有代价。
+        """
+        def _on_done(_f: "asyncio.Future") -> None:
+            try:
+                loop = self._get_loop()
+                loop.run_in_executor(None, _safe_close_stream, stream)
+            except Exception:  # noqa: BLE001
+                _safe_close_stream(stream)
+            logger.info("ASRSessionManager: deferred close of timed-out stream scheduled")
+
+        try:
+            fut.add_done_callback(_on_done)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ASRSessionManager: deferred close not scheduled: %s", exc)
+
     async def _maybe_restart_worker(self) -> None:
         backend = self._backend
         fn = getattr(backend, "restart_worker", None)
         if fn is None:
+            # 只有 trt_edge_llm 实现了 restart_worker。别的后端到这里没有 worker
+            # 级回收手段，靠上面的延迟 close 兜底 —— 但要留下痕迹，否则这条路径
+            # 在日志里完全不可见。
+            logger.warning(
+                "ASRSessionManager: backend %s has no restart_worker(); relying on "
+                "deferred stream close for reclamation",
+                type(backend).__name__,
+            )
             return
         # IMPORTANT: do NOT submit to ``self._executor`` (the single-thread
         # ASR slot that may be wedged). The default executor (None) is a
