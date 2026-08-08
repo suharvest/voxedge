@@ -158,10 +158,21 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-voxedge **0.0.7a0** is the current release; **0.0.6a1** is what the qualified
-TensorRT Edge-LLM v0.9.1 OVS runtime still pins.
+voxedge **0.0.8a0** is the current release; the qualified TensorRT Edge-LLM
+v0.9.1 OVS runtime pins it as of 2026-08-08.
 
-0.0.7a0 carries two field fixes and one **breaking** change:
+0.0.8a0 adds a guard against decoder degeneration on short audio. Qwen3-ASR
+under greedy decoding (`top_k=1`) collapses into looping repeats: a 300ms
+fragment transcribed as "帮我，" repeated 128 times. This is **not** a streaming
+bug — the offline `/asr` path produces byte-identical output. The worker accepts
+only `temperature`/`top_k`/`top_p`/`max_generate_length`, with no repetition
+penalty, so the guard lives in the text layer, at the shared exit both paths go
+through. It is deliberately conservative: word-based with a 6-repeat threshold
+for space-separated languages (so `the the the` survives), character-based for
+CJK (8 repeats for single characters, 3 for longer units), and in both cases the
+repeat must cover 80% of the text. Two-fold repeats are left alone.
+
+0.0.7a0 carried two field fixes and one **breaking** change:
 
 * Arabic digits are normalized to spoken Chinese before lexicon lookup. The
   matcha-icefall-zh-en token table contains no Arabic digit, and a lookup miss
