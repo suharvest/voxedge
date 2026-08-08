@@ -11,7 +11,7 @@ Qwen3-ASR 在短音频上会退化成整段复读：300ms 片段实测输出「�
 from __future__ import annotations
 
 import re
-from typing import List, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 # 中文按字符切分，「对对对」「好好好」是正常说法，所以单字门槛远高于多字。
 _MIN_REPEATS_SINGLE_CHAR = 8
@@ -25,33 +25,36 @@ _MIN_COVERAGE = 0.8
 _SEPARATORS = "，,。.、！!？?；;：: \t\n"
 
 
-def _find_period(seq: Sequence, min_repeats_short: int, min_repeats_long: int):
-    """返回 (单元, 重复份数, 被覆盖长度)；找不到返回 None。
+def _find_period(
+    seq: Sequence, min_repeats: int, min_repeats_single: Optional[int] = None
+) -> Optional[Sequence]:
+    """找出能解释整段的最短周期单元；找不到返回 None。
 
     单元长度从短到长试，取最短周期 —— 否则「帮我，」×4 会得到「帮我，帮我」。
+    ``min_repeats_single`` 只对单元长度为 1 的情况生效（中文单字重复门槛更高）；
+    不传则与 ``min_repeats`` 相同。
     """
     n = len(seq)
     if n < 4:
         return None
-    for unit_len in range(1, n // 2 + 1):
+    # 单元最长只需试到 n // 最小门槛：更长的单元不可能重复够份数。
+    max_unit_len = n // min(min_repeats, min_repeats_single or min_repeats)
+    for unit_len in range(1, max_unit_len + 1):
         unit = seq[:unit_len]
         repeats = 1
         while seq[repeats * unit_len:(repeats + 1) * unit_len] == unit:
             repeats += 1
-        if repeats < 2:
-            continue
-        need = min_repeats_short if unit_len == 1 else min_repeats_long
+        need = min_repeats_single if unit_len == 1 and min_repeats_single else min_repeats
         if repeats < need:
             continue
         covered = repeats * unit_len
-        # 尾部允许残缺一份（被 max_generate_length 截断），同样算进覆盖率，
+        # 尾部残缺一份（被 max_generate_length 截断）时整段仍算被覆盖，
         # 否则截断反而让守卫失效。
-        tail = seq[covered:]
-        if tail and unit[:len(tail)] == tail:
-            covered += len(tail)
+        if unit[:n - covered] == seq[covered:]:
+            covered = n
         if covered < _MIN_COVERAGE * n:
             continue
-        return unit, repeats, covered
+        return unit
     return None
 
 
@@ -68,30 +71,24 @@ def collapse_repetition(text: str) -> Tuple[str, bool]:
     已知局限：只重复 2 份不会被收 —— 2 份与正常的强调式重复无法从文本上
     区分，宁可放过。
     """
-    if not text:
-        return text, False
-    stripped = text.strip()
+    stripped = text.strip() if text else ""
     if not stripped:
         return text, False
 
     if any(ch.isspace() for ch in stripped):
-        words: List[str] = re.split(r"\s+", stripped)
         # 逐词剥掉首尾标点再比较，让 "hello, hello, hello" 与
         # "hello hello hello." 走同一条判定。
-        core = [w.strip(_SEPARATORS) for w in words]
-        core = [w for w in core if w]
-        found = _find_period(core, _MIN_REPEATS_SPACED, _MIN_REPEATS_SPACED)
-        if found is None:
-            return text, False
-        unit, _, _ = found
-        return " ".join(unit), True
+        units: Sequence = [
+            w for w in (x.strip(_SEPARATORS) for x in re.split(r"\s+", stripped)) if w
+        ]
+        thresholds, joiner = (_MIN_REPEATS_SPACED,), " "
+    else:
+        units = [ch for ch in stripped if ch not in _SEPARATORS]
+        thresholds = (_MIN_REPEATS_MULTI_CHAR, _MIN_REPEATS_SINGLE_CHAR)
+        joiner = ""
 
-    core_chars = [ch for ch in stripped if ch not in _SEPARATORS]
-    found = _find_period(core_chars, _MIN_REPEATS_SINGLE_CHAR, _MIN_REPEATS_MULTI_CHAR)
-    if found is None:
-        return text, False
-    unit, _, _ = found
-    return "".join(unit), True
+    unit = _find_period(units, *thresholds)
+    return (joiner.join(unit), True) if unit else (text, False)
 
 
 __all__ = ["collapse_repetition"]

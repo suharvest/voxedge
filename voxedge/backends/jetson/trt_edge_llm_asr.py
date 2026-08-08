@@ -579,7 +579,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         （2026-08-08 orin-nx 实测），所以守卫必须放在共用位置而非流式那一侧。
         """
         text, language_detected = self._strip_language_prefix(text)
-        if text and getattr(self._config, "collapse_repetition", True):
+        if text and self._config.collapse_repetition:
             collapsed, did = collapse_repetition(text)
             if did:
                 logger.warning(
@@ -1319,7 +1319,7 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         所以每一处把 partial 当定稿用的地方都必须过这里，否则退化文本绕过守卫。
         当前调用点：轮转兜底、cancel_and_finalize。
         """
-        if not seg or not getattr(self._backend._config, "collapse_repetition", True):
+        if not seg or not self._backend._config.collapse_repetition:
             return seg
         collapsed, did = collapse_repetition(seg)
         if did:
