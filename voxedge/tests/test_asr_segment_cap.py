@@ -177,10 +177,9 @@ def test_cancel_and_finalize_collapses_degenerate_partial():
     stream, _ = _rotating_stream("帮我，" * 20)
     _feed(stream, seconds=1.0)
     stream._partial_text = "帮我，" * 20
-    try:
-        stream.cancel_and_finalize()
-    except Exception:
-        pass  # end 事件在 mock 上可能抛错，这里只关心 _final_text
+    # 不要无条件吞异常：那会掩盖将来清理路径上的回归。这个 mock 的 end 请求
+    # 返回 {}，cancel_and_finalize 不该抛错；真抛了就是回归，让它冒出来。
+    stream.cancel_and_finalize()
     assert stream._final_text == "帮我", (
         f"cancel_and_finalize 晋升了未塌缩的 partial: {stream._final_text!r}"
     )
