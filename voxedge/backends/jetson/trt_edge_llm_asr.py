@@ -51,6 +51,7 @@ from typing import Optional
 
 import numpy as np
 
+from voxedge.text.degenerate import collapse_repetition
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -158,6 +159,8 @@ class TRTEdgeLLMASRConfig:
     max_generate_length: int = 200
 
     min_audio_frames: int = 100
+    # 关掉后退化输出原样透传（排查用）。见 voxedge/text/degenerate.py
+    collapse_repetition: bool = True
 
     # Offline long-audio segmentation.
     offline_segment_enabled: bool = True
@@ -569,6 +572,23 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 logger.warning("restart_worker: kill failed: %s", exc)
         logger.info("ASR worker restarted (will respawn on next request)")
 
+    def _postprocess_text(self, text: str) -> tuple[str, Optional[str]]:
+        """所有 ASR 文本的公共出口：剥语言前缀 + 收掉自回归退化的整段复读。
+
+        离线与流式都经过这里 —— 两条路径在短音频上产出逐字相同的退化输出
+        （2026-08-08 orin-nx 实测），所以守卫必须放在共用位置而非流式那一侧。
+        """
+        text, language_detected = self._strip_language_prefix(text)
+        if text and getattr(self._config, "collapse_repetition", True):
+            collapsed, did = collapse_repetition(text)
+            if did:
+                logger.warning(
+                    "ASR 输出疑似解码退化，已塌缩: %r -> %r",
+                    text[:80], collapsed,
+                )
+                text = collapsed
+        return text, language_detected
+
     @staticmethod
     def _strip_language_prefix(text: str) -> tuple[str, Optional[str]]:
         language_detected = None
@@ -642,7 +662,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         text = responses[0].get("output_text", "")
         if text == "TensorRT Edge LLM cannot handle this request. Fails.":
             raise RuntimeError(f"ASR inference failed (model returned error): {responses[0]}")
-        text, language_detected = self._strip_language_prefix(text)
+        text, language_detected = self._postprocess_text(text)
         total_s = elapsed_mel_s + elapsed_worker
         return TranscriptionResult(
             text=text,
@@ -790,7 +810,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             if text == "TensorRT Edge LLM cannot handle this request. Fails.":
                 raise RuntimeError(f"ASR inference failed (model returned error): {r}")
 
-            text, language_detected = self._strip_language_prefix(text)
+            text, language_detected = self._postprocess_text(text)
             return TranscriptionResult(
                 text=text,
                 language=language_detected,
@@ -1105,13 +1125,18 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                 self._audio_accum = self._audio_accum[-carry_samples:].copy()
             return resp
         if event == "partial":
-            stripped, lang = self._backend._strip_language_prefix(resp.get("text", "") or "")
+            # partial 只剥语言前缀，不做退化塌缩：partial 会随音频增长反复重算，
+            # 一旦某一帧重复份数刚好越过门槛就会突然缩短，下一帧新词进来覆盖率
+            # 跌回门槛以下又恢复全文，字幕会来回抖。退化的判定留给 final。
+            stripped, lang = self._backend._strip_language_prefix(
+                resp.get("text", "") or ""
+            )
             self._partial_text = stripped.strip()
             if lang:
                 self._detected_language = lang
             return resp
         if event == "final":
-            stripped, lang = self._backend._strip_language_prefix(resp.get("text", "") or "")
+            stripped, lang = self._backend._postprocess_text(resp.get("text", "") or "")
             self._final_text = stripped.strip()
             if lang:
                 self._detected_language = lang
@@ -1141,7 +1166,11 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         if resp.get("event") == "final":
             seg = (self._final_text or "").strip()
         else:
-            seg = (self._partial_text or "").strip()
+            # 这条兜底路径把 partial 当成 final 提交，而 partial 是刻意不做
+            # 退化塌缩的（见 partial 分支注释）。既然它要被当作定稿写进
+            # _committed_text，就得在这里补上塌缩，否则长音频轮转时退化文本
+            # 会绕过守卫。
+            seg = self._collapse_if_promoted((self._partial_text or "").strip())
         if seg:
             self._committed_text = (
                 (self._committed_text + " " + seg).strip()
@@ -1283,8 +1312,28 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         finally:
             self._closed = True
 
+    def _collapse_if_promoted(self, seg: str) -> str:
+        """partial 被晋升为 final / 提交为定稿时补做退化塌缩。
+
+        partial 本身刻意不塌缩（会随音频增长反复重算，塌缩会让字幕抖动），
+        所以每一处把 partial 当定稿用的地方都必须过这里，否则退化文本绕过守卫。
+        当前调用点：轮转兜底、cancel_and_finalize。
+        """
+        if not seg or not getattr(self._backend._config, "collapse_repetition", True):
+            return seg
+        collapsed, did = collapse_repetition(seg)
+        if did:
+            logger.warning(
+                "ASR 被晋升为定稿的 partial 疑似退化，已塌缩: %r -> %r",
+                seg[:80], collapsed,
+            )
+            return collapsed
+        return seg
+
     def cancel_and_finalize(self) -> None:
-        self._final_text = self._partial_text
+        # 与轮转兜底同理：partial 刻意不塌缩，一旦被晋升为 final 就得补上，
+        # 否则退化文本从这条路径绕过守卫。
+        self._final_text = self._collapse_if_promoted(self._partial_text)
         self._cancelled = True
         # Send the `end` event but bound the wait to 500ms; if the worker is
         # unresponsive raise WorkerExitError so the caller can restart_worker().
