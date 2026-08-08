@@ -41,6 +41,14 @@ def test_collapses_degenerate(text: str, want: str) -> None:
         "",
         "嗯",
         "行行行行",                    # 单字 4 份，仍低于门槛 8
+        # 英文：以下都是合法说法，按字符切分会被黏成 thethethe / byebyebye
+        # 而误砍，所以空格分隔文本按词判定且门槛 6 份。
+        "the the the",
+        "bye bye bye",
+        "no no no no",
+        "very very very good",
+        "I need to check the M6 nut stock",
+        "ha ha ha ha ha",
     ],
 )
 def test_leaves_normal_text_alone(text: str) -> None:
@@ -60,6 +68,20 @@ def test_picks_shortest_period() -> None:
     """「帮我，」×4 不能塌成「帮我，帮我」。"""
     got, _ = collapse_repetition("帮我，帮我，帮我，帮我，")
     assert got == "帮我"
+
+
+def test_english_degeneration_still_caught() -> None:
+    """英文门槛提高到 6 份，但真的退化（几十上百份）仍要收掉。"""
+    got, collapsed = collapse_repetition("help me " * 30)
+    assert collapsed is True
+    assert got == "help me"
+
+
+def test_english_punctuated_repeats() -> None:
+    """逐词剥标点，"hello, hello, ..." 与无标点走同一判定。"""
+    got, collapsed = collapse_repetition("hello, " * 10)
+    assert collapsed is True
+    assert got == "hello"
 
 
 def test_mixed_content_not_collapsed() -> None:

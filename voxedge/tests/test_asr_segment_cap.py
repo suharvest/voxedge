@@ -125,3 +125,62 @@ def test_rotate_uses_partial_when_worker_rotates_on_finalize():
     s._begin = lambda: None
     s._rotate_segment()
     assert s._committed_text == "partial words"
+
+
+# ── 退化塌缩：partial 被晋升为定稿的两条路径 ────────────────────────────
+# codex review 2026-08-08 指出原测试只覆盖轮转拼接，没验证新加的塌缩。
+
+class _RotationBackend(_MockBackend):
+    """强制 finalize 返回 segment_rotation 而非 final，逼走 partial 兜底路径。"""
+
+    def __init__(self, config, partial_text):
+        super().__init__(config, finals=[])
+        self._partial_text = partial_text
+
+    def _worker_request(self, ev):
+        e = ev.get("event")
+        if e == "begin":
+            self.begin_count += 1
+            return {"event": "begin_ack"}
+        if e == "chunk":
+            if ev.get("last"):
+                self.last_true_count += 1
+                return {"event": "segment_rotation", "carryover_sec": 0.0}
+            return {"event": "partial", "text": self._partial_text}
+        return {}
+
+
+def _rotating_stream(partial_text, *, collapse=True):
+    cfg = TRTEdgeLLMASRConfig(collapse_repetition=collapse)
+    be = _RotationBackend(cfg, partial_text)
+    return _TRTEdgeLLMStreamingASRStream(be), be
+
+
+def test_rotation_fallback_collapses_degenerate_partial():
+    stream, _ = _rotating_stream("帮我，" * 20)
+    _feed(stream, seconds=1.0)
+    stream._rotate_segment()
+    assert stream._committed_text == "帮我", (
+        f"轮转兜底把未塌缩的退化 partial 提交了: {stream._committed_text!r}"
+    )
+
+
+def test_rotation_fallback_respects_disable_switch():
+    raw = "帮我，" * 20
+    stream, _ = _rotating_stream(raw, collapse=False)
+    _feed(stream, seconds=1.0)
+    stream._rotate_segment()
+    assert stream._committed_text == raw.strip(), "关掉开关后不应塌缩"
+
+
+def test_cancel_and_finalize_collapses_degenerate_partial():
+    stream, _ = _rotating_stream("帮我，" * 20)
+    _feed(stream, seconds=1.0)
+    stream._partial_text = "帮我，" * 20
+    try:
+        stream.cancel_and_finalize()
+    except Exception:
+        pass  # end 事件在 mock 上可能抛错，这里只关心 _final_text
+    assert stream._final_text == "帮我", (
+        f"cancel_and_finalize 晋升了未塌缩的 partial: {stream._final_text!r}"
+    )

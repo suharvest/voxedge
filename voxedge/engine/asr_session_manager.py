@@ -124,6 +124,10 @@ class ASRSessionManager:
     # falling back to a full worker restart).
     _REBUILD_BACKOFF_S = (0.05, 0.15, 0.40)
     _CANCEL_ACK_TIMEOUT_S = 0.5
+    # 建流前等待仍在进行的 restart_worker 的上界。取值高于典型重启耗时（杀进程
+    # + 下次请求时懒重建），但要远低于用户能感知的卡顿；超时后放行，理由见
+    # _await_pending_restart。
+    _RESTART_WAIT_TIMEOUT_S = 3.0
 
     def __init__(
         self,
@@ -148,6 +152,8 @@ class ASRSessionManager:
         self._state: SessionState = SessionState.IDLE
         self._stream: Any = None
         self._generation: int = 0
+        # 仍在执行的 restart_worker future（见 _await_pending_restart）。
+        self._restart_future: Optional[asyncio.Future] = None
         # Lock-free preemption signal. ``cancel``/``on_speech_start`` bump this
         # BEFORE contending for ``_lock`` so an in-flight ``finalize`` (which,
         # per F1, holds ``_lock`` across its whole worker op) can detect that it
@@ -206,6 +212,13 @@ class ASRSessionManager:
                 await self._inner_cancel(reason="speech_start_preempt")
             elif self._state == SessionState.CANCELLING:
                 pass
+
+            # 新流的 begin 不能和仍在跑的 restart_worker 撞上：restart 正在杀
+            # worker 进程，而 begin 会 _ensure_worker 重新拉起，两者用的是不同的
+            # 锁（manager 的 asyncio 锁管不到后端的 worker 锁）。
+            # 这条路径在外层取消 _maybe_restart_worker 时真实存在：executor 线程
+            # 停不下来，而 _inner_cancel 的 finally 已经复位 IDLE 放开了锁。
+            await self._await_pending_restart()
 
             self._generation += 1
             try:
@@ -394,9 +407,26 @@ class ASRSessionManager:
         # stream.close() from the coroutine side would then race that thread
         # (the asyncio lock doesn't extend to executor threads). Leave it to
         # restart_worker to reclaim the worker-side resources instead.
+        # 状态复位与资源回收放进 finally，而不是逐个 except 分支各写一遍。
+        # 逐分支写法挡不住「在 except 块内部再抛异常」：那时同级 handler 已经
+        # 用过，新异常直接逃逸。真实窗口是下面 TimeoutError 分支里的
+        # `await self._maybe_restart_worker()` —— 外层 asr_loop.py:111 的 2s
+        # wait_for 正好可能在这个 await 点注入 CancelledError，于是既复位不了
+        # 状态（永久卡在 CANCELLING，拒绝后续所有会话），也可能漏挂回收。
+        # finally 与异常路径无关，是唯一能覆盖全部逃逸口的写法。
         thread_done = False
+        deferred_scheduled = False
         try:
-            await asyncio.wait_for(fut, timeout=self._CANCEL_ACK_TIMEOUT_S)
+            # shield 是必须的，不是保险起见：wait_for 超时会把它等待的 future
+            # 直接置为 CANCELLED，而 executor 线程根本停不下来。不 shield 的话
+            # fut 立刻 done → 下面挂的延迟 close 回调马上触发 → 正好在
+            # _cancel_call 仍持有该 C++ stream 时去 close，等于把上面 P3 注释
+            # 警告的竞争又引回来。实测顺序（2026-08-08）：
+            #   未 shield: callback(cancelled=True) → timeout → cancel 返回
+            #   加 shield: timeout → cancel 返回 → callback(cancelled=False)
+            await asyncio.wait_for(
+                asyncio.shield(fut), timeout=self._CANCEL_ACK_TIMEOUT_S
+            )
             thread_done = True
         except asyncio.TimeoutError:
             logger.warning(
@@ -409,7 +439,18 @@ class ASRSessionManager:
             # 这一段的 stream。挂一个延迟回收 —— 等 _cancel_call 线程真正返回
             # 后再 close，那时已无并发访问，不构成竞争。
             self._schedule_deferred_close(fut, stream)
+            deferred_scheduled = True
             await self._maybe_restart_worker()
+        except asyncio.CancelledError:
+            # 外层任务被取消 —— 真实路径：asr_loop.py:111 用
+            # wait_for(mgr.cancel(...), timeout=2.0) 包了这个协程。CancelledError
+            # 继承 BaseException，下面的 `except Exception` 接不住它。
+            # 回收与状态复位交给 finally，这里只记日志并把取消语义透传出去。
+            logger.warning(
+                "ASRSessionManager: cancel(%s) was cancelled from outside (state=%s)",
+                reason, prev_state,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             thread_done = True  # future raised → the executor call has returned
             if _is_worker_protocol_error(exc):
@@ -420,9 +461,16 @@ class ASRSessionManager:
                 await self._maybe_restart_worker()
             else:
                 logger.info("ASRSessionManager: cancel(%s) swallowed exc=%s", reason, exc)
-        if thread_done:
-            _safe_close_stream(stream)
-        self._state = SessionState.IDLE
+        finally:
+            if thread_done:
+                # executor 调用已返回（正常或抛错），没有并发访问，直接同步收。
+                _safe_close_stream(stream)
+            elif not deferred_scheduled:
+                # 线程可能还在跑，只能延迟收。走到这里的有：外层取消、
+                # TimeoutError 分支里 restart_worker 期间被取消、以及将来任何
+                # 新增的逃逸路径 —— 这正是用 finally 而非逐分支的理由。
+                self._schedule_deferred_close(fut, stream)
+            self._state = SessionState.IDLE
 
     def mark_error(self, exc: BaseException) -> None:
         """Synchronous shim so accept_waveform threads / partial pollers
@@ -509,8 +557,28 @@ class ASRSessionManager:
         close 本身可能阻塞（C++ 侧同步调用），所以不在 done_callback 里直接跑，
         而是丢给默认线程池 —— 不能用 self._executor，那正是可能被卡住的那个槽。
         若该线程永不返回，回收也就无从谈起，这是卡死线程的固有代价。
+
+        已知约束（codex review 2026-08-08，未解决，非阻塞）：超时后本 manager
+        会立即复位 IDLE，新会话可以马上建流，而这里的延迟 close 稍后才在另一个
+        线程池里执行 —— 于是旧流的 close 可能与新流的操作在时间上交叠。对
+        trt_edge_llm 是安全的：它的 close 发的是 ``{"event":"end","id":
+        <session_id>}``，按会话 id 隔离，动不到新会话。但本 manager 是通用的，
+        无法为所有后端担保跨流 close 的线程安全 —— 新增后端时需自行确认。
         """
-        def _on_done(_f: "asyncio.Future") -> None:
+        def _on_done(f: "asyncio.Future") -> None:
+            # 被取消说明线程仍可能在跑（见 _inner_cancel 里的 shield 注释），
+            # 这时 close 就是在制造竞争 —— 宁可漏收也不能并发访问。
+            if f.cancelled():
+                logger.warning(
+                    "ASRSessionManager: cancel future was cancelled; skipping "
+                    "deferred close to avoid racing the executor thread"
+                )
+                return
+            # 取一次异常，避免 "exception was never retrieved" 噪音。
+            try:
+                f.exception()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 loop = self._get_loop()
                 loop.run_in_executor(None, _safe_close_stream, stream)
@@ -540,11 +608,46 @@ class ASRSessionManager:
         # ASR slot that may be wedged). The default executor (None) is a
         # multi-thread pool and is always free.
         loop = self._get_loop()
+        fut = loop.run_in_executor(None, fn)
+        # 记下这个 future：本协程可能在下面的 await 处被外层取消，而 executor
+        # 线程照跑不误（正在杀 worker 进程）。此时 _inner_cancel 的 finally 已
+        # 复位 IDLE 并放开锁，新会话可以立刻建流并发 begin —— begin 会
+        # _ensure_worker 把 worker 重新拉起，和仍在杀它的 restart 撞车，且两者
+        # 用不同的锁。所以建流前必须先等这个 future（见 _await_pending_restart）。
+        self._restart_future = fut
         try:
-            await loop.run_in_executor(None, fn)
+            # shield 理由同 _inner_cancel：被取消时不能让 fut 变成 CANCELLED，
+            # 否则 _await_pending_restart 会以为重启已结束而放行建流。
+            await asyncio.shield(fut)
             logger.info("ASRSessionManager: backend.restart_worker() completed")
         except Exception as exc:  # noqa: BLE001
             logger.warning("ASRSessionManager: restart_worker failed: %s", exc)
+
+    async def _await_pending_restart(self) -> None:
+        """建流前等待仍在进行的 restart_worker 结束。
+
+        只等有界时间：restart 本身卡死时，宁可让新会话带着风险继续，也不能把
+        整个 ASR 无限期挂起 —— 后者是用户可见的完全不可用。
+        """
+        fut = self._restart_future
+        if fut is None or fut.done():
+            self._restart_future = None
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(fut), timeout=self._RESTART_WAIT_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "ASRSessionManager: restart_worker still running after %.1fs; "
+                "creating the new stream anyway (worker state may be racy)",
+                self._RESTART_WAIT_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            if fut.done():
+                self._restart_future = None
 
 
 __all__ = ["ASRSessionManager", "ASRSessionUnavailable", "SessionState"]

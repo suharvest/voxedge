@@ -1125,7 +1125,12 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
                 self._audio_accum = self._audio_accum[-carry_samples:].copy()
             return resp
         if event == "partial":
-            stripped, lang = self._backend._postprocess_text(resp.get("text", "") or "")
+            # partial 只剥语言前缀，不做退化塌缩：partial 会随音频增长反复重算，
+            # 一旦某一帧重复份数刚好越过门槛就会突然缩短，下一帧新词进来覆盖率
+            # 跌回门槛以下又恢复全文，字幕会来回抖。退化的判定留给 final。
+            stripped, lang = self._backend._strip_language_prefix(
+                resp.get("text", "") or ""
+            )
             self._partial_text = stripped.strip()
             if lang:
                 self._detected_language = lang
@@ -1161,7 +1166,11 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         if resp.get("event") == "final":
             seg = (self._final_text or "").strip()
         else:
-            seg = (self._partial_text or "").strip()
+            # 这条兜底路径把 partial 当成 final 提交，而 partial 是刻意不做
+            # 退化塌缩的（见 partial 分支注释）。既然它要被当作定稿写进
+            # _committed_text，就得在这里补上塌缩，否则长音频轮转时退化文本
+            # 会绕过守卫。
+            seg = self._collapse_if_promoted((self._partial_text or "").strip())
         if seg:
             self._committed_text = (
                 (self._committed_text + " " + seg).strip()
@@ -1303,8 +1312,28 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         finally:
             self._closed = True
 
+    def _collapse_if_promoted(self, seg: str) -> str:
+        """partial 被晋升为 final / 提交为定稿时补做退化塌缩。
+
+        partial 本身刻意不塌缩（会随音频增长反复重算，塌缩会让字幕抖动），
+        所以每一处把 partial 当定稿用的地方都必须过这里，否则退化文本绕过守卫。
+        当前调用点：轮转兜底、cancel_and_finalize。
+        """
+        if not seg or not getattr(self._backend._config, "collapse_repetition", True):
+            return seg
+        collapsed, did = collapse_repetition(seg)
+        if did:
+            logger.warning(
+                "ASR 被晋升为定稿的 partial 疑似退化，已塌缩: %r -> %r",
+                seg[:80], collapsed,
+            )
+            return collapsed
+        return seg
+
     def cancel_and_finalize(self) -> None:
-        self._final_text = self._partial_text
+        # 与轮转兜底同理：partial 刻意不塌缩，一旦被晋升为 final 就得补上，
+        # 否则退化文本从这条路径绕过守卫。
+        self._final_text = self._collapse_if_promoted(self._partial_text)
         self._cancelled = True
         # Send the `end` event but bound the wait to 500ms; if the worker is
         # unresponsive raise WorkerExitError so the caller can restart_worker().
