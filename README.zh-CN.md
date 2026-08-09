@@ -158,8 +158,30 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 ## 状态
 
-voxedge **0.0.8a0** 为当前版本；通过 TensorRT Edge-LLM v0.9.1 验收的 OVS 运行时
-自 2026-08-08 起固定在该版本。
+voxedge **0.0.9a0** 为当前版本；通过 TensorRT Edge-LLM v0.9.1 验收的 OVS 运行时
+自 2026-08-09 起固定在该版本。
+
+0.0.9a0 把 sherpa SenseVoice 后端里两个本该由部署方决定、却写死在库里的选择放了出来。
+`use_itn` 原本恒为 `True`；ITN 不只是标点，它还决定数字形态（`9点`/`九点`）、英文大小写，
+在 2024-07-17 导出上甚至会改词（`开放时间`/`开饭时间`）。而在 2025-09-09 导出上，
+`use_itn=True` 会直接吞掉首字 —— 写死的这个值在那里是有害的，调用方却无从关闭。
+现由 `SherpaASRConfig.offline_use_itn` 控制，默认仍为 `True`，现有部署行为逐字节不变。
+
+`transcribe(audio, language=...)` 另有一处：它收下 per-request 的 language 后完全不用，
+却把它原样填回 `TranscriptionResult.language` —— 调用方请求 `zh`，拿到一个自称 `zh` 的
+结果，而 recognizer 实际跑在 `auto`。SenseVoice 在构造 recognizer 时绑定语言，要让
+per-request 生效就得每种语言各驻留一份模型（各约 237 MB）。因此改为部署级 pin
+（`offline_language`），并让结果诚实汇报 recognizer 实际构造时所用的语言，对冲突的请求
+按取值各警告一次。需注意该 pin 只是弱提示：设定后，其他受支持语种的音频依然按其本身
+语言输出，差异主要在标点位置。
+
+0.0.9a0 同时统一了 `TranscriptionResult.language` 的语义。此前各后端错法不一且方向相反：
+sherpa 与 Paraformer-TRT 把调用方的请求原样回显 —— 而 Paraformer 压根没有语言开关，
+该参数从未传到解码器；SenseVoice-TRT 则相反，语言真的生效了却恒报 `None`。
+现在该字段一律表示**后端实际解码时所用的语言**，后端不做语言选择时为 `None`。
+三种形态（配置级 pin / 逐次生效 / 完全不选语言）由
+`backends.base.resolve_reported_language()` 统一承载，避免同一套判断在各后端重复推导、
+并各自推导歪掉。
 
 0.0.8a0 新增短音频解码退化的塌缩守卫。Qwen3-ASR 在贪心解码（`top_k=1`）下会退化
 成整段复读：300ms 片段实测输出「帮我，」×128。这**不是**流式路径的问题 —— 同一段

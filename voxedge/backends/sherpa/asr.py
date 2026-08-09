@@ -32,6 +32,7 @@ from voxedge.backends.base import (
     ASRCapability,
     ASRStream,
     TranscriptionResult,
+    resolve_reported_language,
 )
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 #   OFFLINE_ASR_PROVIDER/ASR_PROVIDER → offline_provider  (default = streaming_provider)
 #   STREAMING_ASR_NUM_THREADS       → num_threads         (default 4)
 #   MODEL_DIR                       → model_root          (default "/opt/models")
+#   OFFLINE_ASR_USE_ITN             → offline_use_itn     (default True)
+#   OFFLINE_ASR_LANGUAGE            → offline_language    (default "" = auto)
 
 _DEFAULT_ASR_DIRS = {
     "zh_en": "/opt/models/paraformer-streaming",
@@ -69,6 +72,18 @@ class SherpaASRConfig:
     offline_provider: Optional[str] = None
     num_threads: int = 4
     model_root: str = "/opt/models"
+    # SenseVoice inverse text normalization. Controls punctuation, digit form
+    # (9点 vs 九点) and English casing — and on some exports it is not a pure
+    # post-process: the 2025-09-09 SenseVoice drops the leading character with
+    # ITN on. Kept True (the historical hardcoded value) so existing
+    # deployments are byte-identical unless they opt out.
+    offline_use_itn: bool = True
+    # SenseVoice binds its language at recognizer construction, not per stream,
+    # so this is a deployment-level pin, not a per-request switch. "" = auto.
+    # Note it is a weak hint: with a pin set, audio in another supported
+    # language is still transcribed in its own language; mainly punctuation
+    # placement shifts.
+    offline_language: str = ""
 
     def __post_init__(self) -> None:
         if self.streaming_model_dir is None:
@@ -259,6 +274,9 @@ class SherpaASRBackend(ASRBackend):
         self._config = config or SherpaASRConfig()
         self._online_recognizer = None
         self._offline_recognizer = None
+        # Per-request languages already warned about, so a chatty caller does
+        # not flood the log with the same notice on every utterance.
+        self._warned_languages: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -315,9 +333,24 @@ class SherpaASRBackend(ASRBackend):
             raise RuntimeError("Online recognizer not loaded; call preload() first")
         return SherpaASRStream(self._online_recognizer, self._config.language_mode)
 
+    def _effective_language(self, requested: str) -> str:
+        """Language actually decoded with.
+
+        SenseVoice binds its language when the recognizer is built, so a
+        per-request language cannot be honoured without loading a second copy
+        of the model (~237 MB each) — hence a config-level pin, reported here.
+        """
+        return resolve_reported_language(
+            requested,
+            honoured=self._config.offline_language or "auto",
+            backend=self.name,
+            warned=self._warned_languages,
+        )
+
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         if self._offline_recognizer is None:
             raise RuntimeError("Offline recognizer not loaded; call preload() first")
+        effective_language = self._effective_language(language)
 
         from voxedge.backends._deps import require
 
@@ -345,7 +378,7 @@ class SherpaASRBackend(ASRBackend):
         stream.accept_waveform(sample_rate, data)
         recognizer.decode_stream(stream)
         text = stream.result.text.strip()
-        return TranscriptionResult(text=text, language=language)
+        return TranscriptionResult(text=text, language=effective_language)
 
     # ------------------------------------------------------------------
     # Private loaders
@@ -411,11 +444,16 @@ class SherpaASRBackend(ASRBackend):
         model_path = os.path.join(model_dir, "model.int8.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
 
-        logger.info("Loading SenseVoice model from %s (provider=%s)", model_dir, cfg.offline_provider)
+        logger.info(
+            "Loading SenseVoice model from %s (provider=%s, use_itn=%s, language=%s)",
+            model_dir, cfg.offline_provider, cfg.offline_use_itn,
+            cfg.offline_language or "auto",
+        )
         recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
             tokens=tokens_path,
-            use_itn=True,
+            use_itn=cfg.offline_use_itn,
+            language=cfg.offline_language,
             provider=cfg.offline_provider,
         )
         logger.info("SenseVoice model loaded.")
