@@ -158,8 +158,27 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-voxedge **0.0.8a0** is the current release; the qualified TensorRT Edge-LLM
-v0.9.1 OVS runtime pins it as of 2026-08-08.
+voxedge **0.0.9a0** is the current release; the qualified TensorRT Edge-LLM
+v0.9.1 OVS runtime pins it as of 2026-08-09.
+
+0.0.9a0 stops the sherpa SenseVoice backend from hardcoding two decisions that
+belong to the deployment. `use_itn` was pinned to `True`; ITN is not merely
+punctuation — it also decides digit form (`9点` vs `九点`), English casing, and
+on the 2024-07-17 export even word choice (`开放时间` vs `开饭时间`). On the
+2025-09-09 export, `use_itn=True` drops the leading character outright, so the
+hardcoded value is actively harmful there with no way out. It is now
+`SherpaASRConfig.offline_use_itn`, still defaulting to `True` so existing
+deployments are byte-identical.
+
+`transcribe(audio, language=...)` also accepted a per-request language, discarded
+it, and echoed it back in `TranscriptionResult.language` — a caller asking for
+`zh` got a reply claiming `zh` from a recognizer running in `auto`. SenseVoice
+binds language at recognizer construction, so honoring it per request would mean
+one resident model copy per language (~237 MB each). Instead the pin is
+deployment-level (`offline_language`) and the result now reports the language the
+recognizer was actually built with, warning once per distinct conflicting
+request. Note the pin is a weak hint: with it set, audio in another supported
+language is still transcribed in its own language; mainly punctuation shifts.
 
 0.0.8a0 adds a guard against decoder degeneration on short audio. Qwen3-ASR
 under greedy decoding (`top_k=1`) collapses into looping repeats: a 300ms
