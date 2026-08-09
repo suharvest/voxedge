@@ -180,6 +180,16 @@ recognizer was actually built with, warning once per distinct conflicting
 request. Note the pin is a weak hint: with it set, audio in another supported
 language is still transcribed in its own language; mainly punctuation shifts.
 
+0.0.9a0 also unifies what `TranscriptionResult.language` means. Backends were
+each wrong in a different direction: sherpa and Paraformer-TRT echoed the
+caller's request back untouched — and Paraformer has no language switch at all,
+so the parameter never reached its decoder — while SenseVoice-TRT applied the
+language and then reported `None`. The field now always describes what the
+backend actually decoded with, and is `None` when a backend selects no language.
+`backends.base.resolve_reported_language()` carries the three shapes (config
+pin / honoured per call / no selection) so the judgement is not re-derived, and
+re-derived wrongly, in every backend.
+
 0.0.8a0 adds a guard against decoder degeneration on short audio. Qwen3-ASR
 under greedy decoding (`top_k=1`) collapses into looping repeats: a 300ms
 fragment transcribed as "帮我，" repeated 128 times. This is **not** a streaming
