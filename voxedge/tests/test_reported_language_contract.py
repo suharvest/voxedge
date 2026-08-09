@@ -84,3 +84,25 @@ def test_warned_set_is_not_shared_between_backends(caplog):
         _resolve("zh", "yue", b)
     # Two independent backends each get to report the problem once.
     assert len(caplog.records) == 2
+
+
+# ── normalisation must be symmetric ─────────────────────────────────────────
+
+def test_honoured_side_is_normalised_too(caplog):
+    """A pin of "ZH" and a request of "zh" are the same language.
+
+    Regression: only `requested` was lowercased, `honoured` was compared raw.
+    OFFLINE_ASR_LANGUAGE=ZH (env values are .strip()'d, not lowercased) then made
+    every request warn "language 'zh' ignored — decoding as 'ZH'" and reported the
+    odd casing straight into the /asr response body.
+    """
+    with caplog.at_level(logging.WARNING):
+        assert _resolve("zh", "ZH") == "zh"
+        assert _resolve("zh", " Zh ") == "zh"
+    assert caplog.records == []
+
+
+def test_reported_value_is_normalised_even_without_a_request():
+    """Config casing must not leak into the API response."""
+    assert _resolve("auto", "  YUE ") == "yue"
+    assert _resolve(None, "ZH") == "zh"

@@ -81,7 +81,12 @@ def resolve_reported_language(
     that cannot be satisfied is reported once per distinct value via ``warned``,
     so a per-utterance caller does not flood the log.
     """
+    # Both sides are normalised: ``honoured`` often comes from a config/env
+    # value that was only stripped, so comparing it raw made a pin of "ZH" and
+    # a request of "zh" look like a conflict — a spurious warning plus the odd
+    # casing leaking into the reported language.
     requested = (requested or "auto").strip().lower() or "auto"
+    honoured = honoured.strip().lower() or None if honoured is not None else None
     if requested == "auto":
         return honoured
     if requested != (honoured or ""):
