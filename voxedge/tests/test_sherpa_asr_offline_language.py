@@ -58,3 +58,59 @@ def test_repeated_conflicts_warn_once_per_distinct_language(caplog):
         be._effective_language("zh")
     # One notice per distinct value — a per-utterance caller must not flood logs.
     assert len(caplog.records) == 2
+
+
+# ── the config must actually reach sherpa, not just exist ───────────────────
+
+def _fake_sherpa(captured: dict):
+    """Minimal stand-in for the sherpa_onnx module, capturing loader kwargs."""
+    import types
+
+    mod = types.ModuleType("sherpa_onnx")
+
+    class _OfflineRecognizer:
+        @staticmethod
+        def from_sense_voice(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+    mod.OfflineRecognizer = _OfflineRecognizer
+    return mod
+
+
+def _load_with(monkeypatch, tmp_path, **cfg_kwargs) -> dict:
+    import sys
+
+    captured: dict = {}
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", _fake_sherpa(captured))
+    model_dir = tmp_path / "sensevoice" / "sherpa-onnx-sense-voice-x"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.int8.onnx").write_bytes(b"\x00")
+    (model_dir / "tokens.txt").write_bytes(b"\x00")
+
+    be = SherpaASRBackend(
+        config=SherpaASRConfig(model_root=str(tmp_path), **cfg_kwargs)
+    )
+    be._load_offline_recognizer()
+    return captured
+
+
+def test_config_is_passed_through_to_from_sense_voice(monkeypatch, tmp_path):
+    """Guards the wiring, not just the dataclass.
+
+    Asserting only on SherpaASRConfig leaves the loader free to drift: someone
+    re-hardcoding use_itn=True, or dropping the language kwarg, would not fail
+    a single test. So assert on what sherpa actually receives.
+    """
+    captured = _load_with(
+        monkeypatch, tmp_path, offline_use_itn=False, offline_language="yue",
+    )
+    assert captured["use_itn"] is False
+    assert captured["language"] == "yue"
+
+
+def test_defaults_reach_sherpa_unchanged(monkeypatch, tmp_path):
+    """The historical hardcoded behaviour: ITN on, language unset (= auto)."""
+    captured = _load_with(monkeypatch, tmp_path)
+    assert captured["use_itn"] is True
+    assert captured["language"] == ""
