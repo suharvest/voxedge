@@ -32,6 +32,7 @@ from voxedge.backends.base import (
     ASRCapability,
     ASRStream,
     TranscriptionResult,
+    resolve_reported_language,
 )
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
@@ -333,26 +334,18 @@ class SherpaASRBackend(ASRBackend):
         return SherpaASRStream(self._online_recognizer, self._config.language_mode)
 
     def _effective_language(self, requested: str) -> str:
-        """Resolve the language actually used, warning when it is not the one asked for.
+        """Language actually decoded with.
 
         SenseVoice binds its language when the recognizer is built, so a
         per-request language cannot be honoured without loading a second copy
-        of the model (~237 MB each). Rather than silently pretending the
-        request took effect, report the language the recognizer was actually
-        built with and say so once per distinct requested value.
+        of the model (~237 MB each) — hence a config-level pin, reported here.
         """
-        effective = self._config.offline_language or "auto"
-        requested = (requested or "auto").strip() or "auto"
-        if requested != "auto" and requested != effective:
-            if requested not in self._warned_languages:
-                self._warned_languages.add(requested)
-                logger.warning(
-                    "Per-request language %r ignored: SenseVoice binds language at load "
-                    "time and this recognizer was built with %r. Pin it via the backend "
-                    "config (offline_language) instead.",
-                    requested, effective,
-                )
-        return effective
+        return resolve_reported_language(
+            requested,
+            honoured=self._config.offline_language or "auto",
+            backend=self.name,
+            warned=self._warned_languages,
+        )
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         if self._offline_recognizer is None:

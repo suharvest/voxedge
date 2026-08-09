@@ -19,12 +19,15 @@ heavy deps" guarantee. When the agent layer is itself packaged into voxedge
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncIterator, ClassVar, Iterator, Literal, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -44,11 +47,57 @@ class ASRCapability(str, Enum):
 
 @dataclass
 class TranscriptionResult:
-    """Mirrors app/core/asr_backend.py:29-33."""
+    """Mirrors app/core/asr_backend.py:29-33.
+
+    ``language`` is what the backend ACTUALLY decoded with — never an echo of
+    an unhonoured request. ``None`` means the backend performs no language
+    selection at all (a fixed single/dual-language model). Use
+    :func:`resolve_reported_language` to derive it.
+    """
 
     text: str
     language: Optional[str] = None
     meta: Optional[dict] = None
+
+
+def resolve_reported_language(
+    requested: Optional[str],
+    *,
+    honoured: Optional[str],
+    backend: str,
+    warned: set,
+) -> Optional[str]:
+    """Reconcile the language a caller asked for with the one a backend can deliver.
+
+    Backends differ in how much of a per-request language they can honour:
+    SenseVoice binds it when the recognizer is constructed, SenseVoice-TRT maps
+    it per call, Paraformer has no language switch whatsoever. What they must
+    NOT do is accept the parameter, ignore it, and hand it back in
+    ``TranscriptionResult.language`` — a caller asking for ``zh`` then gets a
+    reply claiming ``zh`` from a decoder that never saw the request.
+
+    ``honoured`` is what the backend will really use (``None`` when it selects
+    no language). The return value is what belongs in the result. A request
+    that cannot be satisfied is reported once per distinct value via ``warned``,
+    so a per-utterance caller does not flood the log.
+    """
+    requested = (requested or "auto").strip().lower() or "auto"
+    if requested == "auto":
+        return honoured
+    if requested != (honoured or ""):
+        if requested not in warned:
+            warned.add(requested)
+            if honoured is None:
+                logger.warning(
+                    "%s: per-request language %r ignored — this backend selects no "
+                    "language; its model is fixed.", backend, requested,
+                )
+            else:
+                logger.warning(
+                    "%s: per-request language %r ignored — decoding as %r. Pin it in "
+                    "the backend config instead.", backend, requested, honoured,
+                )
+    return honoured
 
 
 class ASRStream(ABC):

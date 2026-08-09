@@ -36,6 +36,7 @@ from voxedge.backends.base import (
     ASRCapability,
     ASRStream,
     TranscriptionResult,
+    resolve_reported_language,
 )
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
@@ -654,6 +655,17 @@ class ParaformerTRTBackend(ASRBackend):
         self._tokens: list[str] = []
         self._ready = False
         self._enc_profile_ranges: list[tuple[int, int, int]] = []
+        self._warned_languages: set[str] = set()
+
+    def _report_language(self, requested: str) -> Optional[str]:
+        """Always None: this backend selects no language (fixed zh/en model).
+
+        `language` is part of the ASRBackend signature but never reaches the
+        Paraformer decoder, so a request for it cannot be honoured.
+        """
+        return resolve_reported_language(
+            requested, honoured=None, backend=self.name, warned=self._warned_languages,
+        )
 
     def create_context_bundle(self) -> "_ParaformerCtxBundle":
         enc_eng = self._engines.get("enc")
@@ -891,7 +903,7 @@ class ParaformerTRTBackend(ASRBackend):
                 logger.exception("paraformer transcribe: bundle destroy raised")
 
         full_text = decode_ids(all_token_ids, self._tokens)
-        return TranscriptionResult(text=full_text, language=language)
+        return TranscriptionResult(text=full_text, language=self._report_language(language))
 
     def transcribe_audio(self, audio: np.ndarray, language: str = "auto") -> TranscriptionResult:
         """Transcribe float32 audio array (16kHz, [-1,1])."""
@@ -960,7 +972,7 @@ class ParaformerTRTBackend(ASRBackend):
                 logger.exception("paraformer transcribe_audio: bundle destroy raised")
 
         full_text = "".join(all_text_parts)
-        return TranscriptionResult(text=full_text, language=language)
+        return TranscriptionResult(text=full_text, language=self._report_language(language))
 
     def create_stream(self, language: str = "auto") -> ASRStream:
         if not self._ready:

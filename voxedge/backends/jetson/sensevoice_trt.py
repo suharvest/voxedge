@@ -33,7 +33,13 @@ from typing import Optional
 
 import numpy as np
 
-from voxedge.backends.base import ASRBackend, ASRCapability, ASRStream, TranscriptionResult
+from voxedge.backends.base import (
+    ASRBackend,
+    ASRCapability,
+    ASRStream,
+    TranscriptionResult,
+    resolve_reported_language,
+)
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,7 @@ class SenseVoiceTRTBackend(ASRBackend):
         self._cmvn_scale = None
         self._emb = None
         self._sp = None
+        self._warned_languages: set[str] = set()
         self._lock = threading.Lock()  # single shared context; offline is serialized
         self._ready = False
 
@@ -169,12 +176,19 @@ class SenseVoiceTRTBackend(ASRBackend):
         if not self.is_ready():
             raise RuntimeError("SenseVoice TRT backend not ready — call preload() first")
         tag = _map_language(language)
+        # The tag really is applied (it selects the language token prepended to
+        # the input), so report it rather than None. _map_language falls back to
+        # "auto" for anything unsupported, which resolve_reported_language then
+        # surfaces as an ignored request instead of silently pretending.
+        reported = resolve_reported_language(
+            language, honoured=tag, backend=self.name, warned=self._warned_languages,
+        )
         speech, valid = self._build_speech(samples, lang=tag)
         logits = self._infer(speech)
         if logits is None:
-            return TranscriptionResult(text="", language=None, meta={})
+            return TranscriptionResult(text="", language=reported, meta={})
         return TranscriptionResult(
-            text=self._ctc_decode(logits, valid), language=None, meta={}
+            text=self._ctc_decode(logits, valid), language=reported, meta={}
         )
 
     def _infer(self, speech: np.ndarray):
