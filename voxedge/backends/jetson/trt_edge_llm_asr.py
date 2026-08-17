@@ -51,7 +51,7 @@ from typing import Optional
 
 import numpy as np
 
-from voxedge.text.degenerate import collapse_repetition
+from voxedge.text.degenerate import collapse_repetition, collapse_segment_repeats
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -840,8 +840,9 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             sample_rate,
             max_segment_s=self._config.offline_segment_threshold_s,
         )
-        texts: list[str] = []
-        last_language = language
+        # (text, language) per segment. Language is filled in after the loop for
+        # segments the model never labelled — see the unlabelled-segment note below.
+        parts: list[tuple[str, Optional[str]]] = []
         total_inference_s = 0.0
         total_mel_s = 0.0
         total_worker_s = 0.0
@@ -864,19 +865,40 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 )
                 continue
             if result.text:
-                texts.append(result.text)
-            last_language = result.language or last_language
+                parts.append((result.text, result.language))
             meta = result.meta or {}
             total_inference_s += float(meta.get("inference_time_s", 0.0) or 0.0)
             total_mel_s += float(meta.get("mel_time_s", 0.0) or 0.0)
             total_worker_s += float(meta.get("worker_time_s", 0.0) or 0.0)
 
+        # The ASR head prepends a "language <Lang>" tag to every well-formed
+        # transcript, and _strip_language_prefix turns that into `language`. A
+        # segment that comes back with `language=None` therefore never entered
+        # the decode contract the int4 recipe validates against — and in practice
+        # that is exactly when the output is degenerate: across a 35-minute
+        # episode every clean segment reported a language and the only looping
+        # one reported None. Treat the missing tag as the failure signal, label
+        # the segment from the rest of the file, and report the count so callers
+        # can see how much of the transcript is suspect.
+        texts, unlabelled, majority_language = _split_segment_parts(parts)
+        # collapse_repetition only sees one segment at a time, so a hallucination
+        # that repeats once per segment slips through it and only piles up at the
+        # join. Drop those runs here.
+        texts, repeated = collapse_segment_repeats(texts)
+        if repeated:
+            logger.warning(
+                "ASR: dropped %d segment(s) that repeated the previous segment verbatim",
+                repeated,
+            )
+
         return TranscriptionResult(
-            text=_join_segment_texts(texts, last_language or language),
-            language=last_language,
+            text=_join_segment_texts(texts, majority_language or language),
+            language=majority_language,
             meta={
                 "segmented": True,
                 "segment_count": len(segments),
+                "unlabelled_segments": unlabelled,
+                "repeated_segments": repeated,
                 "failed_segments": failed_segments,
                 "original_duration_s": round(original_duration_s, 3),
                 "inference_time_s": round(total_inference_s, 3),
@@ -955,6 +977,34 @@ def _split_offline_audio(
         for start in range(0, len(seg), max_samples):
             bounded.append(seg[start:start + max_samples])
     return [seg for seg in bounded if len(seg) > 0]
+
+
+def _split_segment_parts(
+    parts: list[tuple[str, Optional[str]]]
+) -> tuple[list[str], int, Optional[str]]:
+    """Return (texts, unlabelled_count, majority_language) for the segment results.
+
+    A segment whose ``language`` is None never emitted the "language <Lang>" head
+    tag, which means its decode left the contract the int4 recipe validates
+    against — in practice that is exactly when the text is degenerate. The count
+    goes into meta so callers can see how much of the transcript is suspect.
+
+    The majority language is derived from the segments that *did* report one, and
+    is used only to pick the join style and to report a file-level language. It is
+    deliberately not taken from the caller's request: that value never reaches the
+    decoder (the worker only ever *strips* the head tag, it never primes one), so
+    echoing it back would claim a detection that never happened.
+    """
+    labelled = [lang for _, lang in parts if lang]
+    majority = max(set(labelled), key=labelled.count) if labelled else None
+    unlabelled = sum(1 for _, lang in parts if not lang)
+    if unlabelled:
+        logger.warning(
+            "ASR: %d/%d offline segment(s) carried no language tag — their decode "
+            "left the expected contract, so that text is unreliable.",
+            unlabelled, len(parts),
+        )
+    return [text for text, _ in parts], unlabelled, majority
 
 
 def _join_segment_texts(texts: list[str], language: str | None) -> str:

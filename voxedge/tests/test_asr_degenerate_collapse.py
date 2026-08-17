@@ -90,3 +90,73 @@ def test_mixed_content_not_collapsed() -> None:
     got, collapsed = collapse_repetition(text)
     assert got == text
     assert collapsed is False
+
+
+# --- 尾部锚定：整段锚定要求周期从 index 0 起算，一个不重复的前缀就让守卫失效 ---
+
+
+def test_degeneration_behind_hallucinated_prefix() -> None:
+    """实测形态：模型先吐一个幻觉词再开始复读，前缀要留住、复读要收掉。
+
+    spark 上一个 4 秒片段返回「一方面，」+「我们看到，」×66，共 334 字。
+    只从 index 0 找周期时整段判不出周期，334 字原样返回。
+    """
+    got, collapsed = collapse_repetition("一方面，" + "我们看到，" * 66)
+    assert collapsed is True
+    assert got == "一方面，我们看到"
+
+
+def test_long_prefix_survives_tail_collapse() -> None:
+    """前缀是真实转写内容时，不能连它一起丢。"""
+    prefix = "是芝加哥种族单一化程度最高的社区之一"
+    got, collapsed = collapse_repetition(prefix + "我们看到，" * 40)
+    assert collapsed is True
+    assert got.startswith(prefix)
+    assert got == prefix + "我们看到"
+
+
+def test_english_tail_collapse_keeps_word_spacing() -> None:
+    """英文走词切分，拼回去时前缀与单元之间要留空格。"""
+    got, collapsed = collapse_repetition("so anyway " + "we see " * 20)
+    assert collapsed is True
+    assert got == "so anyway we see"
+
+
+def test_short_tail_repeat_not_collapsed() -> None:
+    """尾部只重复 2 份 —— 与正常强调无法区分，放过。"""
+    text = "他说了这句话。他说了这句话。"
+    got, collapsed = collapse_repetition(text)
+    assert collapsed is False
+    assert got == text
+
+
+# --- 误伤边界：正常语音里的周期性内容不能被当成解码退化 ---
+
+
+def test_periodic_phone_number_not_collapsed() -> None:
+    """口述的号码天然是周期型的，份数少，与退化的几十上百份区分得开。"""
+    for text in ("客服电话是123123123", "订单号 AB12AB12AB12", "他说了123123123这个号"):
+        got, collapsed = collapse_repetition(text)
+        assert collapsed is False, text
+        assert got == text
+
+
+def test_truncated_trailing_period_leaves_no_fragment() -> None:
+    """结尾被 max_generate_length 切在半份上时，不能选中旋转过的周期。"""
+    got, collapsed = collapse_repetition("前缀" + "我们看到" * 10 + "我们")
+    assert collapsed is True
+    assert got == "前缀我们看到"
+    got, collapsed = collapse_repetition("prefix " + "we see " * 10 + "we")
+    assert collapsed is True
+    assert got == "prefix we see"
+
+
+def test_oversized_input_skips_tail_scan() -> None:
+    """尾部搜索最坏是 O(n^2)，超长输入宁可放过也不能成为性能雷区。"""
+    from voxedge.text.degenerate import _MAX_TAIL_SCAN_UNITS
+
+    text = "前缀" + "循环" * (_MAX_TAIL_SCAN_UNITS + 10)
+    got, collapsed = collapse_repetition(text)
+    # 整段锚定仍可能命中；这里只要求调用能在瞬间返回而不是卡死。
+    assert isinstance(collapsed, bool)
+    assert isinstance(got, str)

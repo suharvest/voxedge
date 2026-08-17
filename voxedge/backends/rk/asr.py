@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 # ── env → config mapping (defaults byte-equal to production env defaults) ────
 # Original env var                  → RKASRConfig field
 #   RK_PLATFORM                     → platform                 (default "rk3576")
+#     accepted: "rk3576" | "rk3588" | "rv1126b"
 #   ASR_ENERGY_SPLIT_RMS            → energy_split_rms         (default 0.003)
 #   ASR_ENERGY_MIN_SILENCE_MS       → energy_min_silence_ms    (default 120)
 #   (literal _LONG_AUDIO_THRESHOLD_S) → long_audio_threshold_s (default 15.0)
@@ -79,6 +80,16 @@ class RKASRConfig:
     here reads ``os.environ``.
 
     ``platform`` mirrors the old ``RK_PLATFORM`` env (default ``"rk3576"``).
+    Accepted values: ``"rk3576"``, ``"rk3588"``, ``"rv1126b"``.
+
+    NOTE — this field is descriptive, not the actual driver. The underlying
+    ``rkvoice_stream`` engine reads ``RK_PLATFORM`` from the **process
+    environment** at ``create_asr()`` time (it is not injected from this
+    dataclass), and uses it both to select the per-SoC ``.rknn`` and to pick
+    the ``init_runtime()`` convention (multi-core rk3576/rk3588 take an NPU
+    core mask; single-core rv1126b must init without one). So set the
+    ``RK_PLATFORM`` env and this field to the **same** value. For SenseVoice,
+    rv1126b and rk3576 use **w4a16** encoders and rk3588 uses **scaling-fp16**.
     The energy-split / long-audio-threshold fields were previously read from
     env *inside* the splitter on every call; they are now injected once.
 
@@ -98,7 +109,7 @@ class RKASRConfig:
     startup when this condition is detected.
     """
 
-    platform: str = "rk3576"
+    platform: str = "rk3576"  # "rk3576" | "rk3588" | "rv1126b"
     energy_split_rms: float = 0.003
     energy_min_silence_ms: int = 120
     long_audio_threshold_s: float = 15.0
