@@ -51,7 +51,7 @@ from typing import Optional
 
 import numpy as np
 
-from voxedge.text.degenerate import collapse_repetition
+from voxedge.text.degenerate import collapse_repetition, collapse_segment_repeats
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -840,7 +840,9 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             sample_rate,
             max_segment_s=self._config.offline_segment_threshold_s,
         )
-        texts: list[str] = []
+        # (text, language) per segment. Language is filled in after the loop for
+        # segments the model never labelled — see the unlabelled-segment note below.
+        parts: list[tuple[str, Optional[str]]] = []
         last_language = language
         total_inference_s = 0.0
         total_mel_s = 0.0
@@ -864,12 +866,32 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 )
                 continue
             if result.text:
-                texts.append(result.text)
+                parts.append((result.text, result.language))
             last_language = result.language or last_language
             meta = result.meta or {}
             total_inference_s += float(meta.get("inference_time_s", 0.0) or 0.0)
             total_mel_s += float(meta.get("mel_time_s", 0.0) or 0.0)
             total_worker_s += float(meta.get("worker_time_s", 0.0) or 0.0)
+
+        # The ASR head prepends a "language <Lang>" tag to every well-formed
+        # transcript, and _strip_language_prefix turns that into `language`. A
+        # segment that comes back with `language=None` therefore never entered
+        # the decode contract the int4 recipe validates against — and in practice
+        # that is exactly when the output is degenerate: across a 35-minute
+        # episode every clean segment reported a language and the only looping
+        # one reported None. Treat the missing tag as the failure signal, label
+        # the segment from the rest of the file, and report the count so callers
+        # can see how much of the transcript is suspect.
+        texts, unlabelled = _label_unlabelled_segments(parts, last_language or language)
+        # collapse_repetition only sees one segment at a time, so a hallucination
+        # that repeats once per segment slips through it and only piles up at the
+        # join. Drop those runs here.
+        texts, repeated = collapse_segment_repeats(texts)
+        if repeated:
+            logger.warning(
+                "ASR: dropped %d segment(s) that repeated the previous segment verbatim",
+                repeated,
+            )
 
         return TranscriptionResult(
             text=_join_segment_texts(texts, last_language or language),
@@ -877,6 +899,8 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             meta={
                 "segmented": True,
                 "segment_count": len(segments),
+                "unlabelled_segments": unlabelled,
+                "repeated_segments": repeated,
                 "failed_segments": failed_segments,
                 "original_duration_s": round(original_duration_s, 3),
                 "inference_time_s": round(total_inference_s, 3),
@@ -955,6 +979,30 @@ def _split_offline_audio(
         for start in range(0, len(seg), max_samples):
             bounded.append(seg[start:start + max_samples])
     return [seg for seg in bounded if len(seg) > 0]
+
+
+def _label_unlabelled_segments(
+    parts: list[tuple[str, Optional[str]]], fallback: Optional[str]
+) -> tuple[list[str], int]:
+    """Backfill the language of segments the model never labelled.
+
+    Returns (texts, unlabelled_count). The language of an unlabelled segment is
+    taken from the majority of its neighbours in the same file rather than from
+    the caller's request, because the request's ``language`` never reaches the
+    decoder — the worker only ever *strips* the head tag, it does not prime one.
+    Guessing per file keeps code-switched audio intact: the tag names the
+    dominant language and in-sentence foreign words survive either way.
+    """
+    labelled = [lang for _, lang in parts if lang]
+    majority = max(set(labelled), key=labelled.count) if labelled else fallback
+    unlabelled = sum(1 for _, lang in parts if not lang)
+    if unlabelled:
+        logger.warning(
+            "ASR: %d/%d offline segment(s) carried no language tag — their decode "
+            "left the expected contract, so the text is unreliable. Labelling them %r.",
+            unlabelled, len(parts), majority,
+        )
+    return [text for text, _ in parts], unlabelled
 
 
 def _join_segment_texts(texts: list[str], language: str | None) -> str:
