@@ -17,10 +17,34 @@ def test_run_of_identical_segments_collapsed() -> None:
 
 
 def test_trailing_punctuation_differences_still_match() -> None:
-    """同一句在不同段的收尾标点常不一样，比较前要剥掉。"""
-    got, dropped = collapse_segment_repeats(["A句。", "A句，", "A句！", "B"])
+    """同一句在不同段的收尾标点常不一样，比较前要剥掉尾部标点。"""
+    a = "这是一句足够长的话用来触发长段门槛"
+    got, dropped = collapse_segment_repeats([a + "。", a + "，", a + "！", "B"])
     assert dropped == 2
-    assert got == ["A句。", "B"]
+    assert got == [a + "。", "B"]
+
+
+def test_inner_punctuation_is_not_stripped() -> None:
+    """只剥尾部标点：剥掉句中标点会让语义不同的段撞键。"""
+    texts = ["不，行。", "不行。", "不，行！"]
+    got, dropped = collapse_segment_repeats(texts)
+    assert dropped == 0
+    assert got == texts
+
+
+def test_short_segments_need_more_repeats() -> None:
+    """VAD 把连续的短语切成三段是正常语音，不是退化。"""
+    for texts in (["啊"] * 3, ["对不起。"] * 3, ["嗯"] * 3):
+        got, dropped = collapse_segment_repeats(texts)
+        assert dropped == 0, texts
+        assert got == texts
+
+
+def test_short_segments_collapsed_once_run_is_long() -> None:
+    """短段连着六份就不再像正常强调了。"""
+    got, dropped = collapse_segment_repeats(["对不起。"] * 6)
+    assert dropped == 5
+    assert got == ["对不起。"]
 
 
 def test_two_identical_segments_left_alone() -> None:

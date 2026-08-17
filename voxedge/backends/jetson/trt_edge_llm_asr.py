@@ -843,7 +843,6 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         # (text, language) per segment. Language is filled in after the loop for
         # segments the model never labelled — see the unlabelled-segment note below.
         parts: list[tuple[str, Optional[str]]] = []
-        last_language = language
         total_inference_s = 0.0
         total_mel_s = 0.0
         total_worker_s = 0.0
@@ -867,7 +866,6 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 continue
             if result.text:
                 parts.append((result.text, result.language))
-            last_language = result.language or last_language
             meta = result.meta or {}
             total_inference_s += float(meta.get("inference_time_s", 0.0) or 0.0)
             total_mel_s += float(meta.get("mel_time_s", 0.0) or 0.0)
@@ -882,7 +880,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         # one reported None. Treat the missing tag as the failure signal, label
         # the segment from the rest of the file, and report the count so callers
         # can see how much of the transcript is suspect.
-        texts, unlabelled = _label_unlabelled_segments(parts, last_language or language)
+        texts, unlabelled, majority_language = _split_segment_parts(parts)
         # collapse_repetition only sees one segment at a time, so a hallucination
         # that repeats once per segment slips through it and only piles up at the
         # join. Drop those runs here.
@@ -894,8 +892,8 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             )
 
         return TranscriptionResult(
-            text=_join_segment_texts(texts, last_language or language),
-            language=last_language,
+            text=_join_segment_texts(texts, majority_language or language),
+            language=majority_language,
             meta={
                 "segmented": True,
                 "segment_count": len(segments),
@@ -981,28 +979,32 @@ def _split_offline_audio(
     return [seg for seg in bounded if len(seg) > 0]
 
 
-def _label_unlabelled_segments(
-    parts: list[tuple[str, Optional[str]]], fallback: Optional[str]
-) -> tuple[list[str], int]:
-    """Backfill the language of segments the model never labelled.
+def _split_segment_parts(
+    parts: list[tuple[str, Optional[str]]]
+) -> tuple[list[str], int, Optional[str]]:
+    """Return (texts, unlabelled_count, majority_language) for the segment results.
 
-    Returns (texts, unlabelled_count). The language of an unlabelled segment is
-    taken from the majority of its neighbours in the same file rather than from
-    the caller's request, because the request's ``language`` never reaches the
-    decoder — the worker only ever *strips* the head tag, it does not prime one.
-    Guessing per file keeps code-switched audio intact: the tag names the
-    dominant language and in-sentence foreign words survive either way.
+    A segment whose ``language`` is None never emitted the "language <Lang>" head
+    tag, which means its decode left the contract the int4 recipe validates
+    against — in practice that is exactly when the text is degenerate. The count
+    goes into meta so callers can see how much of the transcript is suspect.
+
+    The majority language is derived from the segments that *did* report one, and
+    is used only to pick the join style and to report a file-level language. It is
+    deliberately not taken from the caller's request: that value never reaches the
+    decoder (the worker only ever *strips* the head tag, it never primes one), so
+    echoing it back would claim a detection that never happened.
     """
     labelled = [lang for _, lang in parts if lang]
-    majority = max(set(labelled), key=labelled.count) if labelled else fallback
+    majority = max(set(labelled), key=labelled.count) if labelled else None
     unlabelled = sum(1 for _, lang in parts if not lang)
     if unlabelled:
         logger.warning(
             "ASR: %d/%d offline segment(s) carried no language tag — their decode "
-            "left the expected contract, so the text is unreliable. Labelling them %r.",
-            unlabelled, len(parts), majority,
+            "left the expected contract, so that text is unreliable.",
+            unlabelled, len(parts),
         )
-    return [text for text, _ in parts], unlabelled
+    return [text for text, _ in parts], unlabelled, majority
 
 
 def _join_segment_texts(texts: list[str], language: str | None) -> str:

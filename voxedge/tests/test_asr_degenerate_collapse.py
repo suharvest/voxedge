@@ -128,3 +128,35 @@ def test_short_tail_repeat_not_collapsed() -> None:
     got, collapsed = collapse_repetition(text)
     assert collapsed is False
     assert got == text
+
+
+# --- 误伤边界：正常语音里的周期性内容不能被当成解码退化 ---
+
+
+def test_periodic_phone_number_not_collapsed() -> None:
+    """口述的号码天然是周期型的，份数少，与退化的几十上百份区分得开。"""
+    for text in ("客服电话是123123123", "订单号 AB12AB12AB12", "他说了123123123这个号"):
+        got, collapsed = collapse_repetition(text)
+        assert collapsed is False, text
+        assert got == text
+
+
+def test_truncated_trailing_period_leaves_no_fragment() -> None:
+    """结尾被 max_generate_length 切在半份上时，不能选中旋转过的周期。"""
+    got, collapsed = collapse_repetition("前缀" + "我们看到" * 10 + "我们")
+    assert collapsed is True
+    assert got == "前缀我们看到"
+    got, collapsed = collapse_repetition("prefix " + "we see " * 10 + "we")
+    assert collapsed is True
+    assert got == "prefix we see"
+
+
+def test_oversized_input_skips_tail_scan() -> None:
+    """尾部搜索最坏是 O(n^2)，超长输入宁可放过也不能成为性能雷区。"""
+    from voxedge.text.degenerate import _MAX_TAIL_SCAN_UNITS
+
+    text = "前缀" + "循环" * (_MAX_TAIL_SCAN_UNITS + 10)
+    got, collapsed = collapse_repetition(text)
+    # 整段锚定仍可能命中；这里只要求调用能在瞬间返回而不是卡死。
+    assert isinstance(collapsed, bool)
+    assert isinstance(got, str)
