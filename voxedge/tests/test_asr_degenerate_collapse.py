@@ -90,3 +90,41 @@ def test_mixed_content_not_collapsed() -> None:
     got, collapsed = collapse_repetition(text)
     assert got == text
     assert collapsed is False
+
+
+# --- 尾部锚定：整段锚定要求周期从 index 0 起算，一个不重复的前缀就让守卫失效 ---
+
+
+def test_degeneration_behind_hallucinated_prefix() -> None:
+    """实测形态：模型先吐一个幻觉词再开始复读，前缀要留住、复读要收掉。
+
+    spark 上一个 4 秒片段返回「一方面，」+「我们看到，」×66，共 334 字。
+    只从 index 0 找周期时整段判不出周期，334 字原样返回。
+    """
+    got, collapsed = collapse_repetition("一方面，" + "我们看到，" * 66)
+    assert collapsed is True
+    assert got == "一方面，我们看到"
+
+
+def test_long_prefix_survives_tail_collapse() -> None:
+    """前缀是真实转写内容时，不能连它一起丢。"""
+    prefix = "是芝加哥种族单一化程度最高的社区之一"
+    got, collapsed = collapse_repetition(prefix + "我们看到，" * 40)
+    assert collapsed is True
+    assert got.startswith(prefix)
+    assert got == prefix + "我们看到"
+
+
+def test_english_tail_collapse_keeps_word_spacing() -> None:
+    """英文走词切分，拼回去时前缀与单元之间要留空格。"""
+    got, collapsed = collapse_repetition("so anyway " + "we see " * 20)
+    assert collapsed is True
+    assert got == "so anyway we see"
+
+
+def test_short_tail_repeat_not_collapsed() -> None:
+    """尾部只重复 2 份 —— 与正常强调无法区分，放过。"""
+    text = "他说了这句话。他说了这句话。"
+    got, collapsed = collapse_repetition(text)
+    assert collapsed is False
+    assert got == text
