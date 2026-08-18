@@ -16,6 +16,32 @@ Front end matches the lovemefan/sherpa export (identical to the RK backend):
 80-dim kaldi fbank (dither=0, hamming, snip_edges) -> LFR(m=7,n=6)=560 -> CMVN
 (am.mvn) -> prepend 4 prompt frames. CTC greedy + sentencepiece, strip <|...|>.
 
+Concurrency / buffers: ONE execution context, serialized by ``_lock``. Its device
+buffers (d_in/d_out) and CUDA stream are allocated once in ``preload()`` and
+reused by every ``_infer()`` call. ``config.max_concurrent`` does NOT add
+contexts — it only raises the server-side admission ceiling so extra callers
+queue instead of getting a 429; see ``concurrency_capability()``.
+
+Measured on orin-nano (trtexec 10.3 + in-process timing), two things this file
+deliberately does NOT do:
+
+* **No execution-context pool.** GR3D is already 98% at 1 stream and throughput
+  tops out at ~30 qps; ``--streams=2/4`` bought only 1.11x/1.13x (throughput is
+  enqueue-bound: CPU enqueue 36.98 ms vs GPU 37.02 ms) while costing +216/+302
+  MB and degrading latency to 135 ms at N=4. A single context with CUDA graphs
+  reaches the same 29.45 qps at a quarter of the memory.
+* **No pinned host buffer.** Pinned D2H really is faster (1.24 vs 4.77 ms), but
+  the shared block has to be copied out before the next request overwrites it,
+  and that copy costs 7.71 ms — host bandwidth (~4.5 GB/s), not a pinned
+  artefact, since a pageable numpy->numpy copy of the same size measured 7.70
+  ms. Net it was 0.7 ms *slower* than copying straight into a fresh array, plus
+  32.9 MB of page-locked memory.
+
+What does pay, and is kept: reusing the allocations (per-call ``cudaMalloc x2 +
+cudaFree x2 + StreamCreate/Destroy`` measured 5.36 ms) and transferring only the
+``valid`` frames instead of all ``T_FIXED`` (on a 3 s clip that is 54 rows of
+344 — 84% of a 34.5 MB copy that the decoder then discarded).
+
 env-free per voxedge convention: paths injected via SenseVoiceTRTConfig.
 ``tensorrt`` / ``cuda`` / ``kaldi_native_fbank`` / ``sentencepiece`` imports stay
 method-local so this module imports without the optional jetson extra.
@@ -74,10 +100,19 @@ class SenseVoiceTRTConfig:
     engine: str = "/opt/models/sensevoice-trt/sensevoice.plan"
     model_dir: str = "/opt/models/sensevoice-trt"
     bpe_model: Optional[str] = None  # default: <model_dir>/chn_jpn_yue_eng_ko_spectok.bpe.model
+    # ADMISSION ceiling, not a parallelism knob. The backend keeps exactly one
+    # execution context and serializes on _lock; this value only tells the
+    # coordinator how many requests may be admitted and QUEUED before it starts
+    # rejecting with 429. Execution stays serialized either way — see
+    # concurrency_capability(). Raising it costs no VRAM (no extra contexts);
+    # it trades 429s for queueing latency, so size it against the per-request
+    # ~68 ms and the client's timeout.
+    max_concurrent: int = 1
 
     def __post_init__(self) -> None:
         if self.bpe_model is None:
             self.bpe_model = os.path.join(self.model_dir, "chn_jpn_yue_eng_ko_spectok.bpe.model")
+        self.max_concurrent = max(1, int(self.max_concurrent))
 
 
 class SenseVoiceTRTBackend(ASRBackend):
@@ -100,6 +135,24 @@ class SenseVoiceTRTBackend(ASRBackend):
         self._emb = None
         self._sp = None
         self._warned_languages: set[str] = set()
+        # Resident device buffers + stream, created once in preload(), reused by
+        # every _infer(), released in unload(). This is the part that pays: the
+        # old per-call cudaMalloc/cudaFree/cudaStreamCreate churn measured
+        # 5.36 ms per request on orin-nano.
+        #
+        # There is deliberately NO pinned host buffer. Pinned D2H is genuinely
+        # faster (1.24 ms vs 4.77 ms for the full tensor), but it lands in a
+        # shared block the next request overwrites, so the result has to be
+        # copied out again — and that host copy measured 7.71 ms. That is the
+        # board's memory bandwidth (34.5 MB / 7.7 ms ~ 4.5 GB/s), not a pinned
+        # artefact: a plain pageable numpy->numpy copy of the same size measured
+        # 7.70 ms. Full pinned path 1.24 + 7.71 = 8.95 ms vs 8.26 ms for a D2H
+        # straight into a fresh array — pinned was net NEGATIVE and cost 32.9 MB
+        # of page-locked host memory. Measured on device; do not reintroduce it
+        # without re-measuring.
+        self._d_in = 0
+        self._d_out = 0
+        self._stream = None
         self._lock = threading.Lock()  # single shared context; offline is serialized
         self._ready = False
 
@@ -118,11 +171,22 @@ class SenseVoiceTRTBackend(ASRBackend):
     def is_ready(self) -> bool:
         return self._ready and self._ctx is not None
 
-    @classmethod
-    def concurrency_capability(cls, profile=None):
-        # Single shared execution context, serialized by _lock. Offline /asr is
-        # request-at-a-time; keep it conservative.
-        return ConcurrencyCapability.default()
+    def concurrency_capability(self, profile=None) -> ConcurrencyCapability:
+        # supports_parallel=False WITH max_concurrent=N>1 is DELIBERATE, not a
+        # typo. The two fields answer different questions:
+        #   supports_parallel -> may the coordinator run 2 requests at once?
+        #                        No: one execution context, serialized by _lock.
+        #   max_concurrent    -> how many requests may be ADMITTED?
+        #                        N: extra callers queue behind the lock instead
+        #                        of being rejected outright with 429.
+        # Verified against the OVS resolve(): this pair yields ceiling=N with
+        # mode=serialized. Do NOT "fix" it to supports_parallel=cap>1 — the
+        # on-device measurement (GR3D 98% at 1 stream, --streams=2 = 1.11x for
+        # +216 MB, enqueue-bound) is why there is no context pool here.
+        return ConcurrencyCapability(
+            supports_parallel=False,
+            max_concurrent=max(1, int(self._cfg.max_concurrent)),
+        )
 
     # ------------------------------------------------------------------
     # Preload
@@ -155,13 +219,92 @@ class SenseVoiceTRTBackend(ASRBackend):
         self._sp = spm.SentencePieceProcessor()
         self._sp.load(cfg.bpe_model)
 
+        # GPU resources last. Everything above can fail on a missing or corrupt
+        # host asset, and preload() has no cleanup path of its own -- the caller
+        # (ConversationEngine) catches the failure and keeps the backend, so an
+        # allocation made before this point would leak ~35 MB of device memory
+        # and a stream on every retry. _alloc_buffers() rolls back its own
+        # partial state, so this is the last thing that can leave anything held.
+        self._alloc_buffers()
+
         self._ready = True
         logger.info("SenseVoice TRT backend ready (engine=%s, out=%s).", cfg.engine, self._out_shape)
 
+    # ------------------------------------------------------------------
+    # Resident buffers (allocated once — NOT per request)
+    # ------------------------------------------------------------------
+
+    def _alloc_buffers(self) -> None:
+        """Allocate d_in / d_out / stream once.
+
+        Shapes are static (fixed-shape engine), so nothing here has to be redone
+        per request. Measured saving vs the old per-call path: 5.36 ms of
+        cudaMalloc x2 + cudaFree x2 + StreamCreate/Destroy.
+
+        VRAM is unchanged versus the per-call version — the same two device
+        buffers, just held for the process lifetime instead of churned:
+        d_out (1, 344, 25055) fp32 = 34.5 MB, d_in (1, 344, 560) fp32 = 0.77 MB.
+        No host buffer is allocated here; see the module docstring for why the
+        pinned one was removed.
+        """
+        from cuda import cudart
+
+        in_nbytes = int(np.prod((1, T_FIXED, LFR_DIM))) * 4
+        out_nbytes = int(np.prod(self._out_shape)) * 4
+        try:
+            err, d_in = cudart.cudaMalloc(in_nbytes)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaMalloc(in={in_nbytes}) failed: {err}")
+            self._d_in = int(d_in)
+            err, d_out = cudart.cudaMalloc(out_nbytes)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaMalloc(out={out_nbytes}) failed: {err}")
+            self._d_out = int(d_out)
+            err, stream = cudart.cudaStreamCreate()
+            if int(err) != 0:
+                raise RuntimeError(f"cudaStreamCreate failed: {err}")
+            self._stream = stream
+            # The context and the buffers are both resident, so bind once here
+            # rather than on every _infer().
+            self._ctx.set_tensor_address(self._in_name, self._d_in)
+            self._ctx.set_tensor_address(self._out_name, self._d_out)
+        except Exception:
+            self._free_buffers()
+            raise
+
+    def _free_buffers(self) -> None:
+        """Release everything _alloc_buffers took. Idempotent."""
+        try:
+            from cuda import cudart
+        except Exception:  # pragma: no cover - no CUDA on this host
+            self._stream = None
+            self._d_in = self._d_out = 0
+            return
+        if self._stream is not None:
+            stream, self._stream = self._stream, None
+            try:
+                cudart.cudaStreamSynchronize(stream)
+            except Exception:
+                pass
+            try:
+                cudart.cudaStreamDestroy(stream)
+            except Exception:
+                pass
+        for attr in ("_d_in", "_d_out"):
+            ptr = getattr(self, attr)
+            if ptr:
+                setattr(self, attr, 0)
+                try:
+                    cudart.cudaFree(ptr)
+                except Exception:
+                    pass
+
     def unload(self) -> None:
-        self._ctx = None
-        self._engine = None
         self._ready = False
+        with self._lock:
+            self._free_buffers()
+            self._ctx = None
+            self._engine = None
 
     # ------------------------------------------------------------------
     # Transcribe (offline)
@@ -184,39 +327,57 @@ class SenseVoiceTRTBackend(ASRBackend):
             language, honoured=tag, backend=self.name, warned=self._warned_languages,
         )
         speech, valid = self._build_speech(samples, lang=tag)
-        logits = self._infer(speech)
+        logits = self._infer(speech, valid)
         if logits is None:
             return TranscriptionResult(text="", language=reported, meta={})
         return TranscriptionResult(
             text=self._ctc_decode(logits, valid), language=reported, meta={}
         )
 
-    def _infer(self, speech: np.ndarray):
+    def _infer(self, speech: np.ndarray, valid: Optional[int] = None):
         from cuda import cudart
 
         speech = np.ascontiguousarray(speech, dtype=np.float32)
-        out = np.empty(self._out_shape, dtype=np.float32)
+        # Fixed-shape engine: _build_speech always pads/truncates to T_FIXED, so
+        # the resident d_in fits exactly. Guard anyway — with a resident buffer a
+        # shape bug becomes an out-of-bounds H2D write instead of a fresh malloc.
+        if speech.shape != (1, T_FIXED, LFR_DIM):
+            raise ValueError(
+                f"SenseVoice TRT expects speech shape (1, {T_FIXED}, {LFR_DIM}), "
+                f"got {speech.shape}"
+            )
+        # Only the first `valid` frames carry audio; the rest is the zero pad
+        # _build_speech added to reach T_FIXED, and _ctc_decode throws it away.
+        # The engine output is row-major (1, T, V), so those frames are a
+        # contiguous prefix and the D2H can simply stop early. On a 3 s clip
+        # valid is 54 of 344, i.e. 84% of the 34.5 MB transfer was pure waste —
+        # and at 4.5 GB/s of host bandwidth that transfer is the single most
+        # expensive non-GPU item in the request.
+        rows = int(self._out_shape[1]) if valid is None else max(
+            1, min(int(valid), int(self._out_shape[1]))
+        )
+        out = np.empty((rows, int(self._out_shape[2])), dtype=np.float32)
+        out_nbytes = out.nbytes
         with self._lock:
-            err, d_in = cudart.cudaMalloc(speech.nbytes)
-            err, d_out = cudart.cudaMalloc(out.nbytes)
-            err, stream = cudart.cudaStreamCreate()
-            try:
-                self._ctx.set_tensor_address(self._in_name, int(d_in))
-                self._ctx.set_tensor_address(self._out_name, int(d_out))
-                cudart.cudaMemcpy(d_in, speech.ctypes.data, speech.nbytes,
-                                  cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
-                ok = self._ctx.execute_async_v3(stream)
-                cudart.cudaStreamSynchronize(stream)
-                if not ok:
-                    logger.error("SenseVoice TRT execute_async_v3 failed")
-                    return None
-                cudart.cudaMemcpy(out.ctypes.data, d_out, out.nbytes,
-                                  cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
-            finally:
-                cudart.cudaStreamDestroy(stream)
-                cudart.cudaFree(d_in)
-                cudart.cudaFree(d_out)
-        return out.reshape(self._out_shape)[0]
+            # Buffers/stream are resident: no cudaMalloc / cudaStreamCreate /
+            # cudaFree per request (measured 5.00 ms of the old path). Tensor
+            # addresses were bound in _alloc_buffers(); re-bind is cheap and keeps
+            # the pairing explicit.
+            self._ctx.set_tensor_address(self._in_name, self._d_in)
+            self._ctx.set_tensor_address(self._out_name, self._d_out)
+            cudart.cudaMemcpy(self._d_in, speech.ctypes.data, speech.nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+            ok = self._ctx.execute_async_v3(self._stream)
+            cudart.cudaStreamSynchronize(self._stream)
+            if not ok:
+                logger.error("SenseVoice TRT execute_async_v3 failed")
+                return None
+            # D2H straight into the caller's array. It is freshly allocated per
+            # request, so nothing is shared and no second copy is needed — the
+            # pinned variant needed one and lost 0.7 ms net doing it.
+            cudart.cudaMemcpy(out.ctypes.data, self._d_out, out_nbytes,
+                              cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+        return out
 
     # ------------------------------------------------------------------
     # Front end + decode (identical contract to the RK backend)
