@@ -213,12 +213,19 @@ class SenseVoiceTRTBackend(ASRBackend):
         self._out_name = next(n for n in names if self._engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
         self._ctx.set_input_shape(self._in_name, (1, T_FIXED, LFR_DIM))
         self._out_shape = tuple(self._ctx.get_tensor_shape(self._out_name))
-        self._alloc_buffers()
 
         self._cmvn_add, self._cmvn_scale = self._load_cmvn(os.path.join(cfg.model_dir, "am.mvn"))
         self._emb = np.load(os.path.join(cfg.model_dir, "embedding.npy"))
         self._sp = spm.SentencePieceProcessor()
         self._sp.load(cfg.bpe_model)
+
+        # GPU resources last. Everything above can fail on a missing or corrupt
+        # host asset, and preload() has no cleanup path of its own -- the caller
+        # (ConversationEngine) catches the failure and keeps the backend, so an
+        # allocation made before this point would leak ~35 MB of device memory
+        # and a stream on every retry. _alloc_buffers() rolls back its own
+        # partial state, so this is the last thing that can leave anything held.
+        self._alloc_buffers()
 
         self._ready = True
         logger.info("SenseVoice TRT backend ready (engine=%s, out=%s).", cfg.engine, self._out_shape)

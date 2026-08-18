@@ -28,7 +28,9 @@ for real rather than merely counted.
 from __future__ import annotations
 
 import ctypes
+import pathlib
 import sys
+import textwrap
 import threading
 import types
 
@@ -571,17 +573,54 @@ def test_realloc_after_unload(cudart):
     assert len(cudart.live_ptrs) == 2 and len(cudart.live_streams) == 1
 
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
 # ---------------------------------------------------------------------------
 # import hygiene
 # ---------------------------------------------------------------------------
 
 
 def test_module_imports_without_cuda_or_tensorrt():
-    """No tensorrt / cuda on the dev box: import must still work (lazy imports)."""
-    assert "tensorrt" not in sys.modules
-    import importlib
+    """Import must work with no tensorrt/cuda present — the imports are lazy.
 
-    mod = importlib.reload(
-        importlib.import_module("voxedge.backends.jetson.sensevoice_trt")
+    Runs in a subprocess with ``tensorrt``/``cuda`` blocked at the finder level.
+    The earlier version asserted ``"tensorrt" not in sys.modules``, which tests
+    the ambient state of the whole test process rather than this module: on a
+    real Jetson, or simply after any other test imported TensorRT, it failed
+    even though the module is still perfectly lazy. Tests share sys.modules and
+    ordering is not guaranteed, so the check has to be isolated.
+    """
+    import subprocess
+    import sys as _sys
+
+    script = textwrap.dedent(
+        """
+        import sys
+
+        class _Blocker:
+            def find_module(self, name, path=None):
+                return self if name.split(".")[0] in ("tensorrt", "cuda") else None
+            def load_module(self, name):
+                raise ImportError(f"{name} blocked for this test")
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in ("tensorrt", "cuda"):
+                    raise ImportError(f"{name} blocked for this test")
+                return None
+
+        sys.meta_path.insert(0, _Blocker())
+        for mod in [m for m in sys.modules if m.split(".")[0] in ("tensorrt", "cuda")]:
+            del sys.modules[mod]
+
+        from voxedge.backends.jetson.sensevoice_trt import SenseVoiceTRTConfig
+        assert SenseVoiceTRTConfig().max_concurrent == 1
+        assert "tensorrt" not in sys.modules, "import must stay lazy"
+        print("OK")
+        """
     )
-    assert mod.SenseVoiceTRTConfig().max_concurrent == 1
+    proc = subprocess.run(
+        [_sys.executable, "-c", script],
+        capture_output=True, text=True, cwd=str(_REPO_ROOT),
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "OK" in proc.stdout
