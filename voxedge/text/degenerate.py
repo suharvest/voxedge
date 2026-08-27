@@ -33,6 +33,15 @@ _MIN_TAIL_REPEATS_SINGLE_CHAR = 12
 # 单元。真有超长输入时宁可放过，也不能让守卫本身变成性能雷区 ——
 # 实测 2048 单元约 0.06s，4096 就要 0.43s。
 _MAX_TAIL_SCAN_UNITS = 2048
+# 段**中间**的复读：两侧都有正常内容，既不从 index 0 起算也不贴着结尾，前两个
+# 锚点都判不出来。实测 Whisper 在 RK3588 上把「…上下文语境中找到自己的立场，
+# 并能够…」吐成「…语经中找到×18并能针对…」——前后都是正常转写。
+# 这一档没有覆盖率兜底（复读只占整段一小部分），所以份数门槛取得比整段锚定更
+# 严：宁可放过，也不能把「好好好好」这类正常说法从句子中间挖掉。
+_MIN_INTERIOR_REPEATS = 6
+_MIN_INTERIOR_REPEATS_SINGLE = 12
+# 单元最长扫到这么多个单位：再长的"复读"更可能是正常的排比句式。
+_MAX_INTERIOR_UNIT_LEN = 12
 # 跨段：短段（少于这么多有效字符）要更多份数才当退化，否则 VAD 把「对不起。」
 # 切成三段就会被删掉两段。
 _MIN_SEGMENT_KEY_LEN = 8
@@ -118,6 +127,36 @@ def _find_tail_period(
     return None, n
 
 
+def _find_interior_run(
+    seq: Sequence, min_repeats: int, min_repeats_single: Optional[int] = None
+) -> Optional[Tuple[int, int, int]]:
+    """找出段中间连续复读的一段；返回 (起始下标, 单元长度, 份数)。
+
+    与另外两个锚点的区别是它不要求复读解释整段，也不要求贴着结尾 —— 代价是
+    没有覆盖率可以兜底，所以只靠份数判定。有多处命中时取覆盖字数最多的那处。
+    """
+    n = len(seq)
+    if n < 4 or n > _MAX_TAIL_SCAN_UNITS:
+        return None
+    best: Optional[Tuple[int, int, int, int]] = None   # (covered, start, unit_len, repeats)
+    for unit_len in range(1, min(_MAX_INTERIOR_UNIT_LEN, n // min_repeats) + 1):
+        need = min_repeats_single if (unit_len == 1 and min_repeats_single) else min_repeats
+        i = 0
+        while i + unit_len * need <= n:
+            unit = seq[i:i + unit_len]
+            repeats = 1
+            while seq[i + repeats * unit_len:i + (repeats + 1) * unit_len] == unit:
+                repeats += 1
+            if repeats >= need:
+                covered = repeats * unit_len
+                if best is None or covered > best[0]:
+                    best = (covered, i, unit_len, repeats)
+                i += repeats * unit_len
+            else:
+                i += 1
+    return (best[1], best[2], best[3]) if best else None
+
+
 def collapse_repetition(text: str) -> Tuple[str, bool]:
     """把整段复读塌缩成一份。返回 (结果, 是否发生塌缩)。
 
@@ -164,6 +203,20 @@ def collapse_repetition(text: str) -> Tuple[str, bool]:
     if tail_unit and tail_start > 0:
         prefix = stripped[:offsets[tail_start]].rstrip()
         return joiner.join([prefix, joiner.join(tail_unit)]), True
+
+    interior_thresholds = (
+        (_MIN_INTERIOR_REPEATS,) if len(thresholds) == 1
+        else (_MIN_INTERIOR_REPEATS, _MIN_INTERIOR_REPEATS_SINGLE)
+    )
+    found = _find_interior_run(units, *interior_thresholds)
+    if found:
+        start, unit_len, repeats = found
+        end = start + unit_len * repeats
+        # 保留第一份，删掉其余。按 stripped 的原始下标切，标点和两侧文本原样保留。
+        keep_to = offsets[start + unit_len]
+        resume_from = offsets[end] if end < len(offsets) else len(stripped)
+        head = stripped[:keep_to].rstrip(_SEPARATORS)
+        return joiner.join([head, stripped[resume_from:]]) if joiner else head + stripped[resume_from:], True
     return text, False
 
 

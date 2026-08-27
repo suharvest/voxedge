@@ -160,3 +160,46 @@ def test_oversized_input_skips_tail_scan() -> None:
     # 整段锚定仍可能命中；这里只要求调用能在瞬间返回而不是卡死。
     assert isinstance(collapsed, bool)
     assert isinstance(got, str)
+
+
+# ── 第三个锚点：段中间的复读 ────────────────────────────────────────────
+#
+# 前两个锚点一个从 index 0 起算、一个贴着结尾，两侧都有正常内容的复读它们都
+# 判不出来。实测来源：Whisper-base 在 RK3588 上按 10s 窗口切分时，中文长句里
+# 出现「…上下文语经中找到×18并能针对特定问题…」，前后都是正常转写。
+
+
+def test_interior_run_is_collapsed_keeping_both_sides():
+    text = "学生们可以在他文章的上下文语经中" + "找到" * 18 + "并能针对特定问题提出自己的观点"
+    out, collapsed = collapse_repetition(text)
+    assert collapsed
+    assert out == "学生们可以在他文章的上下文语经中找到并能针对特定问题提出自己的观点"
+
+
+def test_interior_run_in_spaced_language_keeps_the_word_break():
+    # 塌缩点两侧必须还是两个词：拼成 "delayeduntil" 等于制造一个新的错词。
+    out, collapsed = collapse_repetition("the meeting is " + "delayed " * 8 + "until friday")
+    assert collapsed
+    assert out == "the meeting is delayed until friday"
+
+
+@pytest.mark.parametrize("text", [
+    # 口语里合法的重复，份数都够不到门槛 —— 这一档没有覆盖率兜底，只靠份数，
+    # 所以门槛比整段锚定更严正是为了这些。
+    "对对对我明白了",
+    "very very very good",
+    "I said no no no no to that",
+    "他说不行不行不行这样不行",
+    "正常的一句中文转写没有任何复读",
+])
+def test_normal_speech_repetition_survives(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed
+    assert out == text
+
+
+def test_interior_guard_does_not_fire_on_a_long_clean_transcript():
+    # 排比句式：结构重复但内容不同，不该被当成解码退化。
+    text = "第一要看清楚，第二要想明白，第三要说得准，第四要做得实，第五要收得住"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
