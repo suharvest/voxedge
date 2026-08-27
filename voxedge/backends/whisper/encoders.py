@@ -42,35 +42,51 @@ class HailoEncoder(Encoder):
     shorter than the compiled one.
     """
 
-    def __init__(self, hef_path: str | Path, window_s: float, padding_cutoff_s: float = 1.0):
-        from hailo_platform import VDevice
+    def __init__(self, hef_path: str | Path, window_s: float, padding_cutoff_s: float = 1.0,
+                 timeout_ms: int = 10_000):
+        from hailo_platform import FormatType, HailoSchedulingAlgorithm, VDevice
 
         self.window_s = window_s
         self.padding_cutoff_s = padding_cutoff_s
+        self._timeout_ms = timeout_ms
+
         params = VDevice.create_params()
+        # Without a scheduling algorithm the network group is never activated and
+        # every inference returns HAILO_STREAM_NOT_ACTIVATED (72) — while still
+        # filling the output buffer, so the decoder reads zeros and emits a
+        # single token per chunk rather than raising.
+        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
         self._vdev = VDevice(params)
+
         self._model = self._vdev.create_infer_model(str(hef_path))
-        self._model.input().set_format_type(self._infer_format())
+        # BOTH sides, not just the input: the output otherwise stays the HEF's
+        # native UINT8 and the float32 buffer handed to it is 4x the expected
+        # size (HAILO_INVALID_OPERATION, "768000 is different than expected
+        # 192000").
+        self._model.input().set_format_type(FormatType.FLOAT32)
+        self._model.output().set_format_type(FormatType.FLOAT32)
+
+        # configure() and create_bindings() once, then reuse. Rebuilding the
+        # bindings per call is pure overhead on a path whose whole point is a
+        # 24 ms encoder. Safe because this backend declares max_concurrent=1.
         self._configured = self._model.configure()
-
-    @staticmethod
-    def _infer_format():
-        from hailo_platform import FormatType
-
-        return FormatType.FLOAT32
+        self._bindings = self._configured.create_bindings()
+        self._out = np.zeros(self._model.output().shape, dtype=np.float32)
 
     def run(self, mel: np.ndarray) -> np.ndarray:
         # HEF encoders take NHWC: [1, 1, frames, n_mels]
         inp = np.ascontiguousarray(mel.T[None, None, :, :], dtype=np.float32)
-        bindings = self._configured.create_bindings()
-        bindings.input().set_buffer(inp)
-        out_shape = self._model.output().shape
-        out = np.empty(out_shape, dtype=np.float32)
-        bindings.output().set_buffer(out)
-        self._configured.run([bindings], timeout_ms=10_000)
-        return out
+        self._bindings.input().set_buffer(inp)
+        self._bindings.output().set_buffer(self._out)
+        # `timeout` is positional in hailo_platform 4.21; there is no
+        # `timeout_ms` keyword.
+        self._configured.run([self._bindings], self._timeout_ms)
+        return self._out.copy()
 
     def close(self) -> None:
+        self._bindings = None
+        self._configured = None
+        self._model = None
         try:
             self._vdev.release()
         except Exception:
@@ -195,7 +211,8 @@ class TensorRTEncoder(Encoder):
 
 def build_encoder(kind: str, path: str | Path, window_s: float, **kw) -> Encoder:
     if kind == "hailo":
-        return HailoEncoder(path, window_s, kw.get("padding_cutoff_s", 1.0))
+        return HailoEncoder(path, window_s, kw.get("padding_cutoff_s", 1.0),
+                            kw.get("timeout_ms", 10_000))
     if kind == "rknn":
         return RknnEncoder(path, window_s, kw.get("all_cores", False))
     if kind == "tensorrt":
