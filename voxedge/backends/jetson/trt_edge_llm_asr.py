@@ -1007,17 +1007,7 @@ def _split_segment_parts(
     return [text for text, _ in parts], unlabelled, majority
 
 
-def _join_segment_texts(texts: list[str], language: str | None) -> str:
-    texts = [text.strip() for text in texts if text and text.strip()]
-    if not texts:
-        return ""
-    if len(texts) > 1:
-        trail_punct = "。，、！？；,.!?;"
-        texts = [text.rstrip(trail_punct).rstrip() for text in texts[:-1]] + [texts[-1]]
-    cjk_langs = {"Chinese", "Japanese", "Korean", "Cantonese", "zh", "ja", "ko"}
-    lang = language or ""
-    is_cjk = lang in cjk_langs or any(lang.startswith(prefix) for prefix in ("zh", "ja", "ko"))
-    return ("" if is_cjk else " ").join(texts).strip()
+from voxedge.text.join import join_segments as _join_segment_texts  # noqa: E402
 
 
 class _TRTEdgeLLMAccumulatingASRStream(ASRStream):
