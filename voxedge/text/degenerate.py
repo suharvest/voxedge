@@ -27,6 +27,10 @@ _MIN_REPEATS_SPACED = 6
 # 原样返回，WER 168%。
 _LONG_UNIT_WORDS = 6
 _MIN_REPEATS_LONG_UNIT = 3
+# 单元长度扫描上限。整段锚定最少只需 2 整份（第三份可以是残缺的），所以扫描要到
+# n // 2；再加一个绝对上限，因为这个搜索是 O(n × max_unit_len)，而任何真实句子都
+# 远短于 256 个单元。
+_MAX_PERIOD_UNIT_LEN = 256
 # 重复部分必须占到整段的这个比例，才认为整段是退化产物而非局部口吃。
 _MIN_COVERAGE = 0.8
 # 尾部锚定时前面还留着有效内容，覆盖率不可能像整段锚定那样高，所以改用**份数**
@@ -84,20 +88,28 @@ def _find_period(
     if n < 4:
         return None
     # 单元最长只需试到 n // 最小门槛：更长的单元不可能重复够份数。
-    max_unit_len = n // min(
-        min_repeats, min_repeats_single or min_repeats, _MIN_REPEATS_LONG_UNIT
-    )
+    divisor = max(1, min(
+        min_repeats, min_repeats_single or min_repeats, _MIN_REPEATS_LONG_UNIT - 1
+    ))
+    max_unit_len = min(n // divisor, _MAX_PERIOD_UNIT_LEN)
     for unit_len in range(1, max_unit_len + 1):
         unit = seq[:unit_len]
         repeats = 1
         while seq[repeats * unit_len:(repeats + 1) * unit_len] == unit:
             repeats += 1
+        covered = repeats * unit_len
+        truncated = covered < n and unit[:n - covered] == seq[covered:]
+        # 残缺的那一份对长单元计入份数。「整句×2 + 起了个头的第三句」是解码退化
+        # ——正常说话不会把一个 10 词句子说两遍再起第三遍——但按完整份数只数到 2，
+        # 正好卡在"2 份一律放过"的规则里。单元长度门槛（>=6 词）保住了「我爱你。
+        # 我爱你。我爱你真的」这类真实说法：3 个词够不到这一档。
+        if truncated and unit_len >= _LONG_UNIT_WORDS:
+            repeats += 1
         if repeats < _repeats_needed(unit_len, min_repeats, min_repeats_single):
             continue
-        covered = repeats * unit_len
         # 尾部残缺一份（被 max_generate_length 截断）时整段仍算被覆盖，
         # 否则截断反而让守卫失效。
-        if unit[:n - covered] == seq[covered:]:
+        if truncated:
             covered = n
         if covered < _MIN_COVERAGE * n:
             continue

@@ -244,3 +244,22 @@ def test_a_long_repeated_prefix_is_collapsed_and_the_rest_kept():
 def test_short_units_and_double_repeats_survive(text):
     out, collapsed = collapse_repetition(text)
     assert not collapsed and out == text
+
+
+def test_two_full_repeats_plus_a_started_third_is_collapsed():
+    # 一个长单元重复两遍再起第三遍的头，是解码退化被 token 上限截断的样子。
+    # 按完整份数只数到 2，正好落进"2 份一律放过"的规则里。实测来源：Hailo-8 上
+    # cap=32 恰好放得下 2.5 遍短句。
+    out, collapsed = collapse_repetition(
+        "He referred to the rumors as political chatter and silliness. " * 2
+        + "He referred to the rumors as political chatter"
+    )
+    assert collapsed
+    assert out.count("He referred") == 1
+
+
+def test_a_short_unit_twice_plus_a_started_third_survives():
+    # 同样的形状，短单元：这是真实说法，长度门槛（>=6 词）就是为了保住它。
+    text = "I love you. I love you. I love you so much"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
