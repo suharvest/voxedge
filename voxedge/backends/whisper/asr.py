@@ -65,6 +65,12 @@ class WhisperASRConfig:
     #: Bind all three RK3588 NPU cores. Measured no faster than the default on
     #: this graph; left available for boards where it does help.
     all_cores: bool = False
+    #: Hard cap on generated tokens per chunk. ``None`` uses the
+    #: duration-proportional budget, which assumes the decoder emits EOS.
+    #: The Hailo pairing does not: it transcribes correctly and then repeats
+    #: the sentence until the budget runs out, so the vendor pipeline caps the
+    #: sequence instead. Set it for that path; leave it None elsewhere.
+    max_new_tokens: Optional[int] = None
     #: 0 lets onnxruntime pick. The decoder is the wall-clock bottleneck on
     #: every board here, so this is the knob that actually moves RTF.
     decoder_threads: int = 0
@@ -252,6 +258,7 @@ class WhisperASR(ASRBackend):
                 self._vocab,
                 cfg.language,
                 audio_s=len(chunk) / SAMPLE_RATE,
+                max_new=cfg.max_new_tokens,
             )
             dec_ms += (time.perf_counter() - td) * 1000
             if ttft_ms is None:

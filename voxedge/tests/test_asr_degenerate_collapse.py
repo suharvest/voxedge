@@ -203,3 +203,44 @@ def test_interior_guard_does_not_fire_on_a_long_clean_transcript():
     text = "第一要看清楚，第二要想明白，第三要说得准，第四要做得实，第五要收得住"
     out, collapsed = collapse_repetition(text)
     assert not collapsed and out == text
+
+
+# ── 门槛按单元长度分档 ──────────────────────────────────────────────────
+#
+# 空格分词语言原本统一要求 6 份，因为 "the the the" / "no no no no" 是合法英语。
+# 但那是为**单个词**定的：一整句逐字重复 3 遍不是说话方式。实测来源：Hailo-8 上
+# Whisper 不吐 EOS，把正确转写的句子原样重复到 token 预算耗尽，10 词单元 4 份卡
+# 在 6 份门槛外，整段原样返回，WER 168%。
+
+_SENTENCE = "Television reports show white smoke coming from the plant. "
+
+
+def test_a_whole_sentence_repeated_four_times_is_collapsed():
+    out, collapsed = collapse_repetition(_SENTENCE * 4 + "Television reports")
+    assert collapsed
+    assert out.count("Television") == 1
+
+
+def test_a_long_repeated_prefix_is_collapsed_and_the_rest_kept():
+    out, collapsed = collapse_repetition(
+        "However, due to the slow communication channels, " * 3
+        + "Styles in the West could lag behind by 25 30 years."
+    )
+    assert collapsed
+    assert out.count("However") == 1
+    assert out.endswith("25 30 years.")
+
+
+@pytest.mark.parametrize("text", [
+    # Short units keep the higher bar — these are all ordinary speech.
+    "very very very good",
+    "I said no no no no to that",
+    "bye bye bye",
+    # Two repeats of a long unit stay: two is indistinguishable from emphasis,
+    # which is the module's standing rule.
+    "I do not know what to do I do not know what to do",
+    "the cat sat on the mat and then went away",
+])
+def test_short_units_and_double_repeats_survive(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text

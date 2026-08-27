@@ -20,6 +20,13 @@ _MIN_REPEATS_MULTI_CHAR = 3
 # "bye bye bye"、"no no no no" 都是合法说法，按字符切分还会把它们黏成
 # "thethethe" 从而误判。真正的解码退化通常复读几十上百份，6 份足以区分。
 _MIN_REPEATS_SPACED = 6
+# ...但这个门槛是为**单个词**定的。重复单元越长，合法的可能性越低：一个词说 6 遍
+# 可能是口语，一整句 6 个词逐字重复 3 遍不可能是。实测来源：Hailo-8 上 Whisper
+# 把「Television reports show white smoke coming from the plant.」正确转写后原样
+# 重复 4 遍直到 token 预算耗尽（不吐 EOS），10 词单元 4 份，卡在 6 份门槛外整段
+# 原样返回，WER 168%。
+_LONG_UNIT_WORDS = 6
+_MIN_REPEATS_LONG_UNIT = 3
 # 重复部分必须占到整段的这个比例，才认为整段是退化产物而非局部口吃。
 _MIN_COVERAGE = 0.8
 # 尾部锚定时前面还留着有效内容，覆盖率不可能像整段锚定那样高，所以改用**份数**
@@ -49,6 +56,21 @@ _MIN_SEGMENT_RUN_SHORT = 6
 _SEPARATORS = "，,。.、！!？?；;：: \t\n"
 
 
+def _repeats_needed(
+    unit_len: int, min_repeats: int, min_repeats_single: Optional[int]
+) -> int:
+    """按单元长度选份数门槛。
+
+    短单元用调用方给的门槛（中文单字、英文单词都可能被正常重复），长单元降到
+    ``_MIN_REPEATS_LONG_UNIT`` —— 逐字重复一整句是解码退化，不是说话方式。
+    """
+    if unit_len == 1 and min_repeats_single:
+        return min_repeats_single
+    if unit_len >= _LONG_UNIT_WORDS:
+        return min(min_repeats, _MIN_REPEATS_LONG_UNIT)
+    return min_repeats
+
+
 def _find_period(
     seq: Sequence, min_repeats: int, min_repeats_single: Optional[int] = None
 ) -> Optional[Sequence]:
@@ -62,14 +84,15 @@ def _find_period(
     if n < 4:
         return None
     # 单元最长只需试到 n // 最小门槛：更长的单元不可能重复够份数。
-    max_unit_len = n // min(min_repeats, min_repeats_single or min_repeats)
+    max_unit_len = n // min(
+        min_repeats, min_repeats_single or min_repeats, _MIN_REPEATS_LONG_UNIT
+    )
     for unit_len in range(1, max_unit_len + 1):
         unit = seq[:unit_len]
         repeats = 1
         while seq[repeats * unit_len:(repeats + 1) * unit_len] == unit:
             repeats += 1
-        need = min_repeats_single if unit_len == 1 and min_repeats_single else min_repeats
-        if repeats < need:
+        if repeats < _repeats_needed(unit_len, min_repeats, min_repeats_single):
             continue
         covered = repeats * unit_len
         # 尾部残缺一份（被 max_generate_length 截断）时整段仍算被覆盖，
@@ -95,9 +118,11 @@ def _find_tail_period(
     n = len(seq)
     if n < 4 or n > _MAX_TAIL_SCAN_UNITS:
         return None, n
-    max_unit_len = n // _MIN_TAIL_REPEATS
+    max_unit_len = n // min(_MIN_TAIL_REPEATS, _MIN_REPEATS_LONG_UNIT)
     for unit_len in range(1, max_unit_len + 1):
-        need = _MIN_TAIL_REPEATS_SINGLE_CHAR if unit_len == 1 else _MIN_TAIL_REPEATS
+        need = _repeats_needed(
+            unit_len, _MIN_TAIL_REPEATS, _MIN_TAIL_REPEATS_SINGLE_CHAR
+        )
         # `phase` 允许最后一份是残缺的：max_generate_length 截断常把结尾切在半份
         # 上（「…我们看到我们看到我们」）。同一个 unit_len 下多个相位都可能成立，
         # 但它们是同一个周期的旋转，取覆盖最大的那个 —— 否则「前缀+我们看到×10+
@@ -139,8 +164,9 @@ def _find_interior_run(
     if n < 4 or n > _MAX_TAIL_SCAN_UNITS:
         return None
     best: Optional[Tuple[int, int, int, int]] = None   # (covered, start, unit_len, repeats)
-    for unit_len in range(1, min(_MAX_INTERIOR_UNIT_LEN, n // min_repeats) + 1):
-        need = min_repeats_single if (unit_len == 1 and min_repeats_single) else min_repeats
+    scan_to = min(_MAX_INTERIOR_UNIT_LEN, n // min(min_repeats, _MIN_REPEATS_LONG_UNIT))
+    for unit_len in range(1, scan_to + 1):
+        need = _repeats_needed(unit_len, min_repeats, min_repeats_single)
         i = 0
         while i + unit_len * need <= n:
             unit = seq[i:i + unit_len]
