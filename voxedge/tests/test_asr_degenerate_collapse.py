@@ -178,9 +178,23 @@ def test_interior_run_is_collapsed_keeping_both_sides():
 
 def test_interior_run_in_spaced_language_keeps_the_word_break():
     # 塌缩点两侧必须还是两个词：拼成 "delayeduntil" 等于制造一个新的错词。
-    out, collapsed = collapse_repetition("the meeting is " + "delayed " * 8 + "until friday")
+    out, collapsed = collapse_repetition(
+        "he said " + "we need to check this again " * 3 + "and then he left"
+    )
     assert collapsed
-    assert out == "the meeting is delayed until friday"
+    assert out == "he said we need to check this again and then he left"
+
+
+def test_a_single_repeated_word_mid_sentence_is_left_alone():
+    """段中间的单个词重复**不收**，这是刻意的取舍。
+
+    「no no no no no no」是正常说法，「delayed delayed delayed…」是退化，两者都
+    是单词重复，光靠份数分不开。模块的既定政策是宁可漏掉一些退化，也不能把正常
+    口语误伤成单份 —— 何况这一档没有覆盖率可以兜底。整句级的复读仍然会被收。
+    """
+    text = "the meeting is " + "delayed " * 8 + "until friday"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
 
 
 @pytest.mark.parametrize("text", [
@@ -263,3 +277,62 @@ def test_a_short_unit_twice_plus_a_started_third_survives():
     text = "I love you. I love you. I love you so much"
     out, collapsed = collapse_repetition(text)
     assert not collapsed and out == text
+
+
+# ── 独立审查（codex）报出的四处误伤，逐条钉死 ────────────────────────────
+
+def test_a_repeated_prefix_does_not_swallow_the_trailing_speech():
+    """整段锚定曾把周期没解释到的尾巴直接丢掉。
+
+    0.8 的覆盖率余量是为了让**被截断的最后一份**仍然算数，不是为了允许丢掉真实
+    内容。长单元只需 3 份之后，普通句子就够得着这个门槛：下面这句覆盖 0.9，
+    修复前返回的结果里没有 "about this"。
+    """
+    out, collapsed = collapse_repetition("I want to be very clear " * 3 + "about this")
+    assert collapsed
+    assert out == "I want to be very clear about this"
+
+
+@pytest.mark.parametrize("text", [
+    # 单个词/单个字重复：口语里都合法，而段中间这一档没有覆盖率兜底。
+    "I kept saying no no no no no no because nobody listened",
+    "he said ha ha ha ha ha ha ha ha and left",
+    "他说哈哈哈哈哈哈哈哈哈哈哈哈其实我一点也不开心",
+])
+def test_emphasis_and_laughter_survive_the_interior_anchor(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+def test_raising_the_single_unit_bar_is_not_enough_on_its_own():
+    """把「哈」当 1 字周期挡掉之后，搜索会往上挪一层匹配成「哈哈」×6。
+
+    所以门槛按**单元内容**分档而不只按长度：由同一符号构成的单元一律走高门槛。
+    解码循环复读的是词，笑声和强调复读的是字。
+    """
+    text = "他说" + "哈" * 12 + "其实"
+    assert collapse_repetition(text)[1] is False
+    # 但真正跑飞的长串仍然要收。
+    assert collapse_repetition("他说" + "哈" * 40 + "其实")[1] is True
+
+
+def test_the_kept_copy_retains_its_punctuation():
+    text = "wait, " * 6 + "then continued"
+    out, collapsed = collapse_repetition(text)
+    # 这一条现在够不到单词门槛，原样返回；关键是不能变成 "wait then continued"。
+    assert out == text and not collapsed
+    # 长单元的塌缩同样要保留标点。
+    out, collapsed = collapse_repetition(
+        "However, due to the slow communication channels, " * 3 + "Styles in the West."
+    )
+    assert collapsed and out.startswith("However, due to the slow communication channels, Styles")
+
+
+def test_the_scan_stays_cheap_at_the_supported_maximum():
+    """扫描上限放宽后必须仍然有绝对封顶：这个搜索是 O(n x max_unit_len)。"""
+    import time
+
+    text = " ".join(f"w{i}" for i in range(2048))
+    start = time.perf_counter()
+    collapse_repetition(text)
+    assert (time.perf_counter() - start) < 0.15
