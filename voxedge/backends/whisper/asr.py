@@ -13,7 +13,7 @@ from typing import Optional
 
 import numpy as np
 
-from voxedge.audio.segment import split_at_silence_energy
+from voxedge.audio.segment import split_at_silence_energy, split_at_silence_vad
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -208,6 +208,36 @@ class WhisperASR(ASRBackend):
             scaling_mode="single_runtime_multiplex",
         )
 
+    def _split(self, audio: np.ndarray, usable_s: float) -> list[np.ndarray]:
+        """Cut long audio, preferring VAD over frame energy.
+
+        Both matter here. Frame RMS finds a gap only where the waveform is
+        quiet, and on the shortest windows there often is not one: Hailo's base
+        HEF leaves 4 s of usable audio, and continuous speech rarely goes quiet
+        inside 4 s, so the energy splitter falls back to a hard cut mid-phrase.
+        VAD decides on speech rather than loudness and finds boundaries the
+        energy pass cannot. Measured cost of not doing this: English long-form
+        on Hailo tiny came in at 40.3% against the vendor harness's 21.6%,
+        entirely on segmentation.
+
+        webrtcvad is optional, hence the fallback — the same order the
+        TRT-Edge-LLM backend uses.
+        """
+        cfg = self._cfg
+        try:
+            return split_at_silence_vad(audio, SAMPLE_RATE, max_seg_s=usable_s)
+        except ImportError:
+            logger.debug("whisper: webrtcvad absent, splitting on frame energy")
+        except Exception as exc:
+            logger.warning("whisper: VAD splitter failed (%s); using frame energy", exc)
+        return split_at_silence_energy(
+            audio,
+            SAMPLE_RATE,
+            split_rms=cfg.split_rms,
+            min_silence_ms=cfg.split_min_silence_ms,
+            max_seg_s=usable_s,
+        )
+
     # ── transcription ───────────────────────────────────────────────────
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> TranscriptionResult:
         return self.transcribe_array(decode_audio_to_16k_mono(audio_bytes), language)
@@ -232,16 +262,7 @@ class WhisperASR(ASRBackend):
         # transcripts: segments no longer share audio, so they no longer share
         # words.
         usable_s = cfg.window_s - cfg.padding_cutoff_s
-        chunks = _enforce_window(
-            split_at_silence_energy(
-                audio,
-                SAMPLE_RATE,
-                split_rms=cfg.split_rms,
-                min_silence_ms=cfg.split_min_silence_ms,
-                max_seg_s=usable_s,
-            ),
-            usable_s,
-        )
+        chunks = _enforce_window(self._split(audio, usable_s), usable_s)
 
         t0 = time.perf_counter()
         enc_ms = dec_ms = 0.0
