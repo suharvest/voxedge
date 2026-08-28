@@ -185,6 +185,38 @@ class ASRStream(ABC):
         """
 
 
+def _resample_linear(samples, src_sr: int, target_sr: int):
+    """Dependency-free resample: box-filter decimation, then linear interpolation.
+
+    Interpolation alone is fine going UP, and wrong going down: content above
+    the new Nyquist folds back into the band instead of disappearing. A 12 kHz
+    tone in 48 kHz input became a full-amplitude 4 kHz component after
+    resampling to 16 kHz — squarely inside the speech band, and indistinguishable
+    from real audio to everything downstream.
+
+    A moving average over the decimation ratio is the cheapest honest answer:
+    it is a crude low-pass, but it attenuates rather than folds, and it keeps
+    this helper numpy-only. It is still not a resampler; feeding the backend's
+    own rate remains the right thing to do.
+    """
+    import numpy as np
+
+    samples = np.asarray(samples, dtype=np.float32)
+    if src_sr == target_sr or samples.size == 0:
+        return samples
+    if target_sr < src_sr:
+        width = int(src_sr // target_sr)
+        if width > 1 and samples.size >= width:
+            kernel = np.ones(width, dtype=np.float32) / width
+            samples = np.convolve(samples, kernel, mode="same").astype(np.float32)
+    n_out = int(round(samples.size * target_sr / src_sr))
+    if n_out <= 0:
+        return np.zeros(0, dtype=np.float32)
+    x_old = np.linspace(0.0, 1.0, num=samples.size, endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(x_new, x_old, samples).astype(np.float32)
+
+
 class OfflineAccumulateStream(ASRStream):
     """Generic offline→streaming adapter.
 
@@ -205,11 +237,47 @@ class OfflineAccumulateStream(ASRStream):
         self._backend = backend
         self._language = language
         self._buf: list = []
+        self._warned_rates: set = set()
+        self._rate: Optional[int] = None
 
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         import numpy as np
 
-        self._buf.append(np.asarray(samples, dtype=np.float32))
+        # 采样率不匹配要处理掉，不能忽略：这个 stream 只累积，喂进来的样本会
+        # 被当成后端采样率下的音频 —— 8k 的 8000 个样本被读成 16k 的 0.5 秒，
+        # 音高和语速全错且不报任何错。（SenseVoice-TRT 把 16000 硬编码进了自己
+        # 的 fbank，所以这条路一直是静默错的。）
+        #
+        # 但重采样要留到 finalize 一次做完，**不能逐块做**：每块独立插值会在
+        # 每个块边界留下不连续点，实测 8k→16k 的 440Hz 正弦上是 0.17 幅度的
+        # 周期性毛刺（信号峰值 1.0），而且非整数倍率下长度会累积漂移
+        # （22050→16000、200 块累计 +4.6ms）。这里只记采样率。
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.size == 0:
+            # Not audio. Appending it reaches np.stack([]) in some backends,
+            # and letting it pin the rate would reject the first real chunk.
+            return
+
+        expected = self._backend.sample_rate
+        if sample_rate != expected and sample_rate not in self._warned_rates:
+            self._warned_rates.add(sample_rate)
+            logger.warning(
+                "%s: will resample %d Hz -> %d Hz at finalize. Feeding the "
+                "backend's own rate avoids this; linear interpolation is "
+                "adequate for speech but is not a resampler.",
+                self._backend.name, sample_rate, expected,
+            )
+        if self._rate is None:
+            self._rate = sample_rate
+        elif self._rate != sample_rate:
+            raise ValueError(
+                f"{self._backend.name}: sample rate changed mid-utterance "
+                f"({self._rate} -> {sample_rate}); one utterance is one rate"
+            )
+        # copy(): np.asarray 对已经是 float32 的输入返回**同一个对象**，于是
+        # 缓冲区里存的是调用方的数组。调用方复用或清零它之后，finalize 转写的
+        # 就是被改过的内容。
+        self._buf.append(samples.copy())
 
     def get_partial(self) -> tuple[str, bool]:
         # Offline models produce no incremental partials; the server-side VAD
@@ -222,12 +290,17 @@ class OfflineAccumulateStream(ASRStream):
         if not self._buf:
             return "", None
         audio = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        # ONE resample over the whole utterance — see accept_waveform.
+        if self._rate is not None and self._rate != self._backend.sample_rate:
+            audio = _resample_linear(audio, self._rate, self._backend.sample_rate)
         self._buf = []
+        self._rate = None
         result = self._backend.transcribe_array(audio, self._language)
         return result.text, result.language
 
     def close(self) -> None:
         self._buf = []
+        self._rate = None
 
 
 class ASRBackend(ABC):

@@ -119,6 +119,15 @@ artifacts = [
 llm = [
     "httpx>=0.24",
 ]
+# Installing `voxedge[whisper]` pulls the CPU KV-cache decoder that every
+# Whisper execution path shares. The encoder runtime is the platform's own and
+# is NOT declared here: `hailo_platform` ships with HailoRT on a Raspberry Pi
+# + Hailo-8, `rknnlite` comes from the `rk` extra, and `tensorrt`/`cuda-python`
+# from JetPack (see the `jetson` extra). All three imports are lazy, so the
+# backend module imports on a machine with none of them.
+whisper = [
+    "onnxruntime>=1.16",
+]
 
 [tool.setuptools]
 packages = [
@@ -128,6 +137,7 @@ packages = [
     "voxedge.backends.sherpa",
     "voxedge.backends.rk",
     "voxedge.backends.jetson",
+    "voxedge.backends.whisper",
     "voxedge.backends.llm",
     "voxedge.capabilities",
     "voxedge.transport",

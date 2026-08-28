@@ -160,3 +160,179 @@ def test_oversized_input_skips_tail_scan() -> None:
     # 整段锚定仍可能命中；这里只要求调用能在瞬间返回而不是卡死。
     assert isinstance(collapsed, bool)
     assert isinstance(got, str)
+
+
+# ── 第三个锚点：段中间的复读 ────────────────────────────────────────────
+#
+# 前两个锚点一个从 index 0 起算、一个贴着结尾，两侧都有正常内容的复读它们都
+# 判不出来。实测来源：Whisper-base 在 RK3588 上按 10s 窗口切分时，中文长句里
+# 出现「…上下文语经中找到×18并能针对特定问题…」，前后都是正常转写。
+
+
+def test_interior_run_is_collapsed_keeping_both_sides():
+    text = "学生们可以在他文章的上下文语经中" + "找到" * 18 + "并能针对特定问题提出自己的观点"
+    out, collapsed = collapse_repetition(text)
+    assert collapsed
+    assert out == "学生们可以在他文章的上下文语经中找到并能针对特定问题提出自己的观点"
+
+
+def test_interior_run_in_spaced_language_keeps_the_word_break():
+    # 塌缩点两侧必须还是两个词：拼成 "delayeduntil" 等于制造一个新的错词。
+    out, collapsed = collapse_repetition(
+        "he said " + "we need to check this again " * 3 + "and then he left"
+    )
+    assert collapsed
+    assert out == "he said we need to check this again and then he left"
+
+
+def test_a_single_repeated_word_mid_sentence_is_left_alone():
+    """段中间的单个词重复**不收**，这是刻意的取舍。
+
+    「no no no no no no」是正常说法，「delayed delayed delayed…」是退化，两者都
+    是单词重复，光靠份数分不开。模块的既定政策是宁可漏掉一些退化，也不能把正常
+    口语误伤成单份 —— 何况这一档没有覆盖率可以兜底。整句级的复读仍然会被收。
+    """
+    text = "the meeting is " + "delayed " * 8 + "until friday"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+@pytest.mark.parametrize("text", [
+    # 口语里合法的重复，份数都够不到门槛 —— 这一档没有覆盖率兜底，只靠份数，
+    # 所以门槛比整段锚定更严正是为了这些。
+    "对对对我明白了",
+    "very very very good",
+    "I said no no no no to that",
+    "他说不行不行不行这样不行",
+    "正常的一句中文转写没有任何复读",
+])
+def test_normal_speech_repetition_survives(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed
+    assert out == text
+
+
+def test_interior_guard_does_not_fire_on_a_long_clean_transcript():
+    # 排比句式：结构重复但内容不同，不该被当成解码退化。
+    text = "第一要看清楚，第二要想明白，第三要说得准，第四要做得实，第五要收得住"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+# ── 门槛按单元长度分档 ──────────────────────────────────────────────────
+#
+# 空格分词语言原本统一要求 6 份，因为 "the the the" / "no no no no" 是合法英语。
+# 但那是为**单个词**定的：一整句逐字重复 3 遍不是说话方式。实测来源：Hailo-8 上
+# Whisper 不吐 EOS，把正确转写的句子原样重复到 token 预算耗尽，10 词单元 4 份卡
+# 在 6 份门槛外，整段原样返回，WER 168%。
+
+_SENTENCE = "Television reports show white smoke coming from the plant. "
+
+
+def test_a_whole_sentence_repeated_four_times_is_collapsed():
+    out, collapsed = collapse_repetition(_SENTENCE * 4 + "Television reports")
+    assert collapsed
+    assert out.count("Television") == 1
+
+
+def test_a_long_repeated_prefix_is_collapsed_and_the_rest_kept():
+    out, collapsed = collapse_repetition(
+        "However, due to the slow communication channels, " * 3
+        + "Styles in the West could lag behind by 25 30 years."
+    )
+    assert collapsed
+    assert out.count("However") == 1
+    assert out.endswith("25 30 years.")
+
+
+@pytest.mark.parametrize("text", [
+    # Short units keep the higher bar — these are all ordinary speech.
+    "very very very good",
+    "I said no no no no to that",
+    "bye bye bye",
+    # Two repeats of a long unit stay: two is indistinguishable from emphasis,
+    # which is the module's standing rule.
+    "I do not know what to do I do not know what to do",
+    "the cat sat on the mat and then went away",
+])
+def test_short_units_and_double_repeats_survive(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+def test_two_full_repeats_plus_a_started_third_is_collapsed():
+    # 一个长单元重复两遍再起第三遍的头，是解码退化被 token 上限截断的样子。
+    # 按完整份数只数到 2，正好落进"2 份一律放过"的规则里。实测来源：Hailo-8 上
+    # cap=32 恰好放得下 2.5 遍短句。
+    out, collapsed = collapse_repetition(
+        "He referred to the rumors as political chatter and silliness. " * 2
+        + "He referred to the rumors as political chatter"
+    )
+    assert collapsed
+    assert out.count("He referred") == 1
+
+
+def test_a_short_unit_twice_plus_a_started_third_survives():
+    # 同样的形状，短单元：这是真实说法，长度门槛（>=6 词）就是为了保住它。
+    text = "I love you. I love you. I love you so much"
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+# ── 独立审查（codex）报出的四处误伤，逐条钉死 ────────────────────────────
+
+def test_a_repeated_prefix_does_not_swallow_the_trailing_speech():
+    """整段锚定曾把周期没解释到的尾巴直接丢掉。
+
+    0.8 的覆盖率余量是为了让**被截断的最后一份**仍然算数，不是为了允许丢掉真实
+    内容。长单元只需 3 份之后，普通句子就够得着这个门槛：下面这句覆盖 0.9，
+    修复前返回的结果里没有 "about this"。
+    """
+    out, collapsed = collapse_repetition("I want to be very clear " * 3 + "about this")
+    assert collapsed
+    assert out == "I want to be very clear about this"
+
+
+@pytest.mark.parametrize("text", [
+    # 单个词/单个字重复：口语里都合法，而段中间这一档没有覆盖率兜底。
+    "I kept saying no no no no no no because nobody listened",
+    "he said ha ha ha ha ha ha ha ha and left",
+    "他说哈哈哈哈哈哈哈哈哈哈哈哈其实我一点也不开心",
+])
+def test_emphasis_and_laughter_survive_the_interior_anchor(text):
+    out, collapsed = collapse_repetition(text)
+    assert not collapsed and out == text
+
+
+def test_raising_the_single_unit_bar_is_not_enough_on_its_own():
+    """把「哈」当 1 字周期挡掉之后，搜索会往上挪一层匹配成「哈哈」×6。
+
+    所以门槛按**单元内容**分档而不只按长度：由同一符号构成的单元一律走高门槛。
+    解码循环复读的是词，笑声和强调复读的是字。
+    """
+    text = "他说" + "哈" * 12 + "其实"
+    assert collapse_repetition(text)[1] is False
+    # 但真正跑飞的长串仍然要收。
+    assert collapse_repetition("他说" + "哈" * 40 + "其实")[1] is True
+
+
+def test_the_kept_copy_retains_its_punctuation():
+    text = "wait, " * 6 + "then continued"
+    out, collapsed = collapse_repetition(text)
+    # 这一条现在够不到单词门槛，原样返回；关键是不能变成 "wait then continued"。
+    assert out == text and not collapsed
+    # 长单元的塌缩同样要保留标点。
+    out, collapsed = collapse_repetition(
+        "However, due to the slow communication channels, " * 3 + "Styles in the West."
+    )
+    assert collapsed and out.startswith("However, due to the slow communication channels, Styles")
+
+
+def test_the_scan_stays_cheap_at_the_supported_maximum():
+    """扫描上限放宽后必须仍然有绝对封顶：这个搜索是 O(n x max_unit_len)。"""
+    import time
+
+    text = " ".join(f"w{i}" for i in range(2048))
+    start = time.perf_counter()
+    collapse_repetition(text)
+    assert (time.perf_counter() - start) < 0.15

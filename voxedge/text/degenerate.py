@@ -20,6 +20,17 @@ _MIN_REPEATS_MULTI_CHAR = 3
 # "bye bye bye"、"no no no no" 都是合法说法，按字符切分还会把它们黏成
 # "thethethe" 从而误判。真正的解码退化通常复读几十上百份，6 份足以区分。
 _MIN_REPEATS_SPACED = 6
+# ...但这个门槛是为**单个词**定的。重复单元越长，合法的可能性越低：一个词说 6 遍
+# 可能是口语，一整句 6 个词逐字重复 3 遍不可能是。实测来源：Hailo-8 上 Whisper
+# 把「Television reports show white smoke coming from the plant.」正确转写后原样
+# 重复 4 遍直到 token 预算耗尽（不吐 EOS），10 词单元 4 份，卡在 6 份门槛外整段
+# 原样返回，WER 168%。
+_LONG_UNIT_WORDS = 6
+_MIN_REPEATS_LONG_UNIT = 3
+# 单元长度扫描上限。整段锚定最少只需 2 整份（第三份可以是残缺的），所以扫描要到
+# n // 2；再加一个绝对上限，因为这个搜索是 O(n × max_unit_len)，而任何真实句子都
+# 远短于 256 个单元。
+_MAX_PERIOD_UNIT_LEN = 256
 # 重复部分必须占到整段的这个比例，才认为整段是退化产物而非局部口吃。
 _MIN_COVERAGE = 0.8
 # 尾部锚定时前面还留着有效内容，覆盖率不可能像整段锚定那样高，所以改用**份数**
@@ -33,6 +44,22 @@ _MIN_TAIL_REPEATS_SINGLE_CHAR = 12
 # 单元。真有超长输入时宁可放过，也不能让守卫本身变成性能雷区 ——
 # 实测 2048 单元约 0.06s，4096 就要 0.43s。
 _MAX_TAIL_SCAN_UNITS = 2048
+# 段**中间**的复读：两侧都有正常内容，既不从 index 0 起算也不贴着结尾，前两个
+# 锚点都判不出来。实测 Whisper 在 RK3588 上把「…上下文语境中找到自己的立场，
+# 并能够…」吐成「…语经中找到×18并能针对…」——前后都是正常转写。
+# 这一档没有覆盖率兜底（复读只占整段一小部分），所以份数门槛取得比整段锚定更
+# 严：宁可放过，也不能把「好好好好」这类正常说法从句子中间挖掉。
+_MIN_INTERIOR_REPEATS = 6
+# A one-unit period mid-sentence is the ambiguous case: "no no no no no no" and
+# 「哈哈哈…」 are things people say, and here there is no coverage check to lean
+# on. Both scripts therefore get a bar well above what emphasis or laughter
+# reaches. (The spaced case previously fell through to _MIN_INTERIOR_REPEATS
+# because collapse_repetition passes a single threshold for spaced text, so six
+# repeated words were collapsed — measured on "I kept saying no no no no no no
+# because nobody listened".)
+_MIN_INTERIOR_REPEATS_SINGLE = 20
+# 单元最长扫到这么多个单位：再长的"复读"更可能是正常的排比句式。
+_MAX_INTERIOR_UNIT_LEN = 12
 # 跨段：短段（少于这么多有效字符）要更多份数才当退化，否则 VAD 把「对不起。」
 # 切成三段就会被删掉两段。
 _MIN_SEGMENT_KEY_LEN = 8
@@ -40,10 +67,41 @@ _MIN_SEGMENT_RUN_SHORT = 6
 _SEPARATORS = "，,。.、！!？?；;：: \t\n"
 
 
+def _is_uniform(unit: Sequence) -> bool:
+    """True when the unit is one symbol repeated — 「哈哈」, "ha ha", 「好好」.
+
+    A decoding loop repeats a *word*; laughter and emphasis repeat a character.
+    Without this, raising the single-unit bar just pushes the search one level
+    up: 「哈」×12 stops matching as a 1-char period and starts matching as
+    「哈哈」×6, which is the same false positive wearing a different unit length.
+    """
+    return len(set(unit)) == 1
+
+
+def _repeats_needed(
+    unit: Sequence, min_repeats: int, min_repeats_single: Optional[int]
+) -> int:
+    """按单元内容和长度选份数门槛。
+
+    三档：
+    - **同一符号的重复**（「哈哈」、"ha ha"、「好好」）用最高门槛。解码循环复读
+      的是**词**，笑声和强调复读的是**字**。只抬高"单元长度为 1"这一档没用 ——
+      搜索会往上挪一层：「哈」×12 不再作为 1 字周期命中，转而作为「哈哈」×6
+      命中，同一个误判换了个单元长度而已。
+    - **单个单元**（中文单字、英文单词）同样用高门槛：正常口语里都可能重复。
+    - **长单元**降到 ``_MIN_REPEATS_LONG_UNIT`` —— 逐字重复一整句不是说话方式。
+    """
+    if min_repeats_single and (len(unit) == 1 or _is_uniform(unit)):
+        return min_repeats_single
+    if len(unit) >= _LONG_UNIT_WORDS:
+        return min(min_repeats, _MIN_REPEATS_LONG_UNIT)
+    return min_repeats
+
+
 def _find_period(
     seq: Sequence, min_repeats: int, min_repeats_single: Optional[int] = None
-) -> Optional[Sequence]:
-    """找出能解释整段的最短周期单元；找不到返回 None。
+) -> Tuple[Optional[Sequence], int]:
+    """找出能解释整段的最短周期单元；返回 (单元, 完整份覆盖的单元数)，找不到 (None, 0)。
 
     单元长度从短到长试，取最短周期 —— 否则「帮我，」×4 会得到「帮我，帮我」。
     ``min_repeats_single`` 只对单元长度为 1 的情况生效（中文单字重复门槛更高）；
@@ -51,26 +109,35 @@ def _find_period(
     """
     n = len(seq)
     if n < 4:
-        return None
+        return None, 0
     # 单元最长只需试到 n // 最小门槛：更长的单元不可能重复够份数。
-    max_unit_len = n // min(min_repeats, min_repeats_single or min_repeats)
+    divisor = max(1, min(
+        min_repeats, min_repeats_single or min_repeats, _MIN_REPEATS_LONG_UNIT - 1
+    ))
+    max_unit_len = min(n // divisor, _MAX_PERIOD_UNIT_LEN)
     for unit_len in range(1, max_unit_len + 1):
         unit = seq[:unit_len]
         repeats = 1
         while seq[repeats * unit_len:(repeats + 1) * unit_len] == unit:
             repeats += 1
-        need = min_repeats_single if unit_len == 1 and min_repeats_single else min_repeats
-        if repeats < need:
-            continue
         covered = repeats * unit_len
+        truncated = covered < n and unit[:n - covered] == seq[covered:]
+        # 残缺的那一份对长单元计入份数。「整句×2 + 起了个头的第三句」是解码退化
+        # ——正常说话不会把一个 10 词句子说两遍再起第三遍——但按完整份数只数到 2，
+        # 正好卡在"2 份一律放过"的规则里。单元长度门槛（>=6 词）保住了「我爱你。
+        # 我爱你。我爱你真的」这类真实说法：3 个词够不到这一档。
+        if truncated and unit_len >= _LONG_UNIT_WORDS:
+            repeats += 1
+        if repeats < _repeats_needed(unit, min_repeats, min_repeats_single):
+            continue
         # 尾部残缺一份（被 max_generate_length 截断）时整段仍算被覆盖，
         # 否则截断反而让守卫失效。
-        if unit[:n - covered] == seq[covered:]:
+        if truncated:
             covered = n
         if covered < _MIN_COVERAGE * n:
             continue
-        return unit
-    return None
+        return unit, repeats * unit_len
+    return None, 0
 
 
 def _find_tail_period(
@@ -86,9 +153,15 @@ def _find_tail_period(
     n = len(seq)
     if n < 4 or n > _MAX_TAIL_SCAN_UNITS:
         return None, n
-    max_unit_len = n // _MIN_TAIL_REPEATS
+    # Cap the unit length as _find_period does. Widening the divisor to admit
+    # long units also widened this O(n x max_unit_len) scan: 2048 non-repeating
+    # units measured 231 ms against 33 ms before. The coverage check below means
+    # a unit longer than half the segment can never qualify anyway.
+    max_unit_len = min(n // min(_MIN_TAIL_REPEATS, _MIN_REPEATS_LONG_UNIT),
+                       _MAX_PERIOD_UNIT_LEN)
     for unit_len in range(1, max_unit_len + 1):
-        need = _MIN_TAIL_REPEATS_SINGLE_CHAR if unit_len == 1 else _MIN_TAIL_REPEATS
+        # phase-dependent unit; the bar is recomputed per candidate below.
+        need = _MIN_TAIL_REPEATS
         # `phase` 允许最后一份是残缺的：max_generate_length 截断常把结尾切在半份
         # 上（「…我们看到我们看到我们」）。同一个 unit_len 下多个相位都可能成立，
         # 但它们是同一个周期的旋转，取覆盖最大的那个 —— 否则「前缀+我们看到×10+
@@ -106,7 +179,9 @@ def _find_tail_period(
                 if start < 0 or seq[start:stop] != unit:
                     break
                 repeats += 1
-            if repeats < need:
+            if repeats < _repeats_needed(
+                unit, _MIN_TAIL_REPEATS, _MIN_TAIL_REPEATS_SINGLE_CHAR
+            ):
                 continue
             covered = repeats * unit_len + phase
             if covered < _MIN_TAIL_COVERAGE * n:
@@ -116,6 +191,39 @@ def _find_tail_period(
         if best is not None:
             return best[1], n - best[0]
     return None, n
+
+
+def _find_interior_run(
+    seq: Sequence, min_repeats: int, min_repeats_single: Optional[int] = None
+) -> Optional[Tuple[int, int, int]]:
+    """找出段中间连续复读的一段；返回 (起始下标, 单元长度, 份数)。
+
+    与另外两个锚点的区别是它不要求复读解释整段，也不要求贴着结尾 —— 代价是
+    没有覆盖率可以兜底，所以只靠份数判定。有多处命中时取覆盖字数最多的那处。
+    """
+    n = len(seq)
+    if n < 4 or n > _MAX_TAIL_SCAN_UNITS:
+        return None
+    best: Optional[Tuple[int, int, int, int]] = None   # (covered, start, unit_len, repeats)
+    scan_to = min(_MAX_INTERIOR_UNIT_LEN, n // min(min_repeats, _MIN_REPEATS_LONG_UNIT))
+    # The loop bound uses the LOWEST bar any unit of this length could need; the
+    # per-candidate bar is computed below, once the unit's content is known.
+    floor = min(min_repeats, _MIN_REPEATS_LONG_UNIT)
+    for unit_len in range(1, scan_to + 1):
+        i = 0
+        while i + unit_len * floor <= n:
+            unit = seq[i:i + unit_len]
+            repeats = 1
+            while seq[i + repeats * unit_len:i + (repeats + 1) * unit_len] == unit:
+                repeats += 1
+            if repeats >= _repeats_needed(unit, min_repeats, min_repeats_single):
+                covered = repeats * unit_len
+                if best is None or covered > best[0]:
+                    best = (covered, i, unit_len, repeats)
+                i += repeats * unit_len
+            else:
+                i += 1
+    return (best[1], best[2], best[3]) if best else None
 
 
 def collapse_repetition(text: str) -> Tuple[str, bool]:
@@ -156,14 +264,63 @@ def collapse_repetition(text: str) -> Tuple[str, bool]:
         thresholds = (_MIN_REPEATS_MULTI_CHAR, _MIN_REPEATS_SINGLE_CHAR)
         joiner = ""
 
-    unit = _find_period(units, *thresholds)
+    unit, whole_covered = _find_period(units, *thresholds)
     if unit:
-        return joiner.join(unit), True
+        # Keep whatever the period did NOT explain. The 0.8 coverage allowance
+        # exists so a truncated final copy still counts, not so real trailing
+        # speech can be discarded — and once a long unit needs only three
+        # repeats, ordinary sentences reach that bar: "I want to be very clear"
+        # x3 + "about this" covers 0.9 and used to come back without the
+        # "about this".
+        rest = ""
+        if whole_covered < len(offsets):
+            tail = units[whole_covered:]
+            if tail != list(unit[:len(tail)]):     # not a truncated repeat
+                rest = stripped[offsets[whole_covered]:]
+        # Rebuild the kept copy from the ORIGINAL text, not from the
+        # punctuation-stripped unit sequence: re-joining units turns
+        # "However, due to the slow communication channels" into "However due
+        # to ...". Only the copy's own trailing separator goes, which is the
+        # artifact of it having been followed by another copy.
+        head = stripped[:offsets[len(unit)]].rstrip()
+        if not rest:
+            # Nothing follows, so the copy's trailing separator is dangling:
+            # 「帮我查一下，」×4 must collapse to 「帮我查一下」, not to
+            # 「帮我查一下，」.
+            return head.rstrip(_SEPARATORS), True
+        # Something does follow, and that separator is what joins them —
+        # dropping it turns "...channels, Styles in the West" into
+        # "...channels Styles in the West". The joiner still applies on top of
+        # it for spaced languages, or the comma runs into the next word.
+        return joiner.join([head, rest]) if joiner else head + rest, True
 
     tail_unit, tail_start = _find_tail_period(units, *thresholds)
     if tail_unit and tail_start > 0:
         prefix = stripped[:offsets[tail_start]].rstrip()
-        return joiner.join([prefix, joiner.join(tail_unit)]), True
+        # Slice the kept copy out of the original rather than re-joining the
+        # separator-stripped units: "intro " + "However, due " * 6 came back as
+        # "intro However due", losing the comma inside the retained copy.
+        end = tail_start + len(tail_unit)
+        kept = (stripped[offsets[tail_start]:offsets[end]] if end < len(offsets)
+                else stripped[offsets[tail_start]:]).rstrip().rstrip(_SEPARATORS)
+        return joiner.join([prefix, kept]), True
+
+    # Both scripts get the single-unit bar; spaced text used to be handed a
+    # one-element tuple, which silently let a repeated single WORD through at
+    # the multi-unit threshold.
+    interior_thresholds = (_MIN_INTERIOR_REPEATS, _MIN_INTERIOR_REPEATS_SINGLE)
+    found = _find_interior_run(units, *interior_thresholds)
+    if found:
+        start, unit_len, repeats = found
+        end = start + unit_len * repeats
+        # 保留第一份，删掉其余。按 stripped 的原始下标切，标点和两侧文本原样保留。
+        keep_to = offsets[start + unit_len]
+        resume_from = offsets[end] if end < len(offsets) else len(stripped)
+        # Keep the retained copy exactly as it was, punctuation included:
+        # "wait, wait, ... then continued" must not become "wait then continued".
+        head = stripped[:keep_to].rstrip()
+        tail = stripped[resume_from:]
+        return (joiner.join([head, tail]) if joiner else head + tail), True
     return text, False
 
 

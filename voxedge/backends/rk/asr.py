@@ -40,6 +40,7 @@ from typing import Optional
 
 import numpy as np
 
+from voxedge.audio.segment import split_at_silence_energy
 from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
@@ -125,61 +126,23 @@ def _split_at_silence_energy(
     energy_split_rms: float = 0.003,
     energy_min_silence_ms: int = 120,
 ) -> list[np.ndarray]:
-    max_seg = int(_VAD_MAX_SEG_SEC * sr)
-    min_seg = int(_VAD_MIN_SEG_SEC * sr)
-    if len(audio) <= max_seg:
-        return [audio]
+    """RK's tuning of the shared silence splitter.
 
-    frame_len = int(_VAD_FRAME_MS * sr / 1000)
-    n_frames = len(audio) // frame_len
-    if n_frames == 0:
-        return [audio]
-
-    framed = audio[: n_frames * frame_len].reshape(n_frames, frame_len)
-    rms = np.sqrt(np.mean(framed * framed, axis=1) + 1e-12)
-    threshold = energy_split_rms
-    is_silence = rms < threshold
-    min_run = max(1, int(energy_min_silence_ms) // _VAD_FRAME_MS)
-
-    cut_candidates: list[int] = []
-    run_start: Optional[int] = None
-    for i, silent in enumerate(is_silence):
-        if silent:
-            if run_start is None:
-                run_start = i
-        else:
-            if run_start is not None and i - run_start >= min_run:
-                cut_candidates.append(((run_start + i) // 2) * frame_len)
-            run_start = None
-    if run_start is not None and n_frames - run_start >= min_run:
-        cut_candidates.append(((run_start + n_frames) // 2) * frame_len)
-    cand = np.array(cut_candidates, dtype=np.int64)
-
-    cuts = [0]
-    while len(audio) - cuts[-1] > max_seg:
-        target = cuts[-1] + max_seg
-        lo = cuts[-1] + min_seg
-        hi = target
-        mask = (cand >= lo) & (cand <= hi)
-        if mask.any():
-            pick = int(cand[mask][np.argmax(cand[mask])])
-        else:
-            pick = int(target)
-        cuts.append(pick)
-    cuts.append(len(audio))
-
-    # Merge mid-fragments <1s into the previous segment to avoid model bailout
-    min_frag = int(1.0 * sr)
-    min_tail = int(1.5 * sr)
-    i = 1
-    while i < len(cuts) - 1:
-        if (cuts[i + 1] - cuts[i]) < min_frag:
-            cuts.pop(i)
-        else:
-            i += 1
-    while len(cuts) >= 3 and (cuts[-1] - cuts[-2]) < min_tail:
-        cuts.pop(-2)
-    return [audio[cuts[i] : cuts[i + 1]] for i in range(len(cuts) - 1)]
+    RK cuts more eagerly than the TRT-Edge-LLM caller (120 ms of silence rather
+    than 80 to accept a cut, 1.5 s rather than 2.0 before a tail is folded back
+    into its neighbour), which is why these are passed explicitly instead of
+    taking the shared defaults.
+    """
+    return split_at_silence_energy(
+        audio,
+        sr,
+        split_rms=energy_split_rms,
+        min_silence_ms=energy_min_silence_ms,
+        max_seg_s=_VAD_MAX_SEG_SEC,
+        min_seg_s=_VAD_MIN_SEG_SEC,
+        frame_ms=_VAD_FRAME_MS,
+        min_tail_s=1.5,
+    )
 
 
 def _float_to_wav_bytes(samples: np.ndarray, sr: int = 16000) -> bytes:
@@ -253,17 +216,7 @@ def _clean_segment_text(text) -> str:
     return stripped
 
 
-def _join_segments(texts: list[str], language: str) -> str:
-    texts = [t for t in texts if t]
-    if not texts:
-        return ""
-    if len(texts) > 1:
-        # Trim trailing CJK/Latin punctuation off all-but-last segments
-        trail = "。，、！？；,.!?;"
-        texts = [t.rstrip(trail).rstrip() for t in texts[:-1]] + [texts[-1]]
-    cjk = {"Chinese", "Japanese", "Korean", "Cantonese", "zh", "ja", "ko"}
-    sep = "" if (language in cjk or any(language.startswith(p) for p in ("zh", "ja", "ko"))) else " "
-    return sep.join(texts).strip()
+from voxedge.text.join import join_segments as _join_segments  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
