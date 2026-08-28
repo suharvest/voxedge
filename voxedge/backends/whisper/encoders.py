@@ -153,9 +153,15 @@ class TensorRTEncoder(Encoder):
         from voxedge.backends.jetson._util import CudaMemoryPool, arena_size_bytes
 
         self.window_s = window_s
-        logger_trt = trt.Logger(trt.Logger.WARNING)
+        # The Logger and Runtime must OUTLIVE the engine and its execution
+        # context — NVIDIA's lifetime contract. Building the engine from a
+        # temporary `trt.Runtime(...)` leaves both destroyed by the end of the
+        # statement, and everything after that is undefined behaviour that
+        # happens to work until it does not.
+        self._logger = trt.Logger(trt.Logger.WARNING)
+        self._runtime = trt.Runtime(self._logger)
         with open(plan_path, "rb") as f:
-            self._engine = trt.Runtime(logger_trt).deserialize_cuda_engine(f.read())
+            self._engine = self._runtime.deserialize_cuda_engine(f.read())
         if self._engine is None:
             raise RuntimeError(f"failed to deserialize {plan_path}")
         self._ctx = self._engine.create_execution_context()

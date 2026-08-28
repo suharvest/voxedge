@@ -77,6 +77,10 @@ class OnnxKVDecoder:
         # to whatever limit it is given.
         budget = int(max(16, min(220, audio_s * 8 + 12)))
         hard_cap = MAX_POSITIONS - len(forced) - 1
+        if max_new is not None and max_new < 1:
+            # range(-1) is empty, so the loop never runs and even a valid
+            # prefill argmax is discarded — the utterance comes back "".
+            raise ValueError(f"max_new must be >= 1, got {max_new}")
         cap = min(budget, hard_cap) if max_new is None else min(max_new, hard_cap)
 
         token_times: list[float] = []
@@ -100,7 +104,9 @@ class OnnxKVDecoder:
         for _ in range(cap):
             if nxt == EOT:
                 break
-            if nxt <= TIMESTAMP_BEGIN:
+            # `<` not `<=`: TIMESTAMP_BEGIN is the FIRST timestamp token, so
+            # the inclusive form let `<|0.00|>` through as literal text.
+            if nxt < TIMESTAMP_BEGIN:
                 text += vocab.get(str(nxt), "")
             t = time.perf_counter()
             feed: dict[str, np.ndarray] = {

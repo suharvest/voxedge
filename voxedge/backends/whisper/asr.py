@@ -104,6 +104,19 @@ class WhisperASRConfig:
             raise ValueError(
                 f"whisper: padding_cutoff_s must be >= 0, got {self.padding_cutoff_s}"
             )
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ValueError(
+                f"whisper: max_new_tokens must be >= 1, got {self.max_new_tokens}"
+            )
+        # Compare in SAMPLES, not seconds: a cutoff of 4.99999 against a 5 s
+        # window is "less than" by the float check and still leaves zero
+        # samples, which divides by zero when segments are capped.
+        if int((self.window_s - self.padding_cutoff_s) * SAMPLE_RATE) < SAMPLE_RATE // 10:
+            raise ValueError(
+                f"whisper: window_s={self.window_s} minus "
+                f"padding_cutoff_s={self.padding_cutoff_s} leaves under 100 ms "
+                f"of usable audio"
+            )
         if self.padding_cutoff_s >= self.window_s:
             raise ValueError(
                 f"whisper: padding_cutoff_s {self.padding_cutoff_s} leaves no audio "

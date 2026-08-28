@@ -70,10 +70,49 @@ def test_unsupported_language_is_refused_at_construction():
                          vocab_dir="z", language="fr")
 
 
-def test_padding_cutoff_may_not_consume_the_whole_window():
-    with pytest.raises(ValueError, match="no audio"):
+@pytest.mark.parametrize("cutoff", [5.0, 4.99999, 4.95])
+def test_a_cutoff_that_leaves_no_usable_audio_is_refused(cutoff):
+    """Checked in SAMPLES, not seconds.
+
+    4.99999 against a 5 s window passes a float "less than" and still leaves
+    zero samples, which divides by zero when segments are capped to the window.
+    """
+    with pytest.raises(ValueError, match="usable audio|no audio"):
         WhisperASRConfig(encoder_kind="hailo", encoder_path="x", decoder_dir="y",
-                         vocab_dir="z", window_s=5.0, padding_cutoff_s=5.0)
+                         vocab_dir="z", window_s=5.0, padding_cutoff_s=cutoff)
+
+
+@pytest.mark.parametrize("cap", [-1, 0])
+def test_a_token_cap_below_one_is_refused(cap):
+    """`range(-1)` is empty, so the greedy loop never runs and even a valid
+    prefill argmax is discarded — the utterance comes back empty."""
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        WhisperASRConfig(encoder_kind="rknn", encoder_path="x", decoder_dir="y",
+                         vocab_dir="z", max_new_tokens=cap)
+
+
+def test_the_first_timestamp_token_is_not_text():
+    """TIMESTAMP_BEGIN is the FIRST timestamp token; an inclusive comparison
+    emitted `<|0.00|>` into the transcript as literal text."""
+    from voxedge.backends.whisper.decoder import EOT, TIMESTAMP_BEGIN, OnnxKVDecoder
+
+    class _Session:
+        def __init__(self, outs): self._outs = outs
+        def get_outputs(self): return [type("O", (), {"name": "logits"})()]
+        def run(self, _, feed): return [self._outs.pop(0)]
+
+    def _logits(token):
+        row = np.full((1, 1, 51865), -1e9, dtype=np.float32)
+        row[0, -1, token] = 1.0
+        return row
+
+    dec = OnnxKVDecoder.__new__(OnnxKVDecoder)
+    dec._init = _Session([_logits(TIMESTAMP_BEGIN)])
+    dec._past = _Session([_logits(EOT)])
+    dec._past_inputs = {"input_ids"}
+    text, _ = dec.decode(np.zeros((1, 10, 8), dtype=np.float32),
+                         {str(TIMESTAMP_BEGIN): "<|0.00|>"}, "en", audio_s=1.0)
+    assert text == ""
 
 
 def test_no_language_id_capability():
