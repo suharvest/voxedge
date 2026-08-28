@@ -6,6 +6,7 @@ this backend is offline-only.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +87,14 @@ class WhisperASRConfig:
                 f"Qwen3-ASR for other languages"
             )
         self.language = lang
+        # nan and inf reach here from anything that is not the product env
+        # parser — a caller constructing the dataclass directly, a YAML float,
+        # a computed value. Every comparison against nan is False, so the range
+        # checks below cannot catch it: the invariant has to be stated here.
+        for name in ("window_s", "padding_cutoff_s", "overlap_check"):
+            value = getattr(self, name, 0.0)
+            if not math.isfinite(value):
+                raise ValueError(f"whisper: {name} must be finite, got {value!r}")
         if self.window_s <= 0:
             raise ValueError(f"whisper: window_s must be > 0, got {self.window_s}")
         if self.padding_cutoff_s < 0:
