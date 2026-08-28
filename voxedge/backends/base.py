@@ -225,6 +225,7 @@ class OfflineAccumulateStream(ASRStream):
         self._language = language
         self._buf: list = []
         self._warned_rates: set = set()
+        self._rate: Optional[int] = None
 
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         import numpy as np
@@ -234,19 +235,26 @@ class OfflineAccumulateStream(ASRStream):
         # 音高和语速全错且不报任何错。（SenseVoice-TRT 把 16000 硬编码进了自己
         # 的 fbank，所以这条路一直是静默错的。）
         #
-        # 抛异常会把"降级但能跑"变成崩溃，所以这里重采样，并且每个异常采样率
-        # 只告警一次 —— 逐帧告警会淹掉日志。
+        # 但重采样要留到 finalize 一次做完，**不能逐块做**：每块独立插值会在
+        # 每个块边界留下不连续点，实测 8k→16k 的 440Hz 正弦上是 0.17 幅度的
+        # 周期性毛刺（信号峰值 1.0），而且非整数倍率下长度会累积漂移
+        # （22050→16000、200 块累计 +4.6ms）。这里只记采样率。
         expected = self._backend.sample_rate
-        if sample_rate != expected:
-            if sample_rate not in self._warned_rates:
-                self._warned_rates.add(sample_rate)
-                logger.warning(
-                    "%s: resampling %d Hz -> %d Hz. Feeding the backend's own "
-                    "rate avoids this; linear interpolation is adequate for "
-                    "speech but is not a resampler.",
-                    self._backend.name, sample_rate, expected,
-                )
-            samples = _resample_linear(samples, sample_rate, expected)
+        if sample_rate != expected and sample_rate not in self._warned_rates:
+            self._warned_rates.add(sample_rate)
+            logger.warning(
+                "%s: will resample %d Hz -> %d Hz at finalize. Feeding the "
+                "backend's own rate avoids this; linear interpolation is "
+                "adequate for speech but is not a resampler.",
+                self._backend.name, sample_rate, expected,
+            )
+        if self._rate is None:
+            self._rate = sample_rate
+        elif self._rate != sample_rate:
+            raise ValueError(
+                f"{self._backend.name}: sample rate changed mid-utterance "
+                f"({self._rate} -> {sample_rate}); one utterance is one rate"
+            )
         # copy(): np.asarray 对已经是 float32 的输入返回**同一个对象**，于是
         # 缓冲区里存的是调用方的数组。调用方复用或清零它之后，finalize 转写的
         # 就是被改过的内容。
@@ -263,12 +271,17 @@ class OfflineAccumulateStream(ASRStream):
         if not self._buf:
             return "", None
         audio = np.concatenate(self._buf) if len(self._buf) > 1 else self._buf[0]
+        # ONE resample over the whole utterance — see accept_waveform.
+        if self._rate is not None and self._rate != self._backend.sample_rate:
+            audio = _resample_linear(audio, self._rate, self._backend.sample_rate)
         self._buf = []
+        self._rate = None
         result = self._backend.transcribe_array(audio, self._language)
         return result.text, result.language
 
     def close(self) -> None:
         self._buf = []
+        self._rate = None
 
 
 class ASRBackend(ABC):

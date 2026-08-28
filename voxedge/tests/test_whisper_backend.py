@@ -404,3 +404,52 @@ def test_a_failed_construction_releases_the_accelerator():
 
     for cls in (encoders.HailoEncoder, encoders.RknnEncoder):
         assert "self.close()" in inspect.getsource(cls.__init__), cls.__name__
+
+
+def test_resampling_happens_once_over_the_whole_utterance():
+    """Per-chunk resampling leaves a discontinuity at every chunk boundary.
+
+    Measured on a 440 Hz sine at 8 k -> 16 k: 0.17 of amplitude against a
+    signal whose peak is 1.0, repeating at the chunk period. Non-integral
+    ratios also drift in length — 22050 -> 16000 over 200 chunks accumulated
+    4.6 ms. This stream accumulates and transcribes once, so it can resample
+    once, and the result must equal resampling the utterance whole.
+    """
+    from voxedge.backends.base import (
+        OfflineAccumulateStream, TranscriptionResult, _resample_linear,
+    )
+
+    class _Backend:
+        name, sample_rate = "fake", 16000
+        def __init__(self): self.seen = None
+        def transcribe_array(self, samples, language="auto"):
+            self.seen = samples
+            return TranscriptionResult(text=str(samples.size))
+
+    src = 8000
+    t = np.arange(src) / src
+    sine = np.sin(2 * np.pi * 440 * t).astype(np.float32)
+
+    backend = _Backend()
+    stream = OfflineAccumulateStream(backend)
+    for i in range(0, sine.size, 160):
+        stream.accept_waveform(src, sine[i:i + 160])
+    assert stream.finalize()[0] == "16000"
+    expected = _resample_linear(sine, src, 16000)
+    assert np.array_equal(backend.seen, expected), "chunking changed the audio"
+
+
+def test_the_rate_may_not_change_mid_utterance():
+    """One utterance is one rate; a change means the caller is confused, and
+    silently resampling two halves differently would hide it."""
+    from voxedge.backends.base import OfflineAccumulateStream, TranscriptionResult
+
+    class _Backend:
+        name, sample_rate = "fake", 16000
+        def transcribe_array(self, samples, language="auto"):
+            return TranscriptionResult(text="")
+
+    stream = OfflineAccumulateStream(_Backend())
+    stream.accept_waveform(16000, np.ones(10, dtype=np.float32))
+    with pytest.raises(ValueError, match="changed mid-utterance"):
+        stream.accept_waveform(8000, np.ones(10, dtype=np.float32))
