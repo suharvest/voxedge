@@ -311,11 +311,14 @@ def test_read_vocab_splits_on_the_first_space_only():
     from voxedge.backends.whisper.decoder import read_vocab
 
     p = _P(tempfile.mkstemp(suffix=".txt")[1])
-    p.write_text("123 foo bar\n456  leading\n789 \n", encoding="utf-8")
+    # The line is `<id><SP><token>`, so a token that is itself a single space
+    # is written with TWO spaces; one space means an empty token.
+    p.write_text("123 foo bar\n456  leading\n789  \n012 \n", encoding="utf-8")
     vocab = read_vocab(p)
     assert vocab["123"] == "foo bar"
     assert vocab["456"] == " leading"
     assert vocab["789"] == " "
+    assert vocab["012"] == ""
     p.unlink()
 
 
