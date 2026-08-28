@@ -297,7 +297,13 @@ def collapse_repetition(text: str) -> Tuple[str, bool]:
     tail_unit, tail_start = _find_tail_period(units, *thresholds)
     if tail_unit and tail_start > 0:
         prefix = stripped[:offsets[tail_start]].rstrip()
-        return joiner.join([prefix, joiner.join(tail_unit)]), True
+        # Slice the kept copy out of the original rather than re-joining the
+        # separator-stripped units: "intro " + "However, due " * 6 came back as
+        # "intro However due", losing the comma inside the retained copy.
+        end = tail_start + len(tail_unit)
+        kept = (stripped[offsets[tail_start]:offsets[end]] if end < len(offsets)
+                else stripped[offsets[tail_start]:]).rstrip().rstrip(_SEPARATORS)
+        return joiner.join([prefix, kept]), True
 
     # Both scripts get the single-unit bar; spaced text used to be handed a
     # one-element tuple, which silently let a repeated single WORD through at

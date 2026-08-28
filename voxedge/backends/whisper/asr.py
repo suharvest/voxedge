@@ -88,6 +88,13 @@ class WhisperASRConfig:
         self.language = lang
         if self.window_s <= 0:
             raise ValueError(f"whisper: window_s must be > 0, got {self.window_s}")
+        if self.padding_cutoff_s < 0:
+            # A negative cutoff makes the usable window LONGER than the graph,
+            # and the front end then truncates the excess silently — the one
+            # failure mode this class exists to prevent.
+            raise ValueError(
+                f"whisper: padding_cutoff_s must be >= 0, got {self.padding_cutoff_s}"
+            )
         if self.padding_cutoff_s >= self.window_s:
             raise ValueError(
                 f"whisper: padding_cutoff_s {self.padding_cutoff_s} leaves no audio "
