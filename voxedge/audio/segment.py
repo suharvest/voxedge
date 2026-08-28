@@ -87,8 +87,11 @@ def split_at_silence_energy(
     min_tail_s: float = 2.0,
 ) -> list[np.ndarray]:
     """Dependency-free splitter: frame RMS to find silence gaps."""
-    max_seg = int(max_seg_s * sr)
-    min_seg = int(min_seg_s * sr)
+    # round(), not int(): a caller computing max_seg_s as a difference of
+    # floats (a window minus a boundary cutoff) lands just under the integer,
+    # and truncating then splits an utterance exactly one segment long.
+    max_seg = round(max_seg_s * sr)
+    min_seg = round(min_seg_s * sr)
     if len(audio) <= max_seg:
         return [audio]
 
@@ -120,8 +123,8 @@ def split_at_silence_energy(
         np.array(cut_candidates, dtype=np.int64),
         max_seg=max_seg,
         min_seg=min_seg,
-        min_frag=int(min_frag_s * sr),
-        min_tail=int(min_tail_s * sr),
+        min_frag=round(min_frag_s * sr),
+        min_tail=round(min_tail_s * sr),
     )
 
 
@@ -140,8 +143,11 @@ def split_at_silence_vad(
     """Same cut selection, with webrtcvad deciding what counts as silence."""
     import webrtcvad
 
-    max_seg = int(max_seg_s * sr)
-    min_seg = int(min_seg_s * sr)
+    # round(), not int(): a caller computing max_seg_s as a difference of
+    # floats (a window minus a boundary cutoff) lands just under the integer,
+    # and truncating then splits an utterance exactly one segment long.
+    max_seg = round(max_seg_s * sr)
+    min_seg = round(min_seg_s * sr)
     if len(audio) <= max_seg:
         return [audio]
 
@@ -180,6 +186,6 @@ def split_at_silence_vad(
         np.array(cut_candidates, dtype=np.int64),
         max_seg=max_seg,
         min_seg=min_seg,
-        min_frag=int(min_frag_s * sr),
-        min_tail=int(min_tail_s * sr),
+        min_frag=round(min_frag_s * sr),
+        min_tail=round(min_tail_s * sr),
     )

@@ -453,3 +453,65 @@ def test_the_rate_may_not_change_mid_utterance():
     stream.accept_waveform(16000, np.ones(10, dtype=np.float32))
     with pytest.raises(ValueError, match="changed mid-utterance"):
         stream.accept_waveform(8000, np.ones(10, dtype=np.float32))
+
+
+def test_downsampling_attenuates_instead_of_folding():
+    """Interpolation alone is fine going up and wrong going down.
+
+    Content above the new Nyquist folds back into the band rather than
+    disappearing: a 12 kHz tone in 48 kHz input arrived as a full-amplitude
+    4 kHz component after resampling to 16 kHz — inside the speech band, and
+    indistinguishable from real audio downstream.
+    """
+    from voxedge.backends.base import _resample_linear
+
+    src, dst = 48000, 16000
+    t = np.arange(src) / src
+
+    def _peak(freq):
+        out = _resample_linear(np.sin(2 * np.pi * freq * t).astype(np.float32), src, dst)
+        spectrum = np.abs(np.fft.rfft(out))
+        return spectrum.max() / len(out) * 2
+
+    assert _peak(12000) < 0.4, "the alias is not attenuated"
+    assert _peak(1000) > 0.9, "real speech content was damaged"
+
+
+def test_an_empty_chunk_is_not_audio():
+    """It reached `np.stack([])` in some backends, and letting it pin the
+    stream's rate would reject the first real chunk at a different one."""
+    from voxedge.backends.base import OfflineAccumulateStream, TranscriptionResult
+
+    class _Backend:
+        name, sample_rate = "fake", 16000
+        def transcribe_array(self, samples, language="auto"):
+            return TranscriptionResult(text=str(samples.size))
+
+    stream = OfflineAccumulateStream(_Backend())
+    stream.accept_waveform(16000, np.array([], dtype=np.float32))
+    assert stream.finalize() == ("", None)
+
+    stream = OfflineAccumulateStream(_Backend())
+    stream.accept_waveform(16000, np.array([], dtype=np.float32))
+    stream.accept_waveform(8000, np.ones(80, dtype=np.float32))   # must not raise
+    assert stream.finalize()[0] == "160"
+
+
+def test_every_seconds_to_samples_conversion_rounds():
+    """The guard, the splitter, the segmenter and the mel front end must agree.
+
+    A usable window computed as a difference of floats lands just under the
+    integer, and any truncating conversion then splits an utterance that is
+    exactly one window long.
+    """
+    from voxedge.audio.segment import split_at_silence_energy
+    from voxedge.backends.whisper.frontend import log_mel
+
+    usable = 5.0 - 1.0000000000000004        # 4.0 minus a float's worth
+    audio = np.random.RandomState(0).normal(0, 0.15, 128000).astype(np.float32)
+    assert [len(c) for c in split_at_silence_energy(
+        audio, 16000, max_seg_s=usable)] == [64000, 64000]
+
+    mel = log_mel(np.ones(1600, dtype=np.float32),
+                  np.zeros((80, 201), dtype=np.float32), 5.0, 4.9)
+    assert mel.shape[1] == 500

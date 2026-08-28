@@ -186,16 +186,29 @@ class ASRStream(ABC):
 
 
 def _resample_linear(samples, src_sr: int, target_sr: int):
-    """Dependency-free linear resample, mirroring capabilities/speaker_embedding.
+    """Dependency-free resample: box-filter decimation, then linear interpolation.
 
-    Not a real resampler — no anti-aliasing — but adequate for speech and far
-    better than reading the samples at the wrong rate outright.
+    Interpolation alone is fine going UP, and wrong going down: content above
+    the new Nyquist folds back into the band instead of disappearing. A 12 kHz
+    tone in 48 kHz input became a full-amplitude 4 kHz component after
+    resampling to 16 kHz — squarely inside the speech band, and indistinguishable
+    from real audio to everything downstream.
+
+    A moving average over the decimation ratio is the cheapest honest answer:
+    it is a crude low-pass, but it attenuates rather than folds, and it keeps
+    this helper numpy-only. It is still not a resampler; feeding the backend's
+    own rate remains the right thing to do.
     """
     import numpy as np
 
     samples = np.asarray(samples, dtype=np.float32)
     if src_sr == target_sr or samples.size == 0:
         return samples
+    if target_sr < src_sr:
+        width = int(src_sr // target_sr)
+        if width > 1 and samples.size >= width:
+            kernel = np.ones(width, dtype=np.float32) / width
+            samples = np.convolve(samples, kernel, mode="same").astype(np.float32)
     n_out = int(round(samples.size * target_sr / src_sr))
     if n_out <= 0:
         return np.zeros(0, dtype=np.float32)
@@ -239,6 +252,12 @@ class OfflineAccumulateStream(ASRStream):
         # 每个块边界留下不连续点，实测 8k→16k 的 440Hz 正弦上是 0.17 幅度的
         # 周期性毛刺（信号峰值 1.0），而且非整数倍率下长度会累积漂移
         # （22050→16000、200 块累计 +4.6ms）。这里只记采样率。
+        samples = np.asarray(samples, dtype=np.float32)
+        if samples.size == 0:
+            # Not audio. Appending it reaches np.stack([]) in some backends,
+            # and letting it pin the rate would reject the first real chunk.
+            return
+
         expected = self._backend.sample_rate
         if sample_rate != expected and sample_rate not in self._warned_rates:
             self._warned_rates.add(sample_rate)
@@ -258,7 +277,7 @@ class OfflineAccumulateStream(ASRStream):
         # copy(): np.asarray 对已经是 float32 的输入返回**同一个对象**，于是
         # 缓冲区里存的是调用方的数组。调用方复用或清零它之后，finalize 转写的
         # 就是被改过的内容。
-        self._buf.append(np.array(samples, dtype=np.float32, copy=True))
+        self._buf.append(samples.copy())
 
     def get_partial(self) -> tuple[str, bool]:
         # Offline models produce no incremental partials; the server-side VAD

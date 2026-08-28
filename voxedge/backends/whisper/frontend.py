@@ -47,9 +47,12 @@ def log_mel(
     the waveform to (window - cutoff) first, then pad back out to window, so the
     tail of the window is always silence.
     """
-    tgt = int(window_s * SAMPLE_RATE)
+    # round(), matching window_samples() in asr.py. Truncating here while the
+    # guard rounds silently dropped the last sample of a chunk that was exactly
+    # one usable window long.
+    tgt = round(window_s * SAMPLE_RATE)
     if padding_cutoff_s > 0:
-        crop = int((window_s - padding_cutoff_s) * SAMPLE_RATE)
+        crop = round((window_s - padding_cutoff_s) * SAMPLE_RATE)
         head = np.zeros(crop, dtype=np.float64)
         n = min(len(audio), crop)
         head[:n] = audio[:n]
@@ -75,4 +78,4 @@ def log_mel(
     ls = np.log10(np.clip(mel, 1e-10, None))
     ls = np.maximum(ls, ls.max() - 8.0)
     ls = ((ls + 4.0) / 4.0).astype(np.float32)
-    return np.ascontiguousarray(ls[:, : int(window_s * 100)])
+    return np.ascontiguousarray(ls[:, : round(window_s * 100)])
