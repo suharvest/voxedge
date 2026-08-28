@@ -148,6 +148,14 @@ class TensorRTEncoder(Encoder):
     """
 
     def __init__(self, plan_path: str | Path, window_s: float, arena_size_mb: int = 16):
+        # Set before anything that can fail, so close() has a consistent object
+        # to work with no matter how far construction got.
+        self._pool = None
+        self._runtime = self._logger = self._engine = self._ctx = None
+        self._dev: dict[str, int] = {}
+        self._bufs: dict[str, int] = {}
+        self._sizes: tuple[int, int] = (0, 0)
+
         import tensorrt as trt
 
         from voxedge.backends.jetson._util import CudaMemoryPool, arena_size_bytes
@@ -173,8 +181,6 @@ class TensorRTEncoder(Encoder):
         # per call. The encoder's two buffers are fixed-size once the window is
         # fixed, so the arena is reset (not freed) between calls.
         self._pool = CudaMemoryPool(arena_size_bytes(arena_size_mb))
-        self._bufs: dict[str, int] = {}
-        self._sizes: tuple[int, int] = (0, 0)
 
     def run(self, mel: np.ndarray) -> np.ndarray:
         inp = mel[None, :, :]
@@ -206,13 +212,37 @@ class TensorRTEncoder(Encoder):
         return out
 
     def close(self) -> None:
-        self._bufs.clear()
-        try:
-            self._pool.destroy()
-        except Exception:
-            logger.exception("whisper TRT encoder: pool destroy raised; continuing")
+        """Release everything, in reverse construction order, exactly once.
+
+        Tolerates a half-constructed object throughout: ``preload`` calls this
+        from its failure path, so an AttributeError here would replace the real
+        cause — a bad plan, a missing file — with a complaint about a buffer
+        dict. Every attribute is read defensively rather than assuming
+        ``__init__`` ran to completion.
+        """
+        cudart = getattr(self, "_cudart", None)
+        if cudart is not None:
+            for ptr in getattr(self, "_dev", {}).values():
+                try:
+                    cudart.cudaFree(ptr)
+                except Exception:
+                    pass
+        getattr(self, "_dev", {}).clear()
+        getattr(self, "_bufs", {}).clear()
+
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            try:
+                pool.destroy()
+            except Exception:
+                logger.exception("whisper TRT encoder: pool destroy raised; continuing")
+        self._pool = None
+
+        # The Runtime must outlive the engine and the context, so it goes last.
         self._ctx = None
         self._engine = None
+        self._runtime = None
+        self._logger = None
 
 
 def build_encoder(kind: str, path: str | Path, window_s: float, **kw) -> Encoder:

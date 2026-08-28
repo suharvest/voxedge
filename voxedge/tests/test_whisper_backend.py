@@ -245,3 +245,38 @@ def test_base64_decode_stops_at_padding_and_trims_the_buffer():
 def test_detokenize_only_base64_decodes_chinese():
     assert detokenize("Ġhello", "en") == " hello"
     assert detokenize("5L2g5aW9", "zh") == "你好"
+
+
+@pytest.mark.parametrize("kind", ["hailo", "rknn", "tensorrt"])
+def test_close_survives_a_half_constructed_encoder(kind):
+    """`preload` calls close() from its failure path.
+
+    An encoder whose __init__ raised partway — a bad plan, a missing HEF — must
+    still be closable, or the AttributeError replaces the real cause and the
+    operator sees a complaint about a buffer dict instead of the file that was
+    wrong. Calling it twice must also be safe.
+    """
+    from voxedge.backends.whisper import encoders
+
+    cls = {"hailo": encoders.HailoEncoder, "rknn": encoders.RknnEncoder,
+           "tensorrt": encoders.TensorRTEncoder}[kind]
+    obj = cls.__new__(cls)          # __init__ never ran
+    obj.close()
+    obj.close()
+
+
+def test_the_tensorrt_runtime_outlives_the_engine():
+    """NVIDIA's lifetime contract: the Runtime and Logger must outlive the
+    engine and its execution context. Deserializing from a temporary
+    `trt.Runtime(...)` destroys both at the end of the statement, and what
+    follows is undefined behaviour that works until it does not."""
+    import inspect
+
+    from voxedge.backends.whisper.encoders import TensorRTEncoder
+
+    init = inspect.getsource(TensorRTEncoder.__init__)
+    assert "self._runtime = trt.Runtime(self._logger)" in init
+    assert "trt.Runtime(logger" not in init          # no temporary
+    # and teardown order: the runtime is dropped after the context and engine
+    close = inspect.getsource(TensorRTEncoder.close)
+    assert close.index("_ctx = None") < close.index("_runtime = None")
