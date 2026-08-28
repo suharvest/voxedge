@@ -151,32 +151,52 @@ class WhisperASR(ASRBackend):
 
     # ── lifecycle ───────────────────────────────────────────────────────
     def preload(self) -> None:
+        """Load and warm up. Either everything works or the backend stays unready.
+
+        Nothing is published to ``self`` until the warmup inference has
+        succeeded. Assigning as we go looked harmless and was not: a warmup
+        failure left ``is_ready()`` True, the server logged the exception and
+        carried on, and the first real utterance then reused a runtime that had
+        already failed to run once.
+        """
         if self.is_ready():
             return
         cfg = self._cfg
         vocab_dir = Path(cfg.vocab_dir)
-        self._filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
-        self._vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
-        self._decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
-        self._encoder = build_encoder(
+        filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
+        vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
+        decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
+        encoder = build_encoder(
             cfg.encoder_kind,
             cfg.encoder_path,
             cfg.window_s,
             padding_cutoff_s=cfg.padding_cutoff_s,
             all_cores=cfg.all_cores,
         )
-        for _ in range(max(0, cfg.warmup_runs)):
-            # First inference on every one of these runtimes pays a one-off
-            # setup cost (JIT, memory pool, engine context). Paying it here
-            # keeps it out of the first user utterance's TTFT.
-            self._encoder.run(
-                log_mel(
-                    np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
-                    self._filters,
-                    cfg.window_s,
-                    cfg.padding_cutoff_s,
+        try:
+            for _ in range(max(0, cfg.warmup_runs)):
+                # First inference on every one of these runtimes pays a one-off
+                # setup cost (JIT, memory pool, engine context). Paying it here
+                # keeps it out of the first user utterance's TTFT.
+                encoder.run(
+                    log_mel(
+                        np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
+                        filters,
+                        cfg.window_s,
+                        cfg.padding_cutoff_s,
+                    )
                 )
-            )
+        except Exception:
+            # Release the accelerator handle; on Hailo it is the whole device,
+            # and holding it would block the next attempt as well.
+            try:
+                encoder.close()
+            except Exception:
+                logger.exception("whisper: encoder close after failed warmup raised")
+            raise
+
+        self._filters, self._vocab = filters, vocab
+        self._decoder, self._encoder = decoder, encoder
         logger.info(
             "whisper: %s encoder @%.1fs window, CPU KV decoder, lang=%s",
             cfg.encoder_kind, cfg.window_s, cfg.language,
