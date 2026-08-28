@@ -373,3 +373,34 @@ def test_the_offline_stream_copies_and_checks_the_rate():
     stream = OfflineAccumulateStream(_Counting())
     stream.accept_waveform(8000, np.ones(8000, dtype=np.float32))
     assert stream.finalize()[0] == "16000", "one second at 8 kHz is one second"
+
+
+def test_an_utterance_exactly_one_window_long_is_not_split():
+    """The guard and the splitter must convert seconds to samples identically.
+
+    The guard rounded and the splitter truncated, so `(5.0 - 4.9) * 16000 ==
+    1599.9999999999943` was accepted as 1600 and enforced as 1599 — cutting an
+    utterance exactly one window long into two half-windows.
+    """
+    from voxedge.backends.whisper.asr import _enforce_window, window_samples
+
+    usable = 5.0 - 4.9
+    limit = window_samples(usable)
+    assert limit == 1600
+    assert [len(c) for c in _enforce_window([np.zeros(limit, np.float32)], usable)] == [limit]
+    assert len(_enforce_window([np.zeros(limit + 1, np.float32)], usable)) == 2
+
+
+def test_a_failed_construction_releases_the_accelerator():
+    """`build_encoder` has not returned, so the caller has no object to close.
+
+    An RKNNLite whose init_runtime failed still holds NPU context, and a leaked
+    Hailo VDevice blocks every later attempt on the box — HailoRT grants
+    /dev/hailo0 to one process.
+    """
+    import inspect
+
+    from voxedge.backends.whisper import encoders
+
+    for cls in (encoders.HailoEncoder, encoders.RknnEncoder):
+        assert "self.close()" in inspect.getsource(cls.__init__), cls.__name__

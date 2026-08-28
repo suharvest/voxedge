@@ -50,6 +50,7 @@ class HailoEncoder(Encoder):
         self.padding_cutoff_s = padding_cutoff_s
         self._timeout_ms = timeout_ms
 
+        self._vdev = self._model = self._configured = None
         params = VDevice.create_params()
         # Without a scheduling algorithm the network group is never activated and
         # every inference returns HAILO_STREAM_NOT_ACTIVATED (72) — while still
@@ -57,21 +58,26 @@ class HailoEncoder(Encoder):
         # single token per chunk rather than raising.
         params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
         self._vdev = VDevice(params)
-
-        self._model = self._vdev.create_infer_model(str(hef_path))
+        try:
+            self._model = self._vdev.create_infer_model(str(hef_path))
         # BOTH sides, not just the input: the output otherwise stays the HEF's
         # native UINT8 and the float32 buffer handed to it is 4x the expected
         # size (HAILO_INVALID_OPERATION, "768000 is different than expected
         # 192000").
-        self._model.input().set_format_type(FormatType.FLOAT32)
-        self._model.output().set_format_type(FormatType.FLOAT32)
+            self._model.input().set_format_type(FormatType.FLOAT32)
+            self._model.output().set_format_type(FormatType.FLOAT32)
 
         # configure() and create_bindings() once, then reuse. Rebuilding the
         # bindings per call is pure overhead on a path whose whole point is a
         # 24 ms encoder. Safe because this backend declares max_concurrent=1.
-        self._configured = self._model.configure()
-        self._bindings = self._configured.create_bindings()
-        self._out = np.zeros(self._model.output().shape, dtype=np.float32)
+            self._configured = self._model.configure()
+            self._bindings = self._configured.create_bindings()
+            self._out = np.zeros(self._model.output().shape, dtype=np.float32)
+        except Exception:
+            # HailoRT grants /dev/hailo0 to ONE process; leaking the VDevice
+            # here would block every later attempt on this box.
+            self.close()
+            raise
 
     def run(self, mel: np.ndarray) -> np.ndarray:
         # HEF encoders take NHWC: [1, 1, frames, n_mels]
@@ -117,13 +123,20 @@ class RknnEncoder(Encoder):
 
         self.window_s = window_s
         self._rt = RKNNLite()
-        if self._rt.load_rknn(str(rknn_path)) != 0:
-            raise RuntimeError(f"load_rknn failed: {rknn_path}")
-        kwargs = {}
-        if all_cores:
-            kwargs["core_mask"] = RKNNLite.NPU_CORE_0_1_2
-        if self._rt.init_runtime(**kwargs) != 0:
-            raise RuntimeError(f"init_runtime failed: {rknn_path}")
+        # Release on every failure path. `build_encoder` has not returned yet,
+        # so the caller has no object to close — and a loaded RKNNLite whose
+        # init_runtime failed still holds NPU context that nothing else frees.
+        try:
+            if self._rt.load_rknn(str(rknn_path)) != 0:
+                raise RuntimeError(f"load_rknn failed: {rknn_path}")
+            kwargs = {}
+            if all_cores:
+                kwargs["core_mask"] = RKNNLite.NPU_CORE_0_1_2
+            if self._rt.init_runtime(**kwargs) != 0:
+                raise RuntimeError(f"init_runtime failed: {rknn_path}")
+        except Exception:
+            self.close()
+            raise
 
     def run(self, mel: np.ndarray) -> np.ndarray:
         return self._rt.inference(inputs=[mel[None, :, :]])[0]

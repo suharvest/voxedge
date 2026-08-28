@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 _SUPPORTED = ("en", "zh")
 
 
+def window_samples(usable_s: float) -> int:
+    """Seconds to samples, in ONE place.
+
+    The guard rounded and the splitter truncated, so `(5.0 - 4.9) * 16000 ==
+    1599.9999999999943` was accepted as 1600 and then enforced as 1599 —
+    splitting an utterance exactly one window long into two half-windows.
+    """
+    return round(usable_s * SAMPLE_RATE)
+
+
 @dataclass
 class WhisperASRConfig:
     """Explicit construction-time config. Nothing here reads ``os.environ``.
@@ -123,7 +133,7 @@ class WhisperASRConfig:
         # samples, which divides by zero when segments are capped.
         # round(), not int(): (5.0 - 4.9) * 16000 is 1599.9999999999943, and
         # truncating rejected a window that is exactly 100 ms.
-        if round((self.window_s - self.padding_cutoff_s) * SAMPLE_RATE) < SAMPLE_RATE // 10:
+        if window_samples(self.window_s - self.padding_cutoff_s) < SAMPLE_RATE // 10:
             raise ValueError(
                 f"whisper: window_s={self.window_s} minus "
                 f"padding_cutoff_s={self.padding_cutoff_s} leaves under 100 ms "
@@ -146,7 +156,7 @@ def _enforce_window(chunks: list[np.ndarray], usable_s: float) -> list[np.ndarra
     is truncated — the tail is dropped with no error anywhere. Splitting it
     evenly keeps the pieces balanced instead of leaving a runt at the end.
     """
-    limit = int(usable_s * SAMPLE_RATE)
+    limit = window_samples(usable_s)
     out: list[np.ndarray] = []
     for chunk in chunks:
         if len(chunk) <= limit:
