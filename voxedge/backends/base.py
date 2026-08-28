@@ -209,7 +209,19 @@ class OfflineAccumulateStream(ASRStream):
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         import numpy as np
 
-        self._buf.append(np.asarray(samples, dtype=np.float32))
+        # 采样率必须匹配：这个 stream 只累积不重采样，喂错采样率会被当成
+        # 时长不同的同一段音频（8k 的 8000 个样本被当成 16k 的 0.5 秒），
+        # 结果是音高和语速都错的转写，而且不报任何错。宁可在这里炸。
+        expected = self._backend.sample_rate
+        if sample_rate != expected:
+            raise ValueError(
+                f"{self._backend.name}: got {sample_rate} Hz, backend needs "
+                f"{expected} Hz; this stream accumulates, it does not resample"
+            )
+        # copy(): np.asarray 对已经是 float32 的输入返回**同一个对象**，于是
+        # 缓冲区里存的是调用方的数组。调用方复用或清零它之后，finalize 转写的
+        # 就是被改过的内容。
+        self._buf.append(np.array(samples, dtype=np.float32, copy=True))
 
     def get_partial(self) -> tuple[str, bool]:
         # Offline models produce no incremental partials; the server-side VAD

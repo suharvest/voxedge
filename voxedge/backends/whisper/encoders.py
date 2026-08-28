@@ -87,8 +87,11 @@ class HailoEncoder(Encoder):
         self._bindings = None
         self._configured = None
         self._model = None
+        vdev, self._vdev = getattr(self, "_vdev", None), None
+        if vdev is None:
+            return          # never constructed, or already closed
         try:
-            self._vdev.release()
+            vdev.release()
         except Exception:
             # release() is known to segfault on some HailoRT builds after a
             # clean run; the data is already out by then.
@@ -126,8 +129,11 @@ class RknnEncoder(Encoder):
         return self._rt.inference(inputs=[mel[None, :, :]])[0]
 
     def close(self) -> None:
+        rt, self._rt = getattr(self, "_rt", None), None
+        if rt is None:
+            return          # never constructed, or already closed
         try:
-            self._rt.release()
+            rt.release()
         except Exception:
             pass
 

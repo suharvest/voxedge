@@ -104,9 +104,12 @@ class OnnxKVDecoder:
         for _ in range(cap):
             if nxt == EOT:
                 break
-            # `<` not `<=`: TIMESTAMP_BEGIN is the FIRST timestamp token, so
-            # the inclusive form let `<|0.00|>` through as literal text.
-            if nxt < TIMESTAMP_BEGIN:
+            # Text ids are strictly below EOT; everything from EOT up is a
+            # special — EOT, SOT, the language tags, the task tags,
+            # NO_TIMESTAMPS, then the timestamps. Bounding at TIMESTAMP_BEGIN
+            # only excluded the last group, so a `<|startoftranscript|>` or
+            # `<|transcribe|>` argmax still landed in the transcript verbatim.
+            if nxt < EOT:
                 text += vocab.get(str(nxt), "")
             t = time.perf_counter()
             feed: dict[str, np.ndarray] = {
@@ -136,8 +139,13 @@ def read_vocab(path: str | Path) -> dict[str, str]:
     vocab: dict[str, str] = {}
     with open(path, "r") as f:
         for line in f:
-            parts = line.strip().split(" ")
-            vocab[parts[0]] = parts[1] if len(parts) >= 2 else ""
+            # Only the newline goes. `.strip()` would eat a token that IS a
+            # space or begins with one — that is how word boundaries are
+            # encoded — and splitting on every space truncated any token
+            # containing one ("123 foo bar" mapped 123 to "foo").
+            key, _, value = line.rstrip("\n").partition(" ")
+            if key:
+                vocab[key] = value
     return vocab
 
 

@@ -104,14 +104,26 @@ class WhisperASRConfig:
             raise ValueError(
                 f"whisper: padding_cutoff_s must be >= 0, got {self.padding_cutoff_s}"
             )
-        if self.max_new_tokens is not None and self.max_new_tokens < 1:
-            raise ValueError(
-                f"whisper: max_new_tokens must be >= 1, got {self.max_new_tokens}"
-            )
+        if self.max_new_tokens is not None:
+            # `range()` needs an int: 1.5 passed a ">= 1" check and then raised
+            # TypeError inside the decode loop, and nan passes every comparison.
+            if not isinstance(self.max_new_tokens, int) or isinstance(
+                self.max_new_tokens, bool
+            ):
+                raise ValueError(
+                    f"whisper: max_new_tokens must be an int, got "
+                    f"{self.max_new_tokens!r}"
+                )
+            if self.max_new_tokens < 1:
+                raise ValueError(
+                    f"whisper: max_new_tokens must be >= 1, got {self.max_new_tokens}"
+                )
         # Compare in SAMPLES, not seconds: a cutoff of 4.99999 against a 5 s
         # window is "less than" by the float check and still leaves zero
         # samples, which divides by zero when segments are capped.
-        if int((self.window_s - self.padding_cutoff_s) * SAMPLE_RATE) < SAMPLE_RATE // 10:
+        # round(), not int(): (5.0 - 4.9) * 16000 is 1599.9999999999943, and
+        # truncating rejected a window that is exactly 100 ms.
+        if round((self.window_s - self.padding_cutoff_s) * SAMPLE_RATE) < SAMPLE_RATE // 10:
             raise ValueError(
                 f"whisper: window_s={self.window_s} minus "
                 f"padding_cutoff_s={self.padding_cutoff_s} leaves under 100 ms "
@@ -195,14 +207,18 @@ class WhisperASR(ASRBackend):
         filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
         vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
         decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
-        encoder = build_encoder(
-            cfg.encoder_kind,
-            cfg.encoder_path,
-            cfg.window_s,
-            padding_cutoff_s=cfg.padding_cutoff_s,
-            all_cores=cfg.all_cores,
-        )
+        # Construction inside the try as well: a plan with one I/O tensor
+        # raises partway through __init__, and the half-built object holds a
+        # device handle that nothing else will release.
+        encoder = None
         try:
+            encoder = build_encoder(
+                cfg.encoder_kind,
+                cfg.encoder_path,
+                cfg.window_s,
+                padding_cutoff_s=cfg.padding_cutoff_s,
+                all_cores=cfg.all_cores,
+            )
             for _ in range(max(0, cfg.warmup_runs)):
                 # First inference on every one of these runtimes pays a one-off
                 # setup cost (JIT, memory pool, engine context). Paying it here
@@ -218,10 +234,11 @@ class WhisperASR(ASRBackend):
         except Exception:
             # Release the accelerator handle; on Hailo it is the whole device,
             # and holding it would block the next attempt as well.
-            try:
-                encoder.close()
-            except Exception:
-                logger.exception("whisper: encoder close after failed warmup raised")
+            if encoder is not None:
+                try:
+                    encoder.close()
+                except Exception:
+                    logger.exception("whisper: encoder close after failure raised")
             raise
 
         self._filters, self._vocab = filters, vocab

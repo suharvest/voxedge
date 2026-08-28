@@ -280,3 +280,86 @@ def test_the_tensorrt_runtime_outlives_the_engine():
     # and teardown order: the runtime is dropped after the context and engine
     close = inspect.getsource(TensorRTEncoder.close)
     assert close.index("_ctx = None") < close.index("_runtime = None")
+
+
+def test_only_text_ids_reach_the_transcript():
+    """Every id from EOT up is a special.
+
+    Bounding at TIMESTAMP_BEGIN excluded only the timestamps, so an argmax of
+    SOT / TASK_TRANSCRIBE / NO_TIMESTAMPS put `<|startoftranscript|>` and
+    friends into the transcript verbatim.
+    """
+    from voxedge.backends.whisper.decoder import (
+        EOT, NO_TIMESTAMPS, SOT, TASK_TRANSCRIBE, TIMESTAMP_BEGIN,
+    )
+
+    assert EOT < SOT < TASK_TRANSCRIBE < NO_TIMESTAMPS < TIMESTAMP_BEGIN
+    import inspect
+
+    from voxedge.backends.whisper.decoder import OnnxKVDecoder
+
+    assert "if nxt < EOT:" in inspect.getsource(OnnxKVDecoder.decode)
+
+
+def test_read_vocab_splits_on_the_first_space_only():
+    """A token may contain a space, and may BE one — that is how word
+    boundaries are encoded. Splitting on every space truncated it, and
+    stripping the line ate a leading space outright."""
+    import tempfile
+    from pathlib import Path as _P
+
+    from voxedge.backends.whisper.decoder import read_vocab
+
+    p = _P(tempfile.mkstemp(suffix=".txt")[1])
+    p.write_text("123 foo bar\n456  leading\n789 \n", encoding="utf-8")
+    vocab = read_vocab(p)
+    assert vocab["123"] == "foo bar"
+    assert vocab["456"] == " leading"
+    assert vocab["789"] == " "
+    p.unlink()
+
+
+def test_a_window_of_exactly_100ms_is_accepted():
+    """(5.0 - 4.9) * 16000 is 1599.9999999999943; truncating rejected a window
+    that is exactly at the limit."""
+    WhisperASRConfig(encoder_kind="hailo", encoder_path="x", decoder_dir="y",
+                     vocab_dir="z", window_s=5.0, padding_cutoff_s=4.9)
+    with pytest.raises(ValueError, match="usable audio"):
+        WhisperASRConfig(encoder_kind="hailo", encoder_path="x", decoder_dir="y",
+                         vocab_dir="z", window_s=5.0, padding_cutoff_s=4.95)
+
+
+@pytest.mark.parametrize("cap", [1.5, float("nan"), True])
+def test_a_non_integer_token_cap_is_refused(cap):
+    """`range()` needs an int: 1.5 passed a ">= 1" check and raised TypeError
+    inside the decode loop instead."""
+    with pytest.raises(ValueError, match="must be an int"):
+        WhisperASRConfig(encoder_kind="rknn", encoder_path="x", decoder_dir="y",
+                         vocab_dir="z", max_new_tokens=cap)
+
+
+def test_the_offline_stream_copies_and_checks_the_rate():
+    """It accumulates without resampling, so both matter.
+
+    `np.asarray` returns the SAME object for float32 input, so the buffer held
+    the caller's array and a caller reusing it changed what got transcribed.
+    And an unmatched rate is heard as a different duration — 8000 samples at
+    8 kHz read as half a second at 16 kHz — with no error anywhere.
+    """
+    from voxedge.backends.base import OfflineAccumulateStream, TranscriptionResult
+
+    class _Backend:
+        name, sample_rate = "fake", 16000
+        def transcribe_array(self, samples, language="auto"):
+            return TranscriptionResult(text=str(int(samples.sum())))
+
+    stream = OfflineAccumulateStream(_Backend())
+    buf = np.ones(100, dtype=np.float32)
+    stream.accept_waveform(16000, buf)
+    buf[:] = 0
+    assert stream.finalize()[0] == "100"
+
+    with pytest.raises(ValueError, match="8000 Hz"):
+        OfflineAccumulateStream(_Backend()).accept_waveform(
+            8000, np.zeros(10, dtype=np.float32)
+        )
