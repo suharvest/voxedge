@@ -356,13 +356,20 @@ def test_the_offline_stream_copies_and_checks_the_rate():
         def transcribe_array(self, samples, language="auto"):
             return TranscriptionResult(text=str(int(samples.sum())))
 
+    class _Counting(_Backend):
+        def transcribe_array(self, samples, language="auto"):
+            return TranscriptionResult(text=str(samples.size))
+
     stream = OfflineAccumulateStream(_Backend())
     buf = np.ones(100, dtype=np.float32)
     stream.accept_waveform(16000, buf)
     buf[:] = 0
     assert stream.finalize()[0] == "100"
 
-    with pytest.raises(ValueError, match="8000 Hz"):
-        OfflineAccumulateStream(_Backend()).accept_waveform(
-            8000, np.zeros(10, dtype=np.float32)
-        )
+    # A mismatched rate is resampled rather than refused: raising would turn a
+    # degraded-but-running deployment into a crash, and SenseVoice-TRT has been
+    # on this path all along (it hardcodes 16000 into its own fbank, so the
+    # incoming rate was simply ignored).
+    stream = OfflineAccumulateStream(_Counting())
+    stream.accept_waveform(8000, np.ones(8000, dtype=np.float32))
+    assert stream.finalize()[0] == "16000", "one second at 8 kHz is one second"

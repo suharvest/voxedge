@@ -185,6 +185,25 @@ class ASRStream(ABC):
         """
 
 
+def _resample_linear(samples, src_sr: int, target_sr: int):
+    """Dependency-free linear resample, mirroring capabilities/speaker_embedding.
+
+    Not a real resampler — no anti-aliasing — but adequate for speech and far
+    better than reading the samples at the wrong rate outright.
+    """
+    import numpy as np
+
+    samples = np.asarray(samples, dtype=np.float32)
+    if src_sr == target_sr or samples.size == 0:
+        return samples
+    n_out = int(round(samples.size * target_sr / src_sr))
+    if n_out <= 0:
+        return np.zeros(0, dtype=np.float32)
+    x_old = np.linspace(0.0, 1.0, num=samples.size, endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(x_new, x_old, samples).astype(np.float32)
+
+
 class OfflineAccumulateStream(ASRStream):
     """Generic offline→streaming adapter.
 
@@ -205,19 +224,29 @@ class OfflineAccumulateStream(ASRStream):
         self._backend = backend
         self._language = language
         self._buf: list = []
+        self._warned_rates: set = set()
 
     def accept_waveform(self, sample_rate: int, samples: "np.ndarray") -> None:
         import numpy as np
 
-        # 采样率必须匹配：这个 stream 只累积不重采样，喂错采样率会被当成
-        # 时长不同的同一段音频（8k 的 8000 个样本被当成 16k 的 0.5 秒），
-        # 结果是音高和语速都错的转写，而且不报任何错。宁可在这里炸。
+        # 采样率不匹配要处理掉，不能忽略：这个 stream 只累积，喂进来的样本会
+        # 被当成后端采样率下的音频 —— 8k 的 8000 个样本被读成 16k 的 0.5 秒，
+        # 音高和语速全错且不报任何错。（SenseVoice-TRT 把 16000 硬编码进了自己
+        # 的 fbank，所以这条路一直是静默错的。）
+        #
+        # 抛异常会把"降级但能跑"变成崩溃，所以这里重采样，并且每个异常采样率
+        # 只告警一次 —— 逐帧告警会淹掉日志。
         expected = self._backend.sample_rate
         if sample_rate != expected:
-            raise ValueError(
-                f"{self._backend.name}: got {sample_rate} Hz, backend needs "
-                f"{expected} Hz; this stream accumulates, it does not resample"
-            )
+            if sample_rate not in self._warned_rates:
+                self._warned_rates.add(sample_rate)
+                logger.warning(
+                    "%s: resampling %d Hz -> %d Hz. Feeding the backend's own "
+                    "rate avoids this; linear interpolation is adequate for "
+                    "speech but is not a resampler.",
+                    self._backend.name, sample_rate, expected,
+                )
+            samples = _resample_linear(samples, sample_rate, expected)
         # copy(): np.asarray 对已经是 float32 的输入返回**同一个对象**，于是
         # 缓冲区里存的是调用方的数组。调用方复用或清零它之后，finalize 转写的
         # 就是被改过的内容。
