@@ -160,7 +160,6 @@ dev = [
 ]
 
 [tool.uv.sources]
-# RKVoice Stream is released from its engine repository rather than PyPI.
-# Keep the resolver on the released 0.2 line until the wheel is mirrored to
-# the deployment registry.
+# Development lock: keep source tests on the exact RKVoice 0.2.0 release
+# commit. Published package metadata resolves rkvoice-stream>=0.2.0 from PyPI.
 rkvoice-stream = { git = "https://github.com/suharvest/rkvoice-stream.git", rev = "32b4694e5946eb8bed63db6ed8116aa4b146aa94" }

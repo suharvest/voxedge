@@ -39,4 +39,7 @@ The first command covered the two new tests, dependency/factory integration chec
 
 ## Repository checks
 
-`git diff --check` passed. No commit, push, or publish was performed from this worktree. `pyproject.toml` and `uv.lock` both record the exact current RKVoice commit `32b4694e5946eb8bed63db6ed8116aa4b146aa94`.
+`git diff --check` passed. `voxedge==0.0.13a0` is published on PyPI; GitHub
+publication is pending a repository-scoped write credential. `pyproject.toml`
+and `uv.lock` both record the exact RKVoice commit
+`32b4694e5946eb8bed63db6ed8116aa4b146aa94`.
