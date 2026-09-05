@@ -22,6 +22,8 @@ Differences from the production copy (decoupling per spec §3.1 / §10):
 from __future__ import annotations
 
 import logging
+import re
+import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
@@ -30,7 +32,7 @@ import numpy as np
 from voxedge.backends.base import TTSBackend, TTSCapability
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
-from ._util import detect_zh_en, resolve_speaker_kwargs
+from ._util import detect_zh_en, normalize_auto_language, resolve_speaker_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,14 @@ class RKTTSBackend(TTSBackend):
         # BackendManager always calls ``preload()`` after the factory, so the
         # runtime methods below still see a live ``_inner``.
         self._config = config or RKTTSConfig()
+        # The lock is held for the complete synchronous call or streaming
+        # iterator lifetime.  unload therefore cannot drop a native owner
+        # while a generator still has borrowed state.
+        # Generators may be advanced/closed by different executor threads;
+        # Lock is not thread-bound like RLock and can be released by close().
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_failed = False
+        self._runtime_info_cache: dict = {}
         self._inner = None
         # Sensible cached defaults until ``preload()`` populates the real
         # values from the inner backend (also the post-unload fallback so
@@ -120,7 +130,14 @@ class RKTTSBackend(TTSBackend):
         from voxedge.backends._deps import check_rk_deps
 
         check_rk_deps()
-        from rkvoice_stream import create_tts
+        import rkvoice_stream
+
+        create_tts = getattr(rkvoice_stream, "create_tts", None)
+        if not callable(create_tts):
+            raise ImportError(
+                "rkvoice-stream>=0.2.0 is required: missing create_tts factory; "
+                "install 'voxedge[rk]'"
+            )
 
         self._inner = create_tts()
         try:
@@ -134,9 +151,10 @@ class RKTTSBackend(TTSBackend):
 
     @property
     def name(self) -> str:
-        if self._inner is None:
+        inner = self._inner
+        if inner is None:
             return self._cached_name
-        return f"rk:{self._inner.name}"
+        return f"rk:{inner.name}"
 
     @property
     def model_id(self) -> str:
@@ -146,25 +164,73 @@ class RKTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        return set(_DEFAULT_RK_TTS_CAPS)
+        caps = set(_DEFAULT_RK_TTS_CAPS)
+        # The default is intentionally conservative until the lazy inner is
+        # loaded.  Once loaded, an explicit ``False`` is authoritative: the
+        # product layer must not route this backend through streaming APIs.
+        if (self._inner is not None and getattr(self._inner, "name", None) == "kokoro_convonly"
+                and getattr(self._inner, "supports_streaming", True) is False):
+            caps.discard(TTSCapability.STREAMING)
+        return caps
 
     @property
     def sample_rate(self) -> int:
-        if self._inner is None:
+        inner = self._inner
+        if inner is None:
             return self._cached_sample_rate
-        return self._inner.get_sample_rate()
+        return inner.get_sample_rate()
 
     def is_ready(self) -> bool:
-        if self._inner is None:
+        inner = self._inner
+        if inner is None or self._lifecycle_failed:
             return False
-        return self._inner.is_ready()
+        return inner.is_ready()
 
     def preload(self) -> None:
         # Lazy first-load: build the inner backend (NPU init) here rather than
         # in __init__. After ``unload()`` this re-creates it, which matches the
         # BackendManager reload contract (factory → preloader).
-        self._ensure_inner()
-        self._inner.preload()
+        with self._lifecycle_lock:
+            if self._lifecycle_failed:
+                raise RuntimeError(
+                    "RKTTSBackend retained an inner owner after cleanup failure; "
+                    "unload it successfully before retrying preload"
+                )
+            self._ensure_inner()
+            try:
+                self._inner.preload()
+                self._refresh_runtime_info_locked()
+            except Exception as original:
+                cleanup_error = None
+                try:
+                    self._cleanup_inner(self._inner)
+                except Exception as exc:
+                    cleanup_error = exc
+                if cleanup_error is not None:
+                    self._lifecycle_failed = True
+                    raise RuntimeError(
+                        "RKTTSBackend preload failed and cleanup failed: "
+                        f"{cleanup_error}"
+                    ) from original
+                self._inner = None
+                raise
+
+    @staticmethod
+    def _cleanup_inner(inner) -> None:
+        """Invoke exactly one advertised teardown hook, if present."""
+        for name in ("close", "unload", "cleanup"):
+            hook = getattr(inner, name, None)
+            if callable(hook):
+                hook()
+                return
+
+    def _refresh_runtime_info_locked(self) -> None:
+        inner = self._inner
+        info = getattr(inner, "runtime_info", None) if inner is not None else None
+        if callable(info):
+            info = info()
+        if isinstance(info, dict):
+            self._runtime_info_cache = dict(info)
 
     def unload(self) -> None:
         """Drop the rkvoice-stream inner backend handle. Idempotent.
@@ -174,19 +240,35 @@ class RKTTSBackend(TTSBackend):
         repo. Provide a best-effort release here so future support can plug in
         without touching the manager.
         """
-        if self._inner is None:
-            return
-        try:
+        with self._lifecycle_lock:
+            inner = self._inner
+            if inner is None:
+                return
+            # Keep ownership until teardown has succeeded.  On failure the
+            # caller can retry and the manager can report the live resource.
+            try:
+                self._cleanup_inner(inner)
+            except Exception:
+                self._lifecycle_failed = True
+                raise
             self._inner = None
-            import gc
-            gc.collect()
-        except Exception:
-            logger.exception("RKTTSBackend.unload failed; continuing")
+            self._lifecycle_failed = False
+            self._runtime_info_cache = {}
 
     def rate_pitch_caps(self) -> tuple[bool, bool]:
         # rkvoice's native speed/pitch is bypassed (wrapper pops them) → DSP
         # fallback handles both, so there is no double-apply with rkvoice.
         return (False, False)
+
+    def _resolve_language(self, text: str, language: Optional[str]) -> str:
+        """Resolve auto language only for the loaded Kokoro ConvOnly backend."""
+        auto = normalize_auto_language(language) is None
+        name = getattr(self._inner, "name", None)
+        if name is None and self._cached_name == "rk:kokoro_convonly":
+            name = "kokoro_convonly"
+        if auto and name == "kokoro_convonly" and re.search(r"[ぁ-ゖァ-ヺㇰ-ㇿｦ-ﾟ]", text):
+            return "ja"
+        return detect_zh_en(text, language)
 
     def _synthesize_impl(
         self,
@@ -197,24 +279,19 @@ class RKTTSBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> tuple[bytes, dict]:
-        if self._inner is None:
-            raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
-        voice = resolve_speaker_kwargs(
-            self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs
-        )
-        sid = voice.get("speaker_id", 0)
-        # rkvoice-stream's synthesize() doesn't take `language`; pass it
-        # through kwargs only when explicitly set so backends that ignore it
-        # are unaffected.
-        language = detect_zh_en(text, language)
-        kwargs.setdefault("language", language)
-        return self._inner.synthesize(
-            text=text,
-            speaker_id=sid,
-            speed=speed,
-            pitch_shift=pitch_shift,
-            **kwargs,
-        )
+        with self._lifecycle_lock:
+            if self._inner is None or self._lifecycle_failed:
+                raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
+            voice = resolve_speaker_kwargs(
+                self.model_id, allow_embedding=False, speaker_id=speaker_id, **kwargs
+            )
+            sid = voice.get("speaker_id", 0)
+            language = self._resolve_language(text, language)
+            kwargs.setdefault("language", language)
+            return self._inner.synthesize(
+                text=text, speaker_id=sid, speed=speed, pitch_shift=pitch_shift,
+                **kwargs,
+            )
 
     def _generate_streaming_impl(self, text: str, **kwargs):
         """Bridge our base-class generate_streaming() to rkvoice-stream's
@@ -226,42 +303,38 @@ class RKTTSBackend(TTSBackend):
         starlette's StreamingResponse calls ``.encode()`` on non-bytes items
         and explodes on tuples (`'tuple' object has no attribute 'encode'`).
         """
-        if self._inner is None:
-            raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
-        voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
-        speaker_id = voice.get("speaker_id", 0)
-        kwargs.pop("speaker_id", None)
-        speed = kwargs.pop("speed", None)
-        pitch_shift = kwargs.pop("pitch_shift", None)
-        language = detect_zh_en(text, kwargs.pop("language", None))
-        kwargs.setdefault("language", language)
-        for item in self._inner.synthesize_stream(
-            text=text,
-            speaker_id=speaker_id,
-            speed=speed,
-            pitch_shift=pitch_shift,
-            **kwargs,
-        ):
-            audio = item[0] if isinstance(item, tuple) else item
-            if audio is None:
-                continue
-            if isinstance(audio, (bytes, bytearray)):
-                if len(audio) == 0:
-                    continue
-                yield bytes(audio)
-                continue
-            if isinstance(audio, np.ndarray):
-                if audio.size == 0:
-                    continue
-                if audio.dtype == np.int16:
-                    yield audio.tobytes()
-                else:
-                    a = np.asarray(audio, dtype=np.float32)
-                    a = np.clip(a, -1.0, 1.0)
-                    yield (a * 32767.0).astype(np.int16).tobytes()
-                continue
-            # Unknown payload — skip rather than poison the stream.
-            continue
+        with self._lifecycle_lock:
+            if self._inner is None or self._lifecycle_failed:
+                raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
+            voice = resolve_speaker_kwargs(self.model_id, allow_embedding=False, **kwargs)
+            speaker_id = voice.get("speaker_id", 0)
+            kwargs.pop("speaker_id", None)
+            speed = kwargs.pop("speed", None)
+            pitch_shift = kwargs.pop("pitch_shift", None)
+            language = self._resolve_language(text, kwargs.pop("language", None))
+            kwargs.setdefault("language", language)
+            source = self._inner.synthesize_stream(
+                text=text, speaker_id=speaker_id, speed=speed,
+                pitch_shift=pitch_shift, **kwargs,
+            )
+            try:
+                for item in source:
+                    audio = item[0] if isinstance(item, tuple) else item
+                    if audio is None:
+                        continue
+                    if isinstance(audio, (bytes, bytearray)):
+                        if audio:
+                            yield bytes(audio)
+                    elif isinstance(audio, np.ndarray) and audio.size:
+                        if audio.dtype == np.int16:
+                            yield audio.tobytes()
+                        else:
+                            a = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+                            yield (a * 32767.0).astype(np.int16).tobytes()
+            finally:
+                close = getattr(source, "close", None)
+                if callable(close):
+                    close()
 
     def synthesize_stream(
         self,
@@ -272,14 +345,43 @@ class RKTTSBackend(TTSBackend):
         language: Optional[str] = None,
         **kwargs,
     ) -> Iterator[tuple[np.ndarray, dict]]:
-        if self._inner is None:
-            raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
-        language = detect_zh_en(text, language)
-        kwargs.setdefault("language", language)
-        yield from self._inner.synthesize_stream(
-            text=text,
-            speaker_id=speaker_id if speaker_id is not None else 0,
-            speed=speed,
-            pitch_shift=pitch_shift,
-            **kwargs,
-        )
+        with self._lifecycle_lock:
+            if self._inner is None or self._lifecycle_failed:
+                raise RuntimeError("RKTTSBackend not loaded (was unloaded)")
+            language = self._resolve_language(text, language)
+            kwargs.setdefault("language", language)
+            source = self._inner.synthesize_stream(
+                text=text, speaker_id=speaker_id if speaker_id is not None else 0,
+                speed=speed, pitch_shift=pitch_shift, **kwargs,
+            )
+            try:
+                for item in source:
+                    yield item
+            finally:
+                close = getattr(source, "close", None)
+                if callable(close):
+                    close()
+
+    def runtime_info(self):
+        if not self._lifecycle_lock.acquire(blocking=False):
+            info = dict(self._runtime_info_cache)
+            reported_ready = bool(info.get("ready", False))
+            info["lifecycle_busy"] = True
+            info["lifecycle_ready"] = bool(self._inner is not None and not self._lifecycle_failed)
+            info["ready"] = reported_ready and info["lifecycle_ready"]
+            return info
+        try:
+            self._refresh_runtime_info_locked()
+            info = dict(self._runtime_info_cache)
+            if "ready" in info:
+                reported_ready = bool(info["ready"])
+            else:
+                inner = self._inner
+                probe = getattr(inner, "is_ready", None) if inner is not None else None
+                reported_ready = bool(probe()) if callable(probe) else False
+            info["lifecycle_busy"] = False
+            info["lifecycle_ready"] = bool(self._inner is not None and not self._lifecycle_failed)
+            info["ready"] = reported_ready and info["lifecycle_ready"]
+            return info
+        finally:
+            self._lifecycle_lock.release()

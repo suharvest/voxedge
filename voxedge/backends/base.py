@@ -583,7 +583,13 @@ class TTSBackend(ABC):
         )
 
         if not (need_speed or need_pitch):
-            yield from impl_iter
+            try:
+                for chunk in impl_iter:
+                    yield chunk
+            finally:
+                close = getattr(impl_iter, "close", None)
+                if callable(close):
+                    close()
             return
 
         from voxedge.audio.rate import TTSRateShifter
@@ -594,13 +600,18 @@ class TTSBackend(ABC):
             pitch_shift=pitch_shift if need_pitch else 0.0,
             channels=1,
         )
-        for chunk in impl_iter:
-            out = shifter.push(chunk)
-            if out:
-                yield out
-        tail = shifter.flush()
-        if tail:
-            yield tail
+        try:
+            for chunk in impl_iter:
+                out = shifter.push(chunk)
+                if out:
+                    yield out
+            tail = shifter.flush()
+            if tail:
+                yield tail
+        finally:
+            close = getattr(impl_iter, "close", None)
+            if callable(close):
+                close()
 
     def _generate_streaming_impl(
         self,
