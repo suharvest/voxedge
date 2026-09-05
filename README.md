@@ -83,11 +83,31 @@ engine = ConversationEngine(backends={
 pip install voxedge            # pure-Python core (numpy only)
 pip install voxedge[sherpa]    # sherpa-onnx CPU ASR/TTS
 pip install voxedge[jetson]    # Jetson TensorRT backends (aarch64)
-pip install voxedge[rk]        # Rockchip RK3576/RK3588 NPU (aarch64)
+pip install "voxedge[rk]==0.0.13a0" # Rockchip RK3576/RK3588 NPU (aarch64)
 pip install voxedge[llm]       # OpenAI-compatible LLM backend (httpx)
 ```
 
 The `jetson` extra installs only Python-side dependencies available from the package index. It does **not** install TensorRT/CUDA, the C++/pybind workers, plugins, TensorRT engines, or model artifacts; those come from JetPack and the engine/artifact release. Therefore `pip install voxedge[jetson]` alone does not produce a runnable Jetson deployment. The same platform-runtime caveat applies to RKNN and `voxedge[rk]`.
+
+### Kokoro ConvOnly on Rockchip
+
+Kokoro ConvOnly is a first-class RKVoice Stream TTS backend exposed through
+VoxEdge and used directly by OpenVoiceStream (OVS). Install the released
+adapter with `pip install "voxedge[rk]==0.0.13a0"`; the RK extra requires
+`rkvoice-stream>=0.2.0` on aarch64.
+
+The image is unified across RK3576 and RK3588. The platform bundle containing
+RKNN models and the optional Japanese dictionary is mounted externally as a
+read-only resource, so changing a model or region does not create a new
+application image. Configure the bundle path and backend profile in OVS.
+With `language=auto`, Latin/CJK text is routed by the backend detector and
+hiragana, katakana, halfwidth katakana, and related kana text route to `ja`.
+
+Kokoro ConvOnly supports sentence-level streaming through RKVoice Stream and
+HTTP finite-request cancellation. Closing a consumer stream propagates to the
+native iterator and releases the backend lifecycle owner. Cancellation of a
+single in-flight RKNN operation is intentionally not forced; backends whose
+native call is monolithic finish the current call before teardown.
 
 ## Library versus server
 

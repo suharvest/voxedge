@@ -83,11 +83,29 @@ engine = ConversationEngine(backends={
 pip install voxedge            # 纯 Python 核心（仅 numpy）
 pip install voxedge[sherpa]    # sherpa-onnx CPU ASR/TTS
 pip install voxedge[jetson]    # Jetson TensorRT 后端（aarch64）
-pip install voxedge[rk]        # 瑞芯微 RK3576/RK3588 NPU（aarch64）
+pip install "voxedge[rk]==0.0.13a0" # 瑞芯微 RK3576/RK3588 NPU（aarch64）
 pip install voxedge[llm]       # OpenAI 兼容 LLM 后端（httpx）
 ```
 
 `jetson` extra 只安装包索引中可获取的 Python 侧依赖；它**不会**安装 TensorRT/CUDA、C++/pybind worker、plugin、TensorRT engine 或模型产物。这些需来自 JetPack 与引擎/产物 release。因此，单独执行 `pip install voxedge[jetson]` 不会得到可运行的 Jetson 部署。RKNN 与 `voxedge[rk]` 同样存在平台运行时边界。
+
+### Rockchip 上的 Kokoro ConvOnly
+
+Kokoro ConvOnly 已经是 RKVoice Stream 的一级 TTS backend，由 VoxEdge
+统一适配，并被 OpenVoiceStream（OVS）直接使用。在 aarch64 设备上安装：
+`pip install "voxedge[rk]==0.0.13a0"`；`rk` extra 依赖
+`rkvoice-stream>=0.2.0`。
+
+RK3576 与 RK3588 使用同一套统一应用镜像。RKNN 模型和可选的日语词典
+作为外置只读 platform bundle 挂载，切换模型或区域不需要重新制作应用
+镜像。OVS 通过 backend profile 配置 bundle 路径。`language=auto` 会按
+文本路由语言；平假名、片假名、半角片假名及相关日文假名文本路由到
+`ja`。
+
+Kokoro ConvOnly 支持通过 RKVoice Stream 的句级 streaming，以及 HTTP
+有限请求取消。消费者关闭 stream 会传递到底层 native iterator，并释放
+backend 生命周期所有权。对于底层一次性完成的 RKNN 调用，不强制中止
+当前推理；这类 backend 会先完成当前调用再清理资源。
 
 ## Python 库与服务端的边界
 
