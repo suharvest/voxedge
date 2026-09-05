@@ -14,6 +14,10 @@ require the real heavy packages, so they run on any dev box.
 from __future__ import annotations
 
 import builtins
+import importlib
+from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -148,6 +152,61 @@ def test_rk_tts_backend_preload_friendly_error(monkeypatch):
     with pytest.raises(ImportError) as ei:
         backend.preload()
     assert "voxedge[rk]" in str(ei.value)
+
+
+def test_rk_tts_backend_detects_missing_factory(monkeypatch):
+    from voxedge.backends.rk.tts import RKTTSBackend, RKTTSConfig
+
+    monkeypatch.setitem(sys.modules, "rkvoice_stream", types.ModuleType("rkvoice_stream"))
+    backend = RKTTSBackend(RKTTSConfig())
+    with pytest.raises(ImportError, match="missing create_tts"):
+        backend.preload()
+
+
+def test_rk_tts_backend_uses_rkvoice_factory(monkeypatch):
+    from voxedge.backends.rk.tts import RKTTSBackend, RKTTSConfig
+
+    class Inner:
+        name = "kokoro_convonly"
+
+        def get_sample_rate(self):
+            return 24_000
+
+        def preload(self):
+            return None
+
+        def is_ready(self):
+            return True
+
+    inner = Inner()
+    module = types.ModuleType("rkvoice_stream")
+    module.create_tts = lambda: inner
+    monkeypatch.setitem(sys.modules, "rkvoice_stream", module)
+    backend = RKTTSBackend(RKTTSConfig(model_id="kokoro_convonly"))
+    backend.preload()
+    assert backend._inner is inner
+    assert backend.name == "rk:kokoro_convonly"
+    backend.unload()
+
+
+def test_sibling_rkvoice_release_exposes_real_kokoro_factory(monkeypatch):
+    """Verify the locked sibling release, rather than a mocked module."""
+    sibling = Path(__file__).parents[3] / "rkvoice-kokoro-productization"
+    package = sibling / "rkvoice_stream"
+    if not package.is_dir():
+        pytest.skip("sibling RKVoice productization worktree is unavailable")
+    for name in list(sys.modules):
+        if name == "rkvoice_stream" or name.startswith("rkvoice_stream."):
+            sys.modules.pop(name)
+    monkeypatch.syspath_prepend(str(sibling))
+    real = importlib.import_module("rkvoice_stream")
+    assert Path(real.__file__).resolve().is_relative_to(sibling.resolve())
+    assert real.__version__ == "0.2.0"
+    monkeypatch.setenv("KOKORO_CONVONLY_ROOT", "/tmp/kokoro-convonly-integration-check")
+    monkeypatch.setenv("KOKORO_CONVONLY_MANIFEST_SHA256", "0" * 64)
+    backend = real.create_tts("kokoro_convonly")
+    assert backend.__class__.__name__ == "KokoroConvOnlyBackend"
+    assert backend.name == "kokoro_convonly"
 
 
 def test_paraformer_preload_friendly_error_when_trt_missing(monkeypatch):
