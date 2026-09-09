@@ -592,6 +592,24 @@ class RKASRBackend(ASRBackend):
         except Exception:
             self._cached_capabilities = set()
 
+        # The capability we published at startup was derived from config, not
+        # from the object that actually loaded. If an older rkvoice-stream
+        # (one shared RKNNLite context) ends up behind a profile that declares
+        # parallel inference, the host will send two calls into a runtime that
+        # cannot take them. Nothing can be renegotiated this late — the gate is
+        # already sized — so say so loudly rather than corrupt inference.
+        if _resolve_parallel_inference() and not getattr(
+            self._inner, "supports_parallel", False
+        ):
+            logger.error(
+                "RK ASR: profile declares parallel inference but inner backend "
+                "%r reports supports_parallel=False (max_concurrent=%s). "
+                "Pin rkvoice-stream >= the per-core worker pool, or set "
+                "OVS_ASR_INFER_CONCURRENCY=1.",
+                getattr(self._inner, "name", "?"),
+                getattr(self._inner, "max_concurrent", "?"),
+            )
+
     @property
     def name(self) -> str:
         if self._inner is None:
