@@ -84,8 +84,19 @@ class SherpaASRConfig:
     # language is still transcribed in its own language; mainly punctuation
     # placement shifts.
     offline_language: str = ""
+    # ADMISSION ceiling handed to the coordinator. The recognizer object is
+    # SHARED, but each session decodes through its own native stream from
+    # recognizer.create_stream(), and sherpa-onnx supports decoding different
+    # streams concurrently on CPU -- so admitted requests really do run in
+    # parallel. The bound that matters is CPU threads, not the recognizer.
+    # Evidence is CPU-provider only; it does not carry to the CUDA provider.
+    # Default 4 is the historical desktop value and matches ``num_threads``.
+    # Raising it past the core count does not add throughput -- it trades 429s
+    # for queueing inside the thread pool.
+    max_concurrent: int = 4
 
     def __post_init__(self) -> None:
+        self.max_concurrent = max(1, int(self.max_concurrent))
         if self.streaming_model_dir is None:
             self.streaming_model_dir = _DEFAULT_ASR_DIRS.get(
                 self.language_mode, _DEFAULT_ASR_DIRS["zh_en"]
@@ -254,17 +265,30 @@ class SherpaASRBackend(ASRBackend):
     # CPU / ORT model — releasable in-process via del + gc.
     supports_hot_reload = True
 
-    @classmethod
-    def concurrency_capability(cls, profile=None):
+    def concurrency_capability(self, profile=None):
         """Declare concurrency for desktop/CPU ASR.
 
-        CPU/ORT recognizer objects are independent across streams; the soft
-        cap of 4 matches the historical desktop default and bounds CPU thread
-        contention.
+        A real parallelism declaration, not an admission-only ceiling. The
+        recognizer is shared, but every session decodes through its own native
+        stream (``recognizer.create_stream()``, see ``SherpaASRStream``) and
+        sherpa-onnx supports decoding different streams at the same time on
+        CPU. Inference runs in ``accept_waveform`` and ``finalize``;
+        ``get_partial`` only reads a cached result, so nothing decodes outside
+        the server's inference slot.
+
+        The value comes from ``SherpaASRConfig.max_concurrent`` (default 4, the
+        historical desktop cap) so a deployment can size it against its own
+        core count instead of being pinned at the class default. The evidence
+        for concurrent decoding is CPU-provider only and does not carry to the
+        CUDA provider.
+
+        Instance method, not a classmethod: it has to read the config. The
+        product's capability probe builds a config-bearing stub via ``__new__``
+        and calls this on it, so no model is loaded to answer the question.
         """
         return ConcurrencyCapability(
             supports_parallel=True,
-            max_concurrent=4,
+            max_concurrent=max(1, int(self._config.max_concurrent)),
             is_stateful=True,
             requires_exclusive_device=False,
             scaling_mode="external_managed",
