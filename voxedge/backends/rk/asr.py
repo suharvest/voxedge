@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import wave
 from dataclasses import dataclass
 from typing import Optional
@@ -117,6 +118,13 @@ class RKASRConfig:
     # Optional stable artifact name for the runtime-artifact manifest
     # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
     artifact_ref: Optional[str] = None
+    # How many concurrent *sessions* (WebSocket connections) the host may
+    # admit. NPU inference stays strictly serial regardless: the capability
+    # keeps ``supports_parallel=False``, which the host reads as "admit N,
+    # run one inference at a time, queue the rest". Only raised for inner
+    # backends whose inference is confined to finalize(); see
+    # ``_SESSION_SAFE_INNER_BACKENDS``.
+    max_sessions: int = 4
 
 
 def _split_at_silence_energy(
@@ -376,6 +384,62 @@ _CAP_MAP = {
 }
 
 
+# Inner rkvoice-stream backends whose inference happens ONLY inside
+# ``finalize()`` — they use the generic ``OfflineAccumulateStream`` adapter,
+# whose ``accept_waveform`` only appends to a buffer and whose ``get_partial``
+# returns ("", False) without touching the NPU. Those are the only ones where
+# the host may hold more sessions than in-flight inferences: everything that
+# reaches the shared RKNN context passes through the host's per-utterance slot.
+#
+# Deliberately an allow-list, not a deny-list. A new inner backend defaults to
+# the conservative 1:1 until someone checks where its inference actually runs.
+_SESSION_SAFE_INNER_BACKENDS = frozenset({"sensevoice_rknn"})
+
+
+def _resolve_max_sessions(profile=None) -> int:
+    """Session capacity to declare, from profile → process env → default.
+
+    ``concurrency_capability`` is a classmethod, and the host's capability
+    probe calls it without a profile (it builds a config-bearing stub and
+    invokes the bound classmethod). The process env is the reliable layer in
+    that case: the host exports a profile's ``env`` block into ``os.environ``
+    before backends are imported, so ``ASR_BACKEND`` is readable either way.
+    This is the only place in this module that reads the environment;
+    ``RKASRConfig`` itself stays env-free.
+    """
+    env: dict = {}
+    if isinstance(profile, dict):
+        block = profile.get("env")
+        if isinstance(block, dict):
+            env = block
+
+    def _get(name: str) -> str:
+        value = env.get(name)
+        if value is None:
+            value = os.environ.get(name)
+        return str(value or "").strip()
+
+    inner = _get("ASR_BACKEND").lower()
+    if inner not in _SESSION_SAFE_INNER_BACKENDS:
+        return 1
+
+    raw = _get("ASR_MAX_SESSIONS")
+    if raw:
+        try:
+            n = int(raw)
+        except ValueError:
+            logger.warning(
+                "ASR_MAX_SESSIONS=%r is not an integer; using default %d",
+                raw, RKASRConfig.max_sessions,
+            )
+            return RKASRConfig.max_sessions
+        if n < 1:
+            logger.warning("ASR_MAX_SESSIONS=%d must be >= 1; using 1", n)
+            return 1
+        return n
+    return RKASRConfig.max_sessions
+
+
 class RKASRBackend(ASRBackend):
     """Adapter around rkvoice_stream.create_asr().
 
@@ -388,12 +452,32 @@ class RKASRBackend(ASRBackend):
     def concurrency_capability(cls, profile=None):
         """Declare concurrency for RK NPU ASR.
 
-        rkvoice-stream owns the NPU lifecycle and runs single-session. NPU is
-        an exclusive device.
+        Two different numbers:
+
+        ``supports_parallel=False`` — rkvoice-stream holds a single shared
+        ``RKNNLite`` context and its ``inference()`` is not documented
+        thread-safe, so exactly one inference runs at a time. This never
+        changes here; running two at once needs a per-worker context bound to
+        its own NPU core, which lives in rkvoice-stream, not in this adapter.
+
+        ``max_concurrent`` — connections the host may admit. Paired with
+        ``supports_parallel=False`` the host reads this as "admit N, run one
+        inference at a time, queue the rest in FIFO order". Audio arrival is
+        bursty and mostly silence: at RTF ~0.135 the NPU is idle most of the
+        wall clock even with one talker, so tying the connection count to the
+        inference count refused clients against an idle device.
+
+        Only raised for inner backends that do all their inference inside
+        ``finalize()``, which is the only call the host takes its
+        per-utterance slot around. A streaming inner backend (paraformer_rknn,
+        qwen3_rk) also infers inside ``get_partial()``, which the host calls on
+        the event-loop thread outside that slot — interleaving sessions there
+        would put two inferences on the shared context at once. Those keep the
+        conservative 1.
         """
         return ConcurrencyCapability(
             supports_parallel=False,
-            max_concurrent=1,
+            max_concurrent=_resolve_max_sessions(profile),
             is_stateful=True,
             requires_exclusive_device=True,
             scaling_mode="external_managed",
