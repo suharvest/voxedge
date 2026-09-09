@@ -129,25 +129,69 @@ def test_transcribe_array_without_an_offline_recognizer_raises():
         )
 
 
-def test_transcribe_and_transcribe_array_share_one_decode_path():
-    """The file endpoint and the stream endpoint must not drift apart."""
+def _wav_bytes(samples_int16: np.ndarray, rate: int, channels: int = 1) -> bytes:
     import io
     import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(samples_int16.tobytes())
+    return buf.getvalue()
+
+
+def test_transcribe_and_transcribe_array_share_one_decode_path():
+    """The file endpoint and the stream endpoint must not drift apart.
+
+    Non-silent audio, checked sample-by-sample: a stub that always returns the
+    same text would hide a decode-path swap, so assert on what the recognizer
+    was actually handed.
+    """
+    pytest.importorskip("soundfile")
 
     rec = _FakeOfflineRecognizer(text="same")
     be = _backend(offline=rec)
 
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        w.writeframes(np.zeros(1600, dtype=np.int16).tobytes())
-
-    pytest.importorskip("soundfile")
-    assert be.transcribe(buf.getvalue()).text == "same"
-    assert be.transcribe_array(np.zeros(1600, dtype=np.float32)).text == "same"
+    tone = (np.sin(np.linspace(0, 40 * np.pi, 1600)) * 16000).astype(np.int16)
+    assert be.transcribe(_wav_bytes(tone, 16000)).text == "same"
+    assert be.transcribe_array(tone.astype(np.float32)).text == "same"
     assert rec.decoded == 2
+
+    (rate_file, from_file), (rate_arr, from_arr) = rec.fed
+    assert rate_file == rate_arr == 16000
+    assert from_file.dtype == from_arr.dtype == np.float32
+    # transcribe() reads through soundfile, which scales int16 to [-1, 1);
+    # transcribe_array() takes what the stream adapter already produced. Both
+    # must describe the same waveform, so compare shapes and normalized shape.
+    assert from_file.shape == from_arr.shape == (1600,)
+    assert np.allclose(from_file, from_arr / 32768.0, atol=1e-4)
+    assert np.abs(from_file).max() > 0.1  # not silence
+
+
+def test_transcribe_downmixes_stereo_and_resamples_to_16k():
+    """The file path's own preprocessing, asserted on the samples handed over."""
+    pytest.importorskip("soundfile")
+
+    rec = _FakeOfflineRecognizer()
+    be = _backend(offline=rec)
+
+    left = np.full(800, 10000, dtype=np.int16)
+    right = np.full(800, -6000, dtype=np.int16)
+    stereo = np.empty(1600, dtype=np.int16)
+    stereo[0::2] = left
+    stereo[1::2] = right
+
+    be.transcribe(_wav_bytes(stereo, 8000, channels=2))
+
+    rate, fed = rec.fed[0]
+    assert rate == 16000
+    # 800 frames at 8 kHz -> 1600 samples at 16 kHz.
+    assert fed.shape == (1600,)
+    assert fed.dtype == np.float32
+    # Both channels are constant, so the mean is constant too.
+    assert np.allclose(fed, (10000 - 6000) / 2 / 32768.0, atol=1e-3)
 
 
 # ── end-to-end through the adapter ──────────────────────────────────────────
