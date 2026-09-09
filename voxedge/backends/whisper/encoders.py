@@ -69,7 +69,8 @@ class HailoEncoder(Encoder):
 
         # configure() and create_bindings() once, then reuse. Rebuilding the
         # bindings per call is pure overhead on a path whose whole point is a
-        # 24 ms encoder. Safe because this backend declares max_concurrent=1.
+        # 24 ms encoder. Safe because WhisperASR serializes every call on its
+        # own lock -- max_concurrent only sets how many callers may queue.
             self._configured = self._model.configure()
             self._bindings = self._configured.create_bindings()
             self._out = np.zeros(self._model.output().shape, dtype=np.float32)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +87,14 @@ class WhisperASRConfig:
     #: every board here, so this is the knob that actually moves RTF.
     decoder_threads: int = 0
     warmup_runs: int = 1
+    #: ADMISSION ceiling, not a parallelism knob. One encoder handle and one
+    #: decoder KV cache are shared by every caller and the backend serializes
+    #: them on ``_lock``; this value only tells the coordinator how many
+    #: requests may be admitted and QUEUED before it starts rejecting with 429.
+    #: Execution stays serialized either way. Raising it costs no memory (no
+    #: extra runtimes); it trades 429s for queueing latency, so size it against
+    #: the measured per-request wall time and the client's timeout.
+    max_concurrent: int = 1
     extra: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -97,6 +106,17 @@ class WhisperASRConfig:
                 f"Qwen3-ASR for other languages"
             )
         self.language = lang
+        if not isinstance(self.max_concurrent, int) or isinstance(
+            self.max_concurrent, bool
+        ):
+            raise ValueError(
+                f"whisper: max_concurrent must be an int, got "
+                f"{self.max_concurrent!r}"
+            )
+        if self.max_concurrent < 1:
+            raise ValueError(
+                f"whisper: max_concurrent must be >= 1, got {self.max_concurrent}"
+            )
         # nan and inf reach here from anything that is not the product env
         # parser — a caller constructing the dataclass directly, a YAML float,
         # a computed value. Every comparison against nan is False, so the range
@@ -181,6 +201,11 @@ class WhisperASR(ASRBackend):
         self._filters: Optional[np.ndarray] = None
         self._vocab: Optional[dict] = None
         self._warned: set = set()
+        # One encoder handle, one decoder KV cache, both reused across calls
+        # (encoders.py configures its bindings and output buffer once). Two
+        # threads inside ``transcribe_array`` would write the same buffers, so
+        # every admitted request past the first queues here.
+        self._lock = threading.RLock()
 
     # ── identity ────────────────────────────────────────────────────────
     @property
@@ -259,12 +284,15 @@ class WhisperASR(ASRBackend):
         )
 
     def unload(self) -> None:
-        if self._encoder is not None:
-            self._encoder.close()
-        self._encoder = None
-        self._decoder = None
-        self._vocab = None
-        self._filters = None
+        # Same lock as transcribe_array: hot reload closes the encoder handle a
+        # queued request is about to use.
+        with self._lock:
+            if self._encoder is not None:
+                self._encoder.close()
+            self._encoder = None
+            self._decoder = None
+            self._vocab = None
+            self._filters = None
 
     def concurrency_capability(self):
         from voxedge.engine.concurrency_capability import ConcurrencyCapability
@@ -276,9 +304,15 @@ class WhisperASR(ASRBackend):
         # /dev/hailo0 to a single process and a second VDevice anywhere raises
         # HAILO_OUT_OF_PHYSICAL_DEVICES, whereas a TRT engine happily shares the
         # Jetson GPU with the TTS stack.
+        # supports_parallel=False WITH max_concurrent=N>1 is deliberate: the
+        # two fields answer different questions. supports_parallel asks whether
+        # the coordinator may run two requests at once (no: shared encoder
+        # bindings and decoder cache, serialized by _lock); max_concurrent asks
+        # how many requests may be ADMITTED, i.e. how many queue behind the
+        # lock instead of being rejected with 429.
         return ConcurrencyCapability(
             supports_parallel=False,
-            max_concurrent=1,
+            max_concurrent=max(1, int(self._cfg.max_concurrent)),
             is_stateful=False,
             requires_exclusive_device=self._cfg.encoder_kind in ("hailo", "rknn"),
             scaling_mode="single_runtime_multiplex",
@@ -319,6 +353,17 @@ class WhisperASR(ASRBackend):
         return self.transcribe_array(decode_audio_to_16k_mono(audio_bytes), language)
 
     def transcribe_array(
+        self, samples: np.ndarray, language: str = "auto"
+    ) -> TranscriptionResult:
+        # Serialize the whole call, not just the encoder run. The lazy preload
+        # below, the encoder's reused input/output bindings and the decoder's
+        # KV cache are all shared mutable state; a second thread anywhere in
+        # here corrupts one of them. ``max_concurrent`` above admits N callers
+        # so the extra ones wait here rather than taking a 429.
+        with self._lock:
+            return self._transcribe_array_locked(samples, language)
+
+    def _transcribe_array_locked(
         self, samples: np.ndarray, language: str = "auto"
     ) -> TranscriptionResult:
         if not self.is_ready():
