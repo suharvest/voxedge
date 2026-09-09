@@ -84,8 +84,16 @@ class SherpaASRConfig:
     # language is still transcribed in its own language; mainly punctuation
     # placement shifts.
     offline_language: str = ""
+    # ADMISSION ceiling handed to the coordinator. sherpa-onnx recognizers are
+    # re-entrant across streams, so admitted requests really do run in
+    # parallel; the bound that matters is CPU threads, not the recognizer.
+    # Default 4 is the historical desktop value and matches ``num_threads``.
+    # Raising it past the core count does not add throughput -- it trades 429s
+    # for queueing inside the thread pool.
+    max_concurrent: int = 4
 
     def __post_init__(self) -> None:
+        self.max_concurrent = max(1, int(self.max_concurrent))
         if self.streaming_model_dir is None:
             self.streaming_model_dir = _DEFAULT_ASR_DIRS.get(
                 self.language_mode, _DEFAULT_ASR_DIRS["zh_en"]
@@ -254,17 +262,22 @@ class SherpaASRBackend(ASRBackend):
     # CPU / ORT model — releasable in-process via del + gc.
     supports_hot_reload = True
 
-    @classmethod
-    def concurrency_capability(cls, profile=None):
+    def concurrency_capability(self, profile=None):
         """Declare concurrency for desktop/CPU ASR.
 
-        CPU/ORT recognizer objects are independent across streams; the soft
-        cap of 4 matches the historical desktop default and bounds CPU thread
-        contention.
+        CPU/ORT recognizer objects are independent across streams, so this is a
+        real parallelism declaration, not an admission-only ceiling. The value
+        comes from ``SherpaASRConfig.max_concurrent`` (default 4, the historical
+        desktop cap) so a deployment can size it against its own core count
+        instead of being pinned at the class default.
+
+        Instance method, not a classmethod: it has to read the config. The
+        product's capability probe builds a config-bearing stub via ``__new__``
+        and calls this on it, so no model is loaded to answer the question.
         """
         return ConcurrencyCapability(
             supports_parallel=True,
-            max_concurrent=4,
+            max_concurrent=max(1, int(self._config.max_concurrent)),
             is_stateful=True,
             requires_exclusive_device=False,
             scaling_mode="external_managed",
