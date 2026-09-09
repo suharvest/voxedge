@@ -229,59 +229,65 @@ class WhisperASR(ASRBackend):
     def preload(self) -> None:
         """Load and warm up. Either everything works or the backend stays unready.
 
+        Takes the execution lock (re-entrant, so the lazy call from
+        ``_transcribe_array_locked`` is fine). An explicit preload racing a
+        lazy one would otherwise have both pass the readiness check, build two
+        runtimes and overwrite each other's references, leaking the loser.
+
         Nothing is published to ``self`` until the warmup inference has
         succeeded. Assigning as we go looked harmless and was not: a warmup
         failure left ``is_ready()`` True, the server logged the exception and
         carried on, and the first real utterance then reused a runtime that had
         already failed to run once.
         """
-        if self.is_ready():
-            return
-        cfg = self._cfg
-        vocab_dir = Path(cfg.vocab_dir)
-        filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
-        vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
-        decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
-        # Construction inside the try as well: a plan with one I/O tensor
-        # raises partway through __init__, and the half-built object holds a
-        # device handle that nothing else will release.
-        encoder = None
-        try:
-            encoder = build_encoder(
-                cfg.encoder_kind,
-                cfg.encoder_path,
-                cfg.window_s,
-                padding_cutoff_s=cfg.padding_cutoff_s,
-                all_cores=cfg.all_cores,
-            )
-            for _ in range(max(0, cfg.warmup_runs)):
-                # First inference on every one of these runtimes pays a one-off
-                # setup cost (JIT, memory pool, engine context). Paying it here
-                # keeps it out of the first user utterance's TTFT.
-                encoder.run(
-                    log_mel(
-                        np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
-                        filters,
-                        cfg.window_s,
-                        cfg.padding_cutoff_s,
-                    )
+        with self._lock:
+            if self.is_ready():
+                return
+            cfg = self._cfg
+            vocab_dir = Path(cfg.vocab_dir)
+            filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
+            vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
+            decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
+            # Construction inside the try as well: a plan with one I/O tensor
+            # raises partway through __init__, and the half-built object holds a
+            # device handle that nothing else will release.
+            encoder = None
+            try:
+                encoder = build_encoder(
+                    cfg.encoder_kind,
+                    cfg.encoder_path,
+                    cfg.window_s,
+                    padding_cutoff_s=cfg.padding_cutoff_s,
+                    all_cores=cfg.all_cores,
                 )
-        except Exception:
-            # Release the accelerator handle; on Hailo it is the whole device,
-            # and holding it would block the next attempt as well.
-            if encoder is not None:
-                try:
-                    encoder.close()
-                except Exception:
-                    logger.exception("whisper: encoder close after failure raised")
-            raise
+                for _ in range(max(0, cfg.warmup_runs)):
+                    # First inference on every one of these runtimes pays a one-off
+                    # setup cost (JIT, memory pool, engine context). Paying it here
+                    # keeps it out of the first user utterance's TTFT.
+                    encoder.run(
+                        log_mel(
+                            np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
+                            filters,
+                            cfg.window_s,
+                            cfg.padding_cutoff_s,
+                        )
+                    )
+            except Exception:
+                # Release the accelerator handle; on Hailo it is the whole device,
+                # and holding it would block the next attempt as well.
+                if encoder is not None:
+                    try:
+                        encoder.close()
+                    except Exception:
+                        logger.exception("whisper: encoder close after failure raised")
+                raise
 
-        self._filters, self._vocab = filters, vocab
-        self._decoder, self._encoder = decoder, encoder
-        logger.info(
-            "whisper: %s encoder @%.1fs window, CPU KV decoder, lang=%s",
-            cfg.encoder_kind, cfg.window_s, cfg.language,
-        )
+            self._filters, self._vocab = filters, vocab
+            self._decoder, self._encoder = decoder, encoder
+            logger.info(
+                "whisper: %s encoder @%.1fs window, CPU KV decoder, lang=%s",
+                cfg.encoder_kind, cfg.window_s, cfg.language,
+            )
 
     def unload(self) -> None:
         # Same lock as transcribe_array: hot reload closes the encoder handle a
