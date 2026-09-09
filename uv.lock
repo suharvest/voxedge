@@ -729,7 +729,7 @@ wheels = [
 [[package]]
 name = "rkvoice-stream"
 version = "0.2.0"
-source = { git = "https://github.com/suharvest/rkvoice-stream.git?rev=32b4694e5946eb8bed63db6ed8116aa4b146aa94#32b4694e5946eb8bed63db6ed8116aa4b146aa94" }
+source = { git = "https://github.com/suharvest/rkvoice-stream.git?rev=a3b57cb83e90164c9c79cc4a13f735533b7f25b8#a3b57cb83e90164c9c79cc4a13f735533b7f25b8" }
 dependencies = [
     { name = "fastapi" },
     { name = "numpy" },
@@ -1114,7 +1114,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "extra == 'whisper'", specifier = ">=1.16" },
     { name = "piper-phonemize", marker = "platform_machine == 'aarch64' and extra == 'jetson'", specifier = ">=1.1.0" },
     { name = "rknn-toolkit-lite2", marker = "platform_machine == 'aarch64' and extra == 'rk'", specifier = ">=2.0" },
-    { name = "rkvoice-stream", marker = "platform_machine == 'aarch64' and extra == 'rk'", git = "https://github.com/suharvest/rkvoice-stream.git?rev=32b4694e5946eb8bed63db6ed8116aa4b146aa94" },
+    { name = "rkvoice-stream", marker = "platform_machine == 'aarch64' and extra == 'rk'", git = "https://github.com/suharvest/rkvoice-stream.git?rev=a3b57cb83e90164c9c79cc4a13f735533b7f25b8" },
     { name = "sentencepiece", marker = "extra == 'translator'", specifier = ">=0.1.99" },
     { name = "sherpa-onnx", marker = "extra == 'sherpa'", specifier = ">=1.10" },
     { name = "soundfile", marker = "extra == 'jetson'", specifier = ">=0.12" },
