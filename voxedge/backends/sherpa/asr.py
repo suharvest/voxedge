@@ -31,6 +31,7 @@ from voxedge.backends.base import (
     ASRBackend,
     ASRCapability,
     ASRStream,
+    OfflineAccumulateStream,
     TranscriptionResult,
     resolve_reported_language,
 )
@@ -276,6 +277,15 @@ class SherpaASRBackend(ASRBackend):
         ``get_partial`` only reads a cached result, so nothing decodes outside
         the server's inference slot.
 
+        The offline-only path (``OfflineAccumulateStream`` over the SenseVoice
+        recognizer, see ``create_stream``) holds the same property, and it is
+        the one measured: on a Raspberry Pi 5 (4 cores, CPU provider,
+        ``sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17``
+        ``model.int8.onnx``), 2 and 4 threads decoding six clips each through
+        one shared recognizer produced 0 exceptions and transcripts identical
+        to a serial baseline. All the decoding happens inside ``finalize``, so
+        no lock is needed.
+
         The value comes from ``SherpaASRConfig.max_concurrent`` (default 4, the
         historical desktop cap) so a deployment can size it against its own
         core count instead of being pinned at the class default. The evidence
@@ -352,10 +362,67 @@ class SherpaASRBackend(ASRBackend):
         except Exception:
             logger.exception("SherpaASRBackend.unload failed; continuing")
 
+    @property
+    def supports_offline_streaming(self) -> bool:  # type: ignore[override]
+        """True once the offline recognizer is loaded.
+
+        A runtime property, not the class-level flag other offline backends
+        use: this backend can hold an online recognizer, an offline one, or
+        both, and only the loaded set decides what a stream can be built from.
+        ``ASRBackend.has_capability`` reads this, so an offline-only
+        deployment (SenseVoice without Paraformer) advertises STREAMING and
+        the server opens ``/asr/stream`` instead of closing it.
+        """
+        return self._offline_recognizer is not None
+
     def create_stream(self, language: str = "auto") -> ASRStream:
-        if self._online_recognizer is None:
-            raise RuntimeError("Online recognizer not loaded; call preload() first")
-        return SherpaASRStream(self._online_recognizer, self._config.language_mode)
+        """Streaming session: native online recognizer first, offline second.
+
+        With a streaming recognizer loaded (Paraformer / Zipformer) the
+        session is the real incremental one — partials during speech, native
+        endpointing. With only the offline recognizer loaded (SenseVoice) the
+        session accumulates audio and transcribes the whole utterance on
+        ``finalize()`` via the generic ``OfflineAccumulateStream``; endpointing
+        comes from the server-side VAD, and no partial text is emitted before
+        finalize. Both recognizers loaded keeps the online path, which is what
+        every existing sherpa deployment already gets.
+        """
+        if self._online_recognizer is not None:
+            return SherpaASRStream(self._online_recognizer, self._config.language_mode)
+        if self._offline_recognizer is not None:
+            return OfflineAccumulateStream(self, language)
+        raise RuntimeError("No recognizer loaded; call preload() first")
+
+    def transcribe_array(
+        self, samples: np.ndarray, language: str = "auto"
+    ) -> TranscriptionResult:
+        """Offline transcription of float32 mono 16 kHz samples.
+
+        The entry point ``OfflineAccumulateStream.finalize()`` calls. Same
+        decode as :meth:`transcribe`, minus the container decode/resample that
+        only a file upload needs — the stream adapter has already resampled to
+        ``self.sample_rate``.
+        """
+        if self._offline_recognizer is None:
+            raise RuntimeError("Offline recognizer not loaded; call preload() first")
+        effective_language = self._effective_language(language)
+        samples = np.asarray(samples, dtype=np.float32)
+        return TranscriptionResult(
+            text=self._decode_offline(samples), language=effective_language
+        )
+
+    def _decode_offline(self, samples: np.ndarray) -> str:
+        """Decode 16 kHz float32 mono through the offline recognizer.
+
+        Each call takes its own native stream off the shared recognizer.
+        Measured safe under concurrent callers on the CPU provider — see
+        ``concurrency_capability``.
+        """
+        recognizer = self._offline_recognizer
+        stream = recognizer.create_stream()
+        stream.accept_waveform(self.sample_rate, samples)
+        recognizer.decode_stream(stream)
+        return stream.result.text.strip()
 
     def _effective_language(self, requested: str) -> str:
         """Language actually decoded with.
@@ -397,12 +464,9 @@ class SherpaASRBackend(ASRBackend):
             ).astype(np.float32)
             sample_rate = 16000
 
-        recognizer = self._offline_recognizer
-        stream = recognizer.create_stream()
-        stream.accept_waveform(sample_rate, data)
-        recognizer.decode_stream(stream)
-        text = stream.result.text.strip()
-        return TranscriptionResult(text=text, language=effective_language)
+        return TranscriptionResult(
+            text=self._decode_offline(data), language=effective_language
+        )
 
     # ------------------------------------------------------------------
     # Private loaders
