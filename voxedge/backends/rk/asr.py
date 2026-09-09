@@ -119,11 +119,8 @@ class RKASRConfig:
     # (voxedge.artifacts). None preserves the existing host-mounted behaviour.
     artifact_ref: Optional[str] = None
     # How many concurrent *sessions* (WebSocket connections) the host may
-    # admit. NPU inference stays strictly serial regardless: the capability
-    # keeps ``supports_parallel=False``, which the host reads as "admit N,
-    # run one inference at a time, queue the rest". Only raised for inner
-    # backends whose inference is confined to finalize(); see
-    # ``_SESSION_SAFE_INNER_BACKENDS``.
+    # admit. Only raised for inner backends whose inference is confined to
+    # finalize(); see ``_SESSION_SAFE_INNER_BACKENDS``.
     max_sessions: int = 4
 
 
@@ -395,6 +392,18 @@ _CAP_MAP = {
 # the conservative 1:1 until someone checks where its inference actually runs.
 _SESSION_SAFE_INNER_BACKENDS = frozenset({"sensevoice_rknn"})
 
+# Inner backends that build one NPU context per core and dispatch inference
+# from a pool, so two calls may be in flight at once. Kept separate from
+# ``_SESSION_SAFE_INNER_BACKENDS``: session safety is about *where* a backend
+# infers (finalize only), parallelism is about *how many* contexts it holds.
+_PARALLEL_INNER_BACKENDS = frozenset({"sensevoice_rknn"})
+
+# Physical NPU cores per SoC, mirroring rkvoice-stream's
+# ``sensevoice_rknn._PLATFORM_WORKERS``. Used only to answer "is more than one
+# context expected here"; the backend itself decides how many it actually
+# builds and degrades on its own if a core refuses.
+_PLATFORM_NPU_CORES = {"rk3588": 3, "rk3576": 2}
+
 
 def _resolve_max_sessions(profile=None) -> int:
     """Session capacity to declare, from profile → process env → default.
@@ -440,6 +449,41 @@ def _resolve_max_sessions(profile=None) -> int:
     return RKASRConfig.max_sessions
 
 
+def _resolve_parallel_inference(profile=None) -> bool:
+    """Whether the inner backend can hold more than one inference at a time.
+
+    True only when the inner backend builds a per-core NPU worker pool *and*
+    the SoC (or ``SENSEVOICE_RKNN_WORKERS``) leaves it more than one core to
+    bind. The same two inputs rkvoice-stream reads, read the same way, so the
+    two never disagree about whether the pool is wide.
+    """
+    env: dict = {}
+    if isinstance(profile, dict):
+        block = profile.get("env")
+        if isinstance(block, dict):
+            env = block
+
+    def _get(name: str) -> str:
+        value = env.get(name)
+        if value is None:
+            value = os.environ.get(name)
+        return str(value or "").strip()
+
+    if _get("ASR_BACKEND").lower() not in _PARALLEL_INNER_BACKENDS:
+        return False
+
+    raw = _get("SENSEVOICE_RKNN_WORKERS")
+    if raw:
+        try:
+            return int(raw) > 1
+        except ValueError:
+            logger.warning(
+                "SENSEVOICE_RKNN_WORKERS=%r is not an integer; "
+                "falling back to the SoC core count", raw,
+            )
+    return _PLATFORM_NPU_CORES.get(_get("RK_PLATFORM").lower(), 1) > 1
+
+
 class RKASRBackend(ASRBackend):
     """Adapter around rkvoice_stream.create_asr().
 
@@ -454,15 +498,7 @@ class RKASRBackend(ASRBackend):
 
         Two different numbers:
 
-        ``supports_parallel=False`` — rkvoice-stream holds a single shared
-        ``RKNNLite`` context and its ``inference()`` is not documented
-        thread-safe, so exactly one inference runs at a time. This never
-        changes here; running two at once needs a per-worker context bound to
-        its own NPU core, which lives in rkvoice-stream, not in this adapter.
-
-        ``max_concurrent`` — connections the host may admit. Paired with
-        ``supports_parallel=False`` the host reads this as "admit N, run one
-        inference at a time, queue the rest in FIFO order". Audio arrival is
+        ``max_concurrent`` — connections the host may admit. Audio arrival is
         bursty and mostly silence: at RTF ~0.135 the NPU is idle most of the
         wall clock even with one talker, so tying the connection count to the
         inference count refused clients against an idle device.
@@ -474,9 +510,24 @@ class RKASRBackend(ASRBackend):
         the event-loop thread outside that slot — interleaving sessions there
         would put two inferences on the shared context at once. Those keep the
         conservative 1.
+
+        ``supports_parallel`` — whether those admitted sessions may be inside
+        the runtime simultaneously. True once the inner backend builds one
+        ``RKNNLite`` context per NPU core and dispatches inference from a pool
+        (rkvoice-stream's ``sensevoice_rknn``, on a multi-core SoC); the pool
+        never hands one context to two callers, so overlapping calls are safe.
+        False for a single shared context and for every SoC with one core.
+
+        The host reads the pair as "admit ``max_concurrent`` sessions, run
+        ``max_concurrent`` inferences", which oversubscribes a pool of W < N
+        contexts — harmless (the extra callers block on the pool) but it moves
+        the backlog out of the host's bounded FIFO queue, where it is visible
+        and rejectable, into an invisible wait inside the backend. Deployments
+        set ``OVS_ASR_INFER_CONCURRENCY`` to the pool width so the queue stays
+        where it can be observed.
         """
         return ConcurrencyCapability(
-            supports_parallel=False,
+            supports_parallel=_resolve_parallel_inference(profile),
             max_concurrent=_resolve_max_sessions(profile),
             is_stateful=True,
             requires_exclusive_device=True,

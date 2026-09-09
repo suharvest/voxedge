@@ -1,14 +1,15 @@
-"""RK ASR admits more sessions than it runs inferences.
+"""RK ASR session admission and in-flight inference are separate numbers.
 
-``supports_parallel=False`` (only one inference at a time on the single shared
-RKNNLite context) must hold no matter what. ``max_concurrent`` — the session
-admission ceiling the host reads — rises only for inner backends whose
-inference is confined to ``finalize()``.
-
-The allow-list is the load-bearing part: a streaming inner backend also infers
+``max_concurrent`` — the session admission ceiling the host reads — rises only
+for inner backends whose inference is confined to ``finalize()``. The
+allow-list is the load-bearing part: a streaming inner backend also infers
 inside ``get_partial()``, which the host calls on the event-loop thread
 outside its per-utterance slot. Admitting extra sessions there would put two
 inferences on one context at the same time.
+
+``supports_parallel`` answers the other question: whether the inner backend
+holds more than one NPU context. True only for ``sensevoice_rknn`` (one
+``RKNNLite`` per core, dispatched from a pool) on a multi-core SoC.
 """
 
 import pytest
@@ -17,12 +18,16 @@ from voxedge.backends.rk.asr import (
     RKASRBackend,
     RKASRConfig,
     _resolve_max_sessions,
+    _resolve_parallel_inference,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for key in ("ASR_BACKEND", "ASR_MAX_SESSIONS"):
+    for key in (
+        "ASR_BACKEND", "ASR_MAX_SESSIONS", "RK_PLATFORM",
+        "SENSEVOICE_RKNN_WORKERS",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -30,22 +35,62 @@ def _profile(**env):
     return {"name": "rk3576-sensevoice", "env": env}
 
 
-# ── in-flight inference never moves ────────────────────────────────────
+# ── in-flight inference ────────────────────────────────────────────────
 
 
-def test_inference_is_never_declared_parallel():
-    """No profile, env or override may make the shared context parallel."""
+def test_multi_core_sensevoice_is_declared_parallel():
+    """One RKNNLite per core, handed out from a pool — overlap is safe."""
+    for platform in ("rk3576", "rk3588"):
+        cap = RKASRBackend.concurrency_capability(
+            _profile(ASR_BACKEND="sensevoice_rknn", RK_PLATFORM=platform)
+        )
+        assert cap.supports_parallel is True
+        assert cap.requires_exclusive_device is True
+
+
+def test_shared_context_backends_are_never_declared_parallel():
+    """Everything that is not the pooled backend keeps one inference at a time."""
     for profile in (
         None,
-        _profile(ASR_BACKEND="sensevoice_rknn"),
-        _profile(ASR_BACKEND="sensevoice_rknn", ASR_MAX_SESSIONS="16"),
-        _profile(ASR_BACKEND="paraformer_rknn"),
+        _profile(ASR_BACKEND="paraformer_rknn", RK_PLATFORM="rk3588"),
+        _profile(ASR_BACKEND="qwen3_rk", RK_PLATFORM="rk3588"),
+        _profile(ASR_BACKEND="sensevoice_sherpa", RK_PLATFORM="rk3588"),
     ):
         cap = RKASRBackend.concurrency_capability(profile)
-        assert cap.supports_parallel is False, (
-            "the shared RKNNLite context can only run one inference at a time"
-        )
-        assert cap.requires_exclusive_device is True
+        assert cap.supports_parallel is False
+
+
+def test_single_core_soc_is_not_parallel():
+    """rv1126b has one NPU core; a pool of one is not parallelism."""
+    assert _resolve_parallel_inference(
+        _profile(ASR_BACKEND="sensevoice_rknn", RK_PLATFORM="rv1126b")
+    ) is False
+    assert _resolve_parallel_inference(
+        _profile(ASR_BACKEND="sensevoice_rknn")
+    ) is False
+
+
+def test_worker_override_decides_parallelism():
+    """Pinning the pool to one context takes the parallel claim with it."""
+    assert _resolve_parallel_inference(_profile(
+        ASR_BACKEND="sensevoice_rknn", RK_PLATFORM="rk3588",
+        SENSEVOICE_RKNN_WORKERS="1",
+    )) is False
+    assert _resolve_parallel_inference(_profile(
+        ASR_BACKEND="sensevoice_rknn", RK_PLATFORM="rv1126b",
+        SENSEVOICE_RKNN_WORKERS="2",
+    )) is True
+    # Garbage falls back to the SoC count rather than crashing the probe.
+    assert _resolve_parallel_inference(_profile(
+        ASR_BACKEND="sensevoice_rknn", RK_PLATFORM="rk3588",
+        SENSEVOICE_RKNN_WORKERS="lots",
+    )) is True
+
+
+def test_parallelism_reads_process_env_without_a_profile(monkeypatch):
+    monkeypatch.setenv("ASR_BACKEND", "sensevoice_rknn")
+    monkeypatch.setenv("RK_PLATFORM", "rk3588")
+    assert RKASRBackend.concurrency_capability().supports_parallel is True
 
 
 # ── session capacity ───────────────────────────────────────────────────
