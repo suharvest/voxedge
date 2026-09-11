@@ -138,8 +138,8 @@ Concrete adapters live under `backends/{jetson,rk,sherpa}/` and import their hea
 
 | Backend | Platform | Models | Extra | Source engine |
 |---------|----------|--------|-------|---------------|
-| `backends/jetson/` | Jetson Orin (TensorRT) | Qwen3-ASR/TTS, Matcha, Kokoro, Paraformer, SenseVoice, MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) |
-| `backends/rk/` | Rockchip RK3576/RK3588 (RKNN) | Qwen3-ASR, Matcha, Piper, Kokoro, Paraformer, SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) |
+| `backends/jetson/` | Jetson Orin (TensorRT) | Qwen3-ASR/TTS, Matcha, Kokoro, Paraformer, SenseVoice, MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/suharvest/jetson-voice-engine) |
+| `backends/rk/` | Rockchip RK3576/RK3588 (RKNN) | Qwen3-ASR, Matcha, Piper, Kokoro, Paraformer, SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) |
 | `backends/sherpa/` | CPU (any arch) | Paraformer, Zipformer, SenseVoice, Matcha, Kokoro ONNX | `voxedge[sherpa]` | — |
 | `backends/llm/` | Any | OpenAI-compatible LLM over httpx | `voxedge[llm]` | — |
 | `backends/mock.py` | Dev / CI | MockASR, MockTTS, MockVAD, MockLLM | core | — |
@@ -257,8 +257,8 @@ voxedge is one layer in a family of repos:
 |------|------|-----------------|
 | **voxedge** *(this repo)* | Embeddable Python engine | Embedding real-time voice in your own app |
 | [openvoicestream](https://github.com/Seeed-Solution/openvoicestream) | Deployable FastAPI/WebSocket server, Docker profiles, agent gallery | Deployed use-cases and end-to-end demos; ready-to-run containers |
-| [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) | Rockchip NPU engine (`backends/rk/` wraps this) | RK3576/RK3588 model formats, RKNN perf numbers, TTS/ASR backend internals |
-| [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) | Jetson TensorRT build scripts, model export, artifacts (`backends/jetson/` wraps this) | Jetson model conversion, TRT engine build, Orin-specific optimisations |
+| [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) | Rockchip NPU engine (`backends/rk/` wraps this) | RK3576/RK3588 model formats, RKNN perf numbers, TTS/ASR backend internals |
+| [jetson-voice-engine](https://github.com/suharvest/jetson-voice-engine) | Jetson TensorRT build scripts, model export, artifacts (`backends/jetson/` wraps this) | Jetson model conversion, TRT engine build, Orin-specific optimisations |
 
 ## Acknowledgements
 

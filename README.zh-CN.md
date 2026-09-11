@@ -136,8 +136,8 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 | 后端 | 平台 | 模型 | Extra | 底层引擎源码 |
 |------|------|------|-------|------------|
-| `backends/jetson/` | Jetson Orin（TensorRT） | Qwen3-ASR/TTS、Matcha、Kokoro、Paraformer、SenseVoice、MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) |
-| `backends/rk/` | 瑞芯微 RK3576/RK3588（RKNN） | Qwen3-ASR、Matcha、Piper、Kokoro、Paraformer、SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) |
+| `backends/jetson/` | Jetson Orin（TensorRT） | Qwen3-ASR/TTS、Matcha、Kokoro、Paraformer、SenseVoice、MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/suharvest/jetson-voice-engine) |
+| `backends/rk/` | 瑞芯微 RK3576/RK3588（RKNN） | Qwen3-ASR、Matcha、Piper、Kokoro、Paraformer、SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) |
 | `backends/sherpa/` | CPU（任意架构） | Paraformer、Zipformer、SenseVoice、Matcha、Kokoro ONNX | `voxedge[sherpa]` | — |
 | `backends/llm/` | 任意 | OpenAI 兼容 LLM（httpx） | `voxedge[llm]` | — |
 | `backends/mock.py` | 开发 / CI | MockASR、MockTTS、MockVAD、MockLLM | 核心包 | — |
@@ -240,8 +240,8 @@ voxedge 是一个系列仓库中的一层：
 |------|------|--------------|
 | **voxedge**（本仓库） | 可嵌入的 Python 引擎 | 把实时语音嵌入自己的应用 |
 | [openvoicestream](https://github.com/Seeed-Solution/openvoicestream) | 可部署的 FastAPI/WebSocket 服务、Docker profile、agent 库 | 端到端的部署案例和完整示例；开箱即用的容器 |
-| [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) | 瑞芯微 NPU 引擎（`backends/rk/` 包装此库） | RK3576/RK3588 模型格式、RKNN 性能数据、TTS/ASR 后端内部实现 |
-| [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) | Jetson TensorRT 构建脚本、模型导出、产物（`backends/jetson/` 包装此库） | Jetson 模型转换、TRT 引擎构建、Orin 专属优化 |
+| [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) | 瑞芯微 NPU 引擎（`backends/rk/` 包装此库） | RK3576/RK3588 模型格式、RKNN 性能数据、TTS/ASR 后端内部实现 |
+| [jetson-voice-engine](https://github.com/suharvest/jetson-voice-engine) | Jetson TensorRT 构建脚本、模型导出、产物（`backends/jetson/` 包装此库） | Jetson 模型转换、TRT 引擎构建、Orin 专属优化 |
 
 ## 致谢
 
