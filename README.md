@@ -18,7 +18,7 @@
 
 voxedge is an embeddable Python library that drives real-time, on-device voice conversations by calling directly into each platform's native inference runtime — TensorRT on Jetson Orin, RKNN on RK3576/RK3588, sherpa-onnx on CPU. No cloud STT/TTS APIs, no internet at runtime, no intermediate abstraction overhead. The same `ConversationEngine` contract spans the three backend families; the exact model/runtime configuration still determines which features and concurrency level are available.
 
-voxedge is the open-core engine behind **[OpenVoiceStream](https://github.com/suharvest/openvoicestream)** — the deployable FastAPI/WebSocket server, device profiles, and agent gallery. Want a container? Start there. Want to embed real-time edge voice in your own app? You're in the right place.
+voxedge is the open-core engine behind **[OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream)** — the deployable FastAPI/WebSocket server, device profiles, and agent gallery. Want a container? Start there. Want to embed real-time edge voice in your own app? You're in the right place.
 
 ## Key Features
 
@@ -138,8 +138,8 @@ Concrete adapters live under `backends/{jetson,rk,sherpa}/` and import their hea
 
 | Backend | Platform | Models | Extra | Source engine |
 |---------|----------|--------|-------|---------------|
-| `backends/jetson/` | Jetson Orin (TensorRT) | Qwen3-ASR/TTS, Matcha, Kokoro, Paraformer, SenseVoice, MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/suharvest/qwen3-edgellm-jetson) |
-| `backends/rk/` | Rockchip RK3576/RK3588 (RKNN) | Qwen3-ASR, Matcha, Piper, Kokoro, Paraformer, SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) |
+| `backends/jetson/` | Jetson Orin (TensorRT) | Qwen3-ASR/TTS, Matcha, Kokoro, Paraformer, SenseVoice, MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) |
+| `backends/rk/` | Rockchip RK3576/RK3588 (RKNN) | Qwen3-ASR, Matcha, Piper, Kokoro, Paraformer, SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) |
 | `backends/sherpa/` | CPU (any arch) | Paraformer, Zipformer, SenseVoice, Matcha, Kokoro ONNX | `voxedge[sherpa]` | — |
 | `backends/llm/` | Any | OpenAI-compatible LLM over httpx | `voxedge[llm]` | — |
 | `backends/mock.py` | Dev / CI | MockASR, MockTTS, MockVAD, MockLLM | core | — |
@@ -174,7 +174,7 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 ## Design Constraints
 
 - **Pure Python core** — `import voxedge` is numpy-only. Heavy adapters live under `backends/{jetson,rk,sherpa}/` with deferred runtime imports.
-- **Explicit runtime config** — backend configuration is injected as params; profiles and deployment knobs belong to [OpenVoiceStream](https://github.com/suharvest/openvoicestream). The optional artifact downloader deliberately honors `HF_ENDPOINT` after an explicit endpoint and before the manifest endpoint.
+- **Explicit runtime config** — backend configuration is injected as params; profiles and deployment knobs belong to [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream). The optional artifact downloader deliberately honors `HF_ENDPOINT` after an explicit endpoint and before the manifest endpoint.
 
 ## Status
 
@@ -256,14 +256,14 @@ voxedge is one layer in a family of repos:
 | Repo | Role | When to go there |
 |------|------|-----------------|
 | **voxedge** *(this repo)* | Embeddable Python engine | Embedding real-time voice in your own app |
-| [openvoicestream](https://github.com/suharvest/openvoicestream) | Deployable FastAPI/WebSocket server, Docker profiles, agent gallery | Deployed use-cases and end-to-end demos; ready-to-run containers |
-| [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) | Rockchip NPU engine (`backends/rk/` wraps this) | RK3576/RK3588 model formats, RKNN perf numbers, TTS/ASR backend internals |
-| [jetson-voice-engine](https://github.com/suharvest/qwen3-edgellm-jetson) | Jetson TensorRT build scripts, model export, artifacts (`backends/jetson/` wraps this) | Jetson model conversion, TRT engine build, Orin-specific optimisations |
+| [openvoicestream](https://github.com/Seeed-Solution/openvoicestream) | Deployable FastAPI/WebSocket server, Docker profiles, agent gallery | Deployed use-cases and end-to-end demos; ready-to-run containers |
+| [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) | Rockchip NPU engine (`backends/rk/` wraps this) | RK3576/RK3588 model formats, RKNN perf numbers, TTS/ASR backend internals |
+| [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) | Jetson TensorRT build scripts, model export, artifacts (`backends/jetson/` wraps this) | Jetson model conversion, TRT engine build, Orin-specific optimisations |
 
 ## Acknowledgements
 
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — CPU ASR/TTS runtime
-- [OpenVoiceStream](https://github.com/suharvest/openvoicestream) — the deployable server product built on this engine
+- [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream) — the deployable server product built on this engine
 
 ## License
 

@@ -18,7 +18,7 @@
 
 voxedge 是一个可嵌入的 Python 库，通过直接调用各平台原生推理运行时来驱动实时、端侧语音对话 —— Jetson Orin 上是 TensorRT，RK3576/RK3588 上是 RKNN，CPU 上是 sherpa-onnx。无需云端 STT/TTS API，运行时不依赖网络，没有中间抽象层的性能损耗。同一套 `ConversationEngine` 契约横跨三类后端，但具体功能与并发上限仍取决于模型、运行时和产物组合。
 
-voxedge 是已上线产品 **[OpenVoiceStream](https://github.com/suharvest/openvoicestream)** 的开源内核（产品侧含 FastAPI/WebSocket 服务、设备 profile、部署工具与 agent 库）。想要可部署的容器？从那里开始。想把实时边缘语音嵌进自己的应用？这里就是对的地方。
+voxedge 是已上线产品 **[OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream)** 的开源内核（产品侧含 FastAPI/WebSocket 服务、设备 profile、部署工具与 agent 库）。想要可部署的容器？从那里开始。想把实时边缘语音嵌进自己的应用？这里就是对的地方。
 
 ## 核心特性
 
@@ -136,8 +136,8 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 | 后端 | 平台 | 模型 | Extra | 底层引擎源码 |
 |------|------|------|-------|------------|
-| `backends/jetson/` | Jetson Orin（TensorRT） | Qwen3-ASR/TTS、Matcha、Kokoro、Paraformer、SenseVoice、MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/suharvest/qwen3-edgellm-jetson) |
-| `backends/rk/` | 瑞芯微 RK3576/RK3588（RKNN） | Qwen3-ASR、Matcha、Piper、Kokoro、Paraformer、SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) |
+| `backends/jetson/` | Jetson Orin（TensorRT） | Qwen3-ASR/TTS、Matcha、Kokoro、Paraformer、SenseVoice、MOSS-TTS-Nano | `voxedge[jetson]` aarch64 | [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) |
+| `backends/rk/` | 瑞芯微 RK3576/RK3588（RKNN） | Qwen3-ASR、Matcha、Piper、Kokoro、Paraformer、SenseVoice | `voxedge[rk]` aarch64 | [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) |
 | `backends/sherpa/` | CPU（任意架构） | Paraformer、Zipformer、SenseVoice、Matcha、Kokoro ONNX | `voxedge[sherpa]` | — |
 | `backends/llm/` | 任意 | OpenAI 兼容 LLM（httpx） | `voxedge[llm]` | — |
 | `backends/mock.py` | 开发 / CI | MockASR、MockTTS、MockVAD、MockLLM | 核心包 | — |
@@ -172,7 +172,7 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 ## 设计约束
 
 - **纯 Python 核心** —— `import voxedge` 只依赖 numpy。重型适配器位于 `backends/{jetson,rk,sherpa}/`，运行时导入被推迟。
-- **显式运行时配置** —— 后端配置以参数注入；profile 和部署开关属于 [OpenVoiceStream](https://github.com/suharvest/openvoicestream)。可选 artifact downloader 是唯一明确的例外：它在显式 endpoint 之后、manifest endpoint 之前遵循 `HF_ENDPOINT`。
+- **显式运行时配置** —— 后端配置以参数注入；profile 和部署开关属于 [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream)。可选 artifact downloader 是唯一明确的例外：它在显式 endpoint 之后、manifest endpoint 之前遵循 `HF_ENDPOINT`。
 
 ## 状态
 
@@ -239,14 +239,14 @@ voxedge 是一个系列仓库中的一层：
 | 仓库 | 定位 | 适合去看的场景 |
 |------|------|--------------|
 | **voxedge**（本仓库） | 可嵌入的 Python 引擎 | 把实时语音嵌入自己的应用 |
-| [openvoicestream](https://github.com/suharvest/openvoicestream) | 可部署的 FastAPI/WebSocket 服务、Docker profile、agent 库 | 端到端的部署案例和完整示例；开箱即用的容器 |
-| [rkvoice-stream](https://github.com/suharvest/rkvoice-stream) | 瑞芯微 NPU 引擎（`backends/rk/` 包装此库） | RK3576/RK3588 模型格式、RKNN 性能数据、TTS/ASR 后端内部实现 |
-| [jetson-voice-engine](https://github.com/suharvest/qwen3-edgellm-jetson) | Jetson TensorRT 构建脚本、模型导出、产物（`backends/jetson/` 包装此库） | Jetson 模型转换、TRT 引擎构建、Orin 专属优化 |
+| [openvoicestream](https://github.com/Seeed-Solution/openvoicestream) | 可部署的 FastAPI/WebSocket 服务、Docker profile、agent 库 | 端到端的部署案例和完整示例；开箱即用的容器 |
+| [rkvoice-stream](https://github.com/Seeed-Solution/rkvoice-stream) | 瑞芯微 NPU 引擎（`backends/rk/` 包装此库） | RK3576/RK3588 模型格式、RKNN 性能数据、TTS/ASR 后端内部实现 |
+| [jetson-voice-engine](https://github.com/Seeed-Solution/jetson-voice-engine) | Jetson TensorRT 构建脚本、模型导出、产物（`backends/jetson/` 包装此库） | Jetson 模型转换、TRT 引擎构建、Orin 专属优化 |
 
 ## 致谢
 
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) —— CPU ASR/TTS 运行时
-- [OpenVoiceStream](https://github.com/suharvest/openvoicestream) —— 基于本引擎构建的可部署服务端产品
+- [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream) —— 基于本引擎构建的可部署服务端产品
 
 ## 许可证
 

@@ -162,4 +162,4 @@ dev = [
 [tool.uv.sources]
 # Development lock: keep source tests on the exact RKVoice 0.2.0 release
 # commit. Published package metadata resolves rkvoice-stream>=0.2.0 from PyPI.
-rkvoice-stream = { git = "https://github.com/suharvest/rkvoice-stream.git", rev = "a3b57cb83e90164c9c79cc4a13f735533b7f25b8" }
+rkvoice-stream = { git = "https://github.com/Seeed-Solution/rkvoice-stream.git", rev = "a3b57cb83e90164c9c79cc4a13f735533b7f25b8" }
