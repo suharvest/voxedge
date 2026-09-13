@@ -200,6 +200,7 @@ class Session:
                 self._asr_be,
                 language=engine.asr_language,
                 sample_rate=self._asr_be.sample_rate,
+                stream_options=engine.asr_stream_options,
             )
             if self._asr_be
             else None
@@ -828,6 +829,7 @@ class ConversationEngine:
         silence_ms: int = 400,
         vad_preroll_ms: int = 300,
         asr_language: str = "auto",
+        asr_stream_options: Optional[dict] = None,
         tts_language: Optional[str] = None,
         tts_speaker_kwargs: Optional[dict] = None,
         tts_voice: Optional[str] = None,
@@ -854,6 +856,12 @@ class ConversationEngine:
         # turn. 0 disables (behaviour byte-identical to the no-ring path).
         self.vad_preroll_ms = max(0, int(vad_preroll_ms))
         self.asr_language = asr_language
+        # Session-scoped ASR stream options forwarded verbatim to the backend's
+        # ``create_stream(language=..., stream_options=...)`` (e.g.
+        # ``{"vad_endpoint_silence_ms": 1500}`` for backends that own their own
+        # endpoint VAD). Injected by the caller like every other knob — the
+        # engine never reads env. Default None keeps backend defaults.
+        self.asr_stream_options = dict(asr_stream_options or {})
         self.tts_language = tts_language
         # Engine-parity #15: TTS speaker / voice / speed + buffer selection.
         self.tts_speaker_kwargs = tts_speaker_kwargs or {}

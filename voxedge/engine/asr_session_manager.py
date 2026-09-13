@@ -134,9 +134,15 @@ class ASRSessionManager:
         sample_rate: int = 16000,
         executor: Any = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        stream_options: Optional[dict] = None,
     ) -> None:
         self._backend = backend
         self._language = language
+        # Session-scoped options forwarded to the backend's ``create_stream``
+        # on every (re)create. Product-injected (e.g.
+        # ``{"vad_endpoint_silence_ms": 1500}``); empty/None keeps backend
+        # defaults, so existing callers are unaffected.
+        self._stream_options = dict(stream_options or {})
         self._coord = coord  # BackendCoordinator (optional)
         # M2: sample_rate injected (prod hardcoded 16000 in accept_audio,
         # app/core/asr_session_manager.py:235). Falls back to the backend's
@@ -186,6 +192,10 @@ class ASRSessionManager:
         return await loop.run_in_executor(self._executor, fn, *args)
 
     def _new_stream_sync(self) -> Any:
+        if self._stream_options:
+            return self._backend.create_stream(
+                language=self._language, stream_options=self._stream_options
+            )
         return self._backend.create_stream(language=self._language)
 
     async def _create_stream(self) -> Any:
