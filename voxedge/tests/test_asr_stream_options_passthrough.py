@@ -89,3 +89,37 @@ def test_empty_options_behave_like_absent():
     mgr = _manager(be, stream_options={})
     assert mgr._new_stream_sync() == "stream-1"
     assert be.calls == [{"language": "zh"}]
+
+
+def test_legacy_backend_without_the_parameter_is_not_broken(caplog):
+    """Jetson (TRT Edge-LLM / Paraformer) and Sherpa take `language` only.
+
+    An operator default or session override must not turn into a TypeError that
+    fails ASR: the hint is dropped and the profile threshold applies.
+    """
+    be = _RecordingBackend()  # create_stream(language) only
+    mgr = _manager(be, stream_options={"vad_endpoint_silence_ms": 1500})
+    with caplog.at_level("WARNING"):
+        assert mgr._new_stream_sync() == "stream-1"
+        # Second call must reuse the cached capability (no second warning).
+        assert mgr._new_stream_sync() == "stream-2"
+    assert be.calls == [{"language": "zh"}, {"language": "zh"}]
+    warnings = [r for r in caplog.records if "does not accept stream_options" in r.message]
+    assert len(warnings) == 1
+
+
+def test_var_keyword_backend_counts_as_supporting_options():
+    class _KwargsBackend:
+        sample_rate = 16000
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create_stream(self, language="auto", **kwargs):
+            self.calls.append({"language": language, **kwargs})
+            return "stream"
+
+    be = _KwargsBackend()
+    mgr = _manager(be, stream_options={"vad_endpoint_silence_ms": 1500})
+    assert mgr._new_stream_sync() == "stream"
+    assert be.calls == [{"language": "zh", "stream_options": {"vad_endpoint_silence_ms": 1500}}]

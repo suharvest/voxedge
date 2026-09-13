@@ -35,6 +35,7 @@ with a stale generation are silently dropped.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -143,6 +144,12 @@ class ASRSessionManager:
         # ``{"vad_endpoint_silence_ms": 1500}``); empty/None keeps backend
         # defaults, so existing callers are unaffected.
         self._stream_options = dict(stream_options or {})
+        # Lazily resolved: does the backend's create_stream accept
+        # stream_options? Only the RK adapter does today; Jetson (TRT Edge-LLM,
+        # Paraformer) and Sherpa take ``language`` only, so forwarding
+        # unconditionally would raise TypeError and fail ASR outright whenever
+        # an operator default or session override is set.
+        self._accepts_stream_options: Optional[bool] = None
         self._coord = coord  # BackendCoordinator (optional)
         # M2: sample_rate injected (prod hardcoded 16000 in accept_audio,
         # app/core/asr_session_manager.py:235). Falls back to the backend's
@@ -191,8 +198,39 @@ class ASRSessionManager:
             return await loop.run_in_executor(self._executor, _bound)
         return await loop.run_in_executor(self._executor, fn, *args)
 
+    def _backend_accepts_stream_options(self) -> bool:
+        """Whether ``backend.create_stream`` can take ``stream_options``.
+
+        Cached after the first probe (the signature cannot change for a given
+        backend instance). A backend without the parameter must keep working:
+        the option is a tuning hint, never a hard requirement — silently
+        dropping it degrades to the profile's own threshold instead of
+        breaking the session.
+        """
+        cached = self._accepts_stream_options
+        if cached is not None:
+            return cached
+        accepts = False
+        try:
+            params = inspect.signature(self._backend.create_stream).parameters
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            params = {}
+        else:
+            accepts = "stream_options" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        self._accepts_stream_options = accepts
+        if self._stream_options and not accepts:
+            logger.warning(
+                "ASR backend %s does not accept stream_options; ignoring %s "
+                "(profile/default threshold applies)",
+                type(self._backend).__name__,
+                sorted(self._stream_options),
+            )
+        return accepts
+
     def _new_stream_sync(self) -> Any:
-        if self._stream_options:
+        if self._stream_options and self._backend_accepts_stream_options():
             return self._backend.create_stream(
                 language=self._language, stream_options=self._stream_options
             )
