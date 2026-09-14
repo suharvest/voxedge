@@ -1052,7 +1052,7 @@ wheels = [
 
 [[package]]
 name = "voxedge"
-version = "0.0.14a0"
+version = "0.0.15a1"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
