@@ -61,6 +61,7 @@ from voxedge.backends.base import (
 from voxedge.engine.concurrency_capability import ConcurrencyCapability
 
 from ._trt_edge_llm_util import (
+    DEFAULT_ENERGY_SPLIT_RMS,
     VAD_MAX_SEG_SEC,
     _split_at_silence_energy,
     _split_at_silence_vad,
@@ -501,6 +502,7 @@ class TRTEdgeLLMASRBackend(ASRBackend):
     def _worker_request(self, input_data: dict) -> dict:
         """Send one streaming protocol line to the worker, return its single reply."""
         req_event = input_data.get("event") if isinstance(input_data, dict) else None
+        req_id = input_data.get("id") if isinstance(input_data, dict) else None
         with self._worker_lock:
             self._ensure_worker()
             wio = self._wio
@@ -533,6 +535,18 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         typed = _classify_worker_response(output_data, request_event=req_event)
         if typed is not None:
             raise typed
+        # Native handleEnd uses this error after releasing an empty session's
+        # lane and erasing its session.  Treat only the matching end request as
+        # a normal terminal response; all other errors retain their contract.
+        if (
+            req_event == "end"
+            and output_data.get("event") == "error"
+            and output_data.get("ok") is False
+            and output_data.get("error") == "no_audio_accumulated"
+            and req_id is not None
+            and output_data.get("id") == req_id
+        ):
+            return output_data
         if output_data.get("event") == "error" or output_data.get("ok") is False:
             raise WorkerProtocolError(f"ASR worker error: {output_data}")
         return output_data
@@ -614,8 +628,54 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                     text = ""
         return text, language_detected
 
-    def _transcribe_worker(self, mel_path: str, elapsed_mel_s: float) -> TranscriptionResult:
+    @staticmethod
+    def _canonical_worker_language(language: str) -> Optional[str]:
+        aliases = {
+            "zh": "Chinese", "zh-cn": "Chinese", "chinese": "Chinese",
+            "en": "English", "en-us": "English", "english": "English",
+            "yue": "Cantonese", "cantonese": "Cantonese",
+            "ja": "Japanese", "japanese": "Japanese", "ko": "Korean",
+            "korean": "Korean", "fr": "French", "french": "French",
+            "de": "German", "german": "German", "it": "Italian",
+            "italian": "Italian", "pt": "Portuguese", "portuguese": "Portuguese",
+            "ru": "Russian", "russian": "Russian", "es": "Spanish",
+            "spanish": "Spanish", "ar": "Arabic", "arabic": "Arabic",
+            "hi": "Hindi", "hindi": "Hindi", "bn": "Bengali", "bengali": "Bengali",
+            "ur": "Urdu", "urdu": "Urdu", "id": "Indonesian", "indonesian": "Indonesian",
+            "ms": "Malay", "malay": "Malay", "vi": "Vietnamese", "vietnamese": "Vietnamese",
+            "th": "Thai", "thai": "Thai", "tr": "Turkish", "turkish": "Turkish",
+            "nl": "Dutch", "dutch": "Dutch", "pl": "Polish", "polish": "Polish",
+            "uk": "Ukrainian", "ukrainian": "Ukrainian", "sv": "Swedish", "swedish": "Swedish",
+            "no": "Norwegian", "norwegian": "Norwegian", "da": "Danish", "danish": "Danish",
+            "fi": "Finnish", "finnish": "Finnish", "el": "Greek", "greek": "Greek",
+            "he": "Hebrew", "hebrew": "Hebrew", "fa": "Persian", "persian": "Persian",
+            "cs": "Czech", "czech": "Czech", "sk": "Slovak", "slovak": "Slovak",
+            "hu": "Hungarian", "hungarian": "Hungarian", "ro": "Romanian", "romanian": "Romanian",
+            "bg": "Bulgarian", "bulgarian": "Bulgarian", "hr": "Croatian", "croatian": "Croatian",
+            "sr": "Serbian", "serbian": "Serbian", "ta": "Tamil", "tamil": "Tamil",
+            "te": "Telugu", "telugu": "Telugu", "mr": "Marathi", "marathi": "Marathi",
+            "gu": "Gujarati", "gujarati": "Gujarati", "kn": "Kannada", "kannada": "Kannada",
+            "ml": "Malayalam", "malayalam": "Malayalam", "pa": "Punjabi", "punjabi": "Punjabi",
+            "ne": "Nepali", "nepali": "Nepali", "si": "Sinhala", "sinhala": "Sinhala",
+            "my": "Burmese", "burmese": "Burmese", "km": "Khmer", "khmer": "Khmer",
+            "lo": "Lao", "lao": "Lao", "mn": "Mongolian", "mongolian": "Mongolian",
+            "bo": "Tibetan", "tibetan": "Tibetan", "ug": "Uyghur", "uyghur": "Uyghur",
+        }
+        requested = str(language or "auto").strip()
+        if not requested or requested.lower() == "auto":
+            return None
+        if not requested.isascii() or any(ord(ch) < 32 for ch in requested):
+            raise ValueError(f"unsupported ASR worker language: {language!r}")
+        canonical = aliases.get(requested.lower())
+        if canonical is None:
+            raise ValueError(f"unsupported ASR worker language: {language!r}")
+        return canonical
+
+    def _transcribe_worker(
+        self, mel_path: str, elapsed_mel_s: float, language: str = "auto"
+    ) -> TranscriptionResult:
         req_id = uuid.uuid4().hex
+        canonical_language = self._canonical_worker_language(language)
         input_data = {
             "id": req_id,
             "requests": [
@@ -634,8 +694,13 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             "top_k": self._config.top_k,
             "max_generate_length": self._config.max_generate_length,
             "apply_chat_template": True,
-            "add_generation_prompt": True,
+            "add_generation_prompt": canonical_language is None,
         }
+        if canonical_language is not None:
+            input_data["requests"][0]["messages"].append({
+                "role": "assistant",
+                "content": f"language {canonical_language}<asr_text>",
+            })
         with self._worker_lock:
             self._ensure_worker()
             wio = self._wio
@@ -668,12 +733,52 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             text=text,
             language=language_detected,
             meta={
+                "requested_language": language,
                 "inference_time_s": round(total_s, 3),
                 "mel_time_s": round(elapsed_mel_s, 3),
                 "worker_time_s": round(elapsed_worker, 3),
                 "worker_init_ms": round(float(self._worker_ready_meta.get("init_ms", 0.0)), 1),
             },
         )
+
+    @staticmethod
+    def _is_effectively_silent_segment(
+        audio: np.ndarray, sample_rate: int, *, split_rms: float = DEFAULT_ENERGY_SPLIT_RMS
+    ) -> bool:
+        """Skip only uniformly quiet segments, preserving low-volume speech/noise pulses."""
+        if audio.ndim != 1 or not np.isfinite(audio).all():
+            return False
+        frame_len = max(1, int(sample_rate * 20 / 1000))
+        if len(audio) == 0:
+            return True
+        n = (len(audio) + frame_len - 1) // frame_len
+        padded = np.pad(audio, (0, n * frame_len - len(audio)))
+        frames = padded.reshape(n, frame_len)
+        frame_rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+        overall_rms = float(np.sqrt(np.mean(audio * audio) + 1e-12))
+        if overall_rms < split_rms:
+            source = padded
+            peak = float(np.max(np.abs(source)))
+            if peak <= 1e-8:
+                return True
+            try:
+                import webrtcvad
+                gain_source = np.clip(source * (0.5 / peak), -1.0, 1.0)
+                for candidate in (source, gain_source):
+                    vad = webrtcvad.Vad(0)
+                    pcm = (candidate * 32767).astype(np.int16)
+                    if any(
+                        vad.is_speech(
+                            pcm[i * frame_len : (i + 1) * frame_len].tobytes(), sample_rate
+                        )
+                        for i in range(n)
+                    ):
+                        return False
+            except Exception:
+                # Unknown VAD capability is not evidence of silence. Preserve
+                # non-zero audio rather than dropping a quiet real utterance.
+                return False
+        return overall_rms < split_rms and float(frame_rms.max()) <= 2 * split_rms
 
     def _prepare_worker_audio(
         self, audio_bytes: bytes, tmpdir: str
@@ -736,6 +841,11 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         if not self._ready:
             raise RuntimeError("ASR backend not preloaded")
 
+        # Validate the API language before any early-return path (including
+        # silent short audio), so silence handling cannot weaken the worker
+        # language contract.
+        self._canonical_worker_language(language)
+
         if self._config.offline_segment_enabled:
             try:
                 audio, sample_rate = _wav_bytes_to_float_audio(audio_bytes)
@@ -746,12 +856,26 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 duration_s = 0.0
             if audio is not None and duration_s > self._config.offline_segment_threshold_s:
                 return self._transcribe_segmented_offline(audio, sample_rate, language)
+            if audio is not None and self._is_effectively_silent_segment(audio, sample_rate):
+                return TranscriptionResult(
+                    text="",
+                    language=None,
+                    meta={
+                        "segmented": False,
+                        "requested_language": language,
+                        "original_duration_s": round(duration_s, 3),
+                        "skipped_silent_segments": 1,
+                        "skipped_silent_durations_s": [round(duration_s, 3)],
+                        "empty_segments": 0,
+                        "failed_segments": 0,
+                    },
+                )
 
         with tempfile.TemporaryDirectory(prefix="trt_edgellm_asr_") as tmpdir:
             audio_path, elapsed_prep_s = self._prepare_worker_audio(audio_bytes, tmpdir)
 
             if self._use_worker():
-                return self._transcribe_worker(audio_path, elapsed_prep_s)
+                return self._transcribe_worker(audio_path, elapsed_prep_s, language)
 
             input_data = {
                 "requests": [
@@ -847,11 +971,19 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         total_mel_s = 0.0
         total_worker_s = 0.0
         failed_segments = 0
+        skipped_silent_segments = 0
+        skipped_silent_durations_s: list[float] = []
+        empty_segments = 0
+        empty_segment_durations_s: list[float] = []
         min_seg_s = self._config.offline_segment_min_s
 
         for seg in segments:
             seg_duration_s = len(seg) / sample_rate
             if seg_duration_s < min_seg_s:
+                continue
+            if self._is_effectively_silent_segment(seg, sample_rate):
+                skipped_silent_segments += 1
+                skipped_silent_durations_s.append(round(seg_duration_s, 3))
                 continue
             wav_bytes = _float_audio_to_wav_bytes(seg, sample_rate)
             try:
@@ -866,6 +998,9 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 continue
             if result.text:
                 parts.append((result.text, result.language))
+            else:
+                empty_segments += 1
+                empty_segment_durations_s.append(round(seg_duration_s, 3))
             meta = result.meta or {}
             total_inference_s += float(meta.get("inference_time_s", 0.0) or 0.0)
             total_mel_s += float(meta.get("mel_time_s", 0.0) or 0.0)
@@ -900,6 +1035,11 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 "unlabelled_segments": unlabelled,
                 "repeated_segments": repeated,
                 "failed_segments": failed_segments,
+                "empty_segments": empty_segments,
+                "empty_segment_durations_s": empty_segment_durations_s,
+                "skipped_silent_segments": skipped_silent_segments,
+                "skipped_silent_durations_s": skipped_silent_durations_s,
+                "requested_language": language,
                 "original_duration_s": round(original_duration_s, 3),
                 "inference_time_s": round(total_inference_s, 3),
                 "mel_time_s": round(total_mel_s, 3),
@@ -961,9 +1101,13 @@ def _split_offline_audio(
     the env-free webrtcvad→energy splitter cascade.
     """
     try:
-        segments = _split_at_silence_vad(audio, sample_rate)
+        segments = _split_at_silence_vad(
+            audio, sample_rate, max_seg_s=max_segment_s
+        )
     except ImportError:
-        segments = _split_at_silence_energy(audio, sample_rate)
+        segments = _split_at_silence_energy(
+            audio, sample_rate, max_seg_s=max_segment_s
+        )
     except Exception as exc:
         logger.warning("TRT-EdgeLLM ASR offline splitter failed: %s", exc)
         segments = [audio]

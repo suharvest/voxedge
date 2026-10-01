@@ -19,6 +19,7 @@ monkeypatches the splitter + the inner per-segment ``transcribe``.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import voxedge.backends.jetson.trt_edge_llm_asr as asr_mod
 from voxedge.backends.jetson.trt_edge_llm_asr import (
@@ -103,3 +104,41 @@ def test_offline_segment_skips_sub_min_segments(monkeypatch):
     # segment_count counts all returned segments, but only the >= min one is sent.
     assert result.meta["segment_count"] == 2
     assert len(seen) == 1
+
+
+def test_short_transcribe_skips_effectively_silent_audio_before_worker(monkeypatch):
+    backend = _make_backend(threshold_s=6.0)
+    audio = np.zeros(16000 * 2, dtype=np.float32)
+    wav_bytes = _float_audio_to_wav_bytes(audio, 16000)
+    calls = {"prepare": 0}
+
+    def fail_prepare(*args, **kwargs):
+        calls["prepare"] += 1
+        raise AssertionError("silent short audio must not reach the worker")
+
+    monkeypatch.setattr(backend, "_prepare_worker_audio", fail_prepare)
+    result = backend.transcribe(wav_bytes, language="zh")
+
+    assert result.text == ""
+    assert result.meta["skipped_silent_segments"] == 1
+    assert result.meta["empty_segments"] == 0
+    assert result.meta["failed_segments"] == 0
+    assert calls["prepare"] == 0
+
+
+def test_short_guard_real_silence_and_voiced_boundary():
+    backend = _make_backend(threshold_s=6.0)
+    silence = np.zeros(16000 * 2, dtype=np.float32)
+    voiced = (0.02 * np.sin(2 * np.pi * 220 * np.arange(16000 * 2) / 16000)).astype(np.float32)
+
+    assert backend._is_effectively_silent_segment(silence, 16000) is True
+    assert backend._is_effectively_silent_segment(voiced, 16000) is False
+
+
+def test_short_silence_still_rejects_unknown_language(monkeypatch):
+    backend = _make_backend(threshold_s=6.0)
+    wav_bytes = _float_audio_to_wav_bytes(np.zeros(16000 * 2, dtype=np.float32), 16000)
+    monkeypatch.setattr(backend, "_prepare_worker_audio", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("worker path reached")))
+
+    with pytest.raises(ValueError, match="unsupported ASR worker language"):
+        backend.transcribe(wav_bytes, language="not-a-language")

@@ -37,10 +37,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 from enum import Enum
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_RETIRED_WORKER_OP = object()
 
 
 class ASRSessionUnavailable(RuntimeError):
@@ -158,6 +161,12 @@ class ASRSessionManager:
         self._executor = executor  # asr executor (optional)
         self._loop = loop  # late-bound if None
         self._lock = asyncio.Lock()
+        # asyncio task cancellation releases ``_lock`` while a synchronous
+        # worker call submitted to the executor may still be running. Keep a
+        # mutex inside the executor operation itself so cancel/finalize cannot
+        # overlap on one native stream in that interval.
+        self._worker_op_lock = threading.Lock()
+        self._worker_op_epoch = 0
         self._state: SessionState = SessionState.IDLE
         self._stream: Any = None
         self._generation: int = 0
@@ -192,11 +201,22 @@ class ASRSessionManager:
 
     async def _run_sync(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
         loop = self._get_loop()
+        op_lock = self._worker_op_lock
+        op_epoch = self._worker_op_epoch
+        retire_on_restart = kwargs.pop("_retire_on_restart", False)
         if kwargs:
             def _bound():
-                return fn(*args, **kwargs)
+                with op_lock:
+                    if retire_on_restart and op_epoch != self._worker_op_epoch:
+                        return _RETIRED_WORKER_OP
+                    return fn(*args, **kwargs)
             return await loop.run_in_executor(self._executor, _bound)
-        return await loop.run_in_executor(self._executor, fn, *args)
+        def _bound():
+            with op_lock:
+                if retire_on_restart and op_epoch != self._worker_op_epoch:
+                    return _RETIRED_WORKER_OP
+                return fn(*args)
+        return await loop.run_in_executor(self._executor, _bound)
 
     def _backend_accepts_stream_options(self) -> bool:
         """Whether ``backend.create_stream`` can take ``stream_options``.
@@ -435,7 +455,9 @@ class ASRSessionManager:
                 stream.cancel_and_finalize()
 
         loop = self._get_loop()
-        fut = loop.run_in_executor(self._executor, _cancel_call)
+        fut = asyncio.create_task(
+            self._run_sync(_cancel_call, _retire_on_restart=True)
+        )
         # P3: only close the stream if the cancel executor call actually
         # FINISHED (returned or raised). On timeout the worker thread may still
         # be inside _cancel_call on this C++ stream object; a synchronous
@@ -445,7 +467,7 @@ class ASRSessionManager:
         thread_done = False
         try:
             await asyncio.wait_for(fut, timeout=self._CANCEL_ACK_TIMEOUT_S)
-            thread_done = True
+            thread_done = fut.result() is not _RETIRED_WORKER_OP
         except asyncio.TimeoutError:
             logger.warning(
                 "ASRSessionManager: cancel(%s) timed out from state=%s; restarting "
@@ -555,8 +577,16 @@ class ASRSessionManager:
         # ASR slot that may be wedged). The default executor (None) is a
         # multi-thread pool and is always free.
         loop = self._get_loop()
+        # Retire queued operations captured against the old mutex before the
+        # restart begins. An old cancel waiting on the retired lock must not
+        # touch a stream after the backend has recreated its worker.
+        self._worker_op_epoch += 1
         try:
             await loop.run_in_executor(None, fn)
+            # Publish the new mutex only after restart succeeded. If restart
+            # fails, the old native worker may still be alive and all future
+            # operations must remain serialized behind its old mutex.
+            self._worker_op_lock = threading.Lock()
             logger.info("ASRSessionManager: backend.restart_worker() completed")
         except Exception as exc:  # noqa: BLE001
             logger.warning("ASRSessionManager: restart_worker failed: %s", exc)

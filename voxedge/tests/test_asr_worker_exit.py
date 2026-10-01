@@ -20,6 +20,7 @@ own ``WorkerIO`` + a fake subprocess (no CUDA, no real worker).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import threading
@@ -31,8 +32,10 @@ from voxedge.backends.jetson.trt_edge_llm_asr import (
     TRTEdgeLLMASRBackend,
     TRTEdgeLLMASRConfig,
     WorkerExitError,
+    WorkerProtocolError,
     _TRTEdgeLLMStreamingASRStream,
 )
+from voxedge.engine.asr_session_manager import ASRSessionManager, SessionState
 from voxedge.backends.jetson.worker_io import WorkerIO
 
 
@@ -86,6 +89,118 @@ def _make_backend_with_wio():
     backend._worker_stderr_tail = []  # consumed by _stderr_tail_text()
     backend._ensure_worker = lambda: None  # already wired
     return backend, proc, wio
+
+
+def _feed_responses(proc, builders):
+    """Feed one fake WorkerIO response for each request written by the backend."""
+    seen = 0
+    while seen < len(builders):
+        if len(proc.stdin.writes) > seen:
+            req = json.loads(proc.stdin.writes[seen])
+            response = builders[seen](req) if callable(builders[seen]) else builders[seen]
+            proc.stdout.feed(json.dumps(response))
+            seen += 1
+        else:
+            time.sleep(0.005)
+
+
+def _begin_ack(req):
+    return {"id": req["id"], "event": "begin_ack"}
+
+
+def _empty_end(req):
+    return {
+        "id": req["id"],
+        "event": "error",
+        "ok": False,
+        "error": "no_audio_accumulated",
+    }
+
+
+def test_empty_end_error_is_normal_only_for_matching_end_request():
+    backend, proc, _wio = _make_backend_with_wio()
+    feeder = threading.Thread(
+        target=_feed_responses,
+        args=(proc, [lambda req: _empty_end(req)]),
+        daemon=True,
+    )
+    feeder.start()
+    response = backend._worker_request({"event": "end", "id": "sess-empty"})
+    assert response["error"] == "no_audio_accumulated"
+
+    backend, proc, _wio = _make_backend_with_wio()
+    feeder = threading.Thread(
+        target=_feed_responses,
+        args=(proc, [{"id": "sess-begin", "event": "error", "ok": False,
+                      "error": "no_audio_accumulated"}]),
+        daemon=True,
+    )
+    feeder.start()
+    with pytest.raises(WorkerProtocolError):
+        backend._worker_request({"event": "begin", "id": "sess-begin"})
+
+
+def test_end_other_error_still_raises():
+    backend, proc, _wio = _make_backend_with_wio()
+    feeder = threading.Thread(
+        target=_feed_responses,
+        args=(proc, [lambda req: {
+            "id": req["id"], "event": "error", "ok": False, "error": "other_error"
+        }]),
+        daemon=True,
+    )
+    feeder.start()
+    with pytest.raises(WorkerProtocolError):
+        backend._worker_request({"event": "end", "id": "sess-end"})
+
+
+def test_end_mismatched_error_id_still_raises():
+    backend, _proc, _wio = _make_backend_with_wio()
+
+    class _OneResponseWIO:
+        def request(self, _request):
+            yield {
+                "id": "wrong",
+                "event": "error",
+                "ok": False,
+                "error": "no_audio_accumulated",
+            }
+
+    backend._wio = _OneResponseWIO()
+    with pytest.raises(WorkerProtocolError):
+        backend._worker_request({"event": "end", "id": "sess-end"})
+
+
+def test_close_empty_end_is_idempotent_and_manager_does_not_restart():
+    backend, proc, _wio = _make_backend_with_wio()
+    feeder = threading.Thread(
+        target=_feed_responses,
+        args=(proc, [_begin_ack, _empty_end]),
+        daemon=True,
+    )
+    feeder.start()
+    stream = _TRTEdgeLLMStreamingASRStream(backend)
+    stream.close()
+    stream.close()
+    assert stream._closed is True
+    assert len(proc.stdin.writes) == 2
+
+    backend2, proc2, _wio2 = _make_backend_with_wio()
+    feeder2 = threading.Thread(
+        target=_feed_responses,
+        args=(proc2, [_begin_ack, _empty_end]),
+        daemon=True,
+    )
+    feeder2.start()
+    stream2 = _TRTEdgeLLMStreamingASRStream(backend2)
+    restart_calls = []
+    backend2.restart_worker = lambda: restart_calls.append(True)
+    manager = ASRSessionManager(backend2)
+    manager._state = SessionState.ACTIVE
+    manager._stream = stream2
+    asyncio.run(manager._inner_cancel(reason="empty-audio"))
+    assert restart_calls == []
+    assert manager.state is SessionState.IDLE
 
 
 def test_worker_request_worker_exit_raises_worker_exit_error():

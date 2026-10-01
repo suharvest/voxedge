@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from voxedge.engine.asr_session_manager import ASRSessionManager
 
@@ -167,3 +168,174 @@ async def test_prepare_finalize_does_not_overlap_worker_ops():
     assert probe.max_live == 1, (
         f"prepare_finalize overlapped worker ops (max={probe.max_live})"
     )
+
+
+class _BlockingFinalizeStream:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancel_entered = threading.Event()
+        self.overlap = False
+        self._lock = threading.Lock()
+        self._in_finalize = False
+
+    def finalize(self):
+        with self._lock:
+            self._in_finalize = True
+            self.started.set()
+        self.release.wait(3.0)
+        with self._lock:
+            self._in_finalize = False
+        return ("old", None)
+
+    def cancel(self):
+        with self._lock:
+            self.overlap = self._in_finalize
+            self.cancel_entered.set()
+
+    def close(self):
+        pass
+
+    def accept_waveform(self, sample_rate, samples):
+        pass
+
+    def get_partial(self):
+        return ("", False)
+
+
+class _BlockingFinalizeBackend:
+    sample_rate = 16000
+
+    def __init__(self):
+        self.stream = _BlockingFinalizeStream()
+        self.restart_called = threading.Event()
+
+    def create_stream(self, language="auto"):
+        return self.stream
+
+    def restart_worker(self):
+        self.restart_called.set()
+
+
+@run_async
+async def test_cancel_waits_for_cancelled_finalize_worker_op():
+    backend = _BlockingFinalizeBackend()
+    executor = ThreadPoolExecutor(max_workers=2)
+    mgr = ASRSessionManager(backend, executor=executor, sample_rate=16000)
+    await mgr.on_speech_start()
+    finalize = asyncio.create_task(mgr.finalize_with_status("vad_end"))
+    while not backend.stream.started.is_set():
+        await asyncio.sleep(0.005)
+    finalize.cancel()
+    try:
+        await finalize
+    except asyncio.CancelledError:
+        pass
+    cancel = asyncio.create_task(mgr.cancel("bargein"))
+    await asyncio.sleep(0.1)
+    assert not backend.stream.cancel_entered.is_set()
+    assert not backend.stream.overlap
+    backend.stream.release.set()
+    await cancel
+    assert backend.stream.cancel_entered.is_set()
+    assert not backend.stream.overlap
+    executor.shutdown(wait=True)
+
+
+@run_async
+async def test_cancel_timeout_restarts_wedged_worker_op():
+    backend = _BlockingFinalizeBackend()
+    executor = ThreadPoolExecutor(max_workers=2)
+    mgr = ASRSessionManager(backend, executor=executor, sample_rate=16000)
+    await mgr.on_speech_start()
+    finalize = asyncio.create_task(mgr.finalize_with_status("vad_end"))
+    while not backend.stream.started.is_set():
+        await asyncio.sleep(0.005)
+    finalize.cancel()
+    try:
+        await finalize
+    except asyncio.CancelledError:
+        pass
+    await mgr.cancel("bargein")
+    assert backend.restart_called.is_set()
+    backend.stream.release.set()
+    executor.shutdown(wait=True)
+
+
+class _RestartingBackend:
+    sample_rate = 16000
+
+    def __init__(self):
+        self.streams = []
+        self.restarted = threading.Event()
+
+    def create_stream(self, language="auto"):
+        stream = _BlockingFinalizeStream()
+        self.streams.append(stream)
+        return stream
+
+    def restart_worker(self):
+        self.restarted.set()
+
+
+class _FailedRestartBackend(_RestartingBackend):
+    def restart_worker(self):
+        self.restarted.set()
+        raise RuntimeError("restart unavailable")
+
+
+@run_async
+async def test_restart_retires_queued_old_cancel_before_new_stream():
+    backend = _RestartingBackend()
+    executor = ThreadPoolExecutor(max_workers=2)
+    mgr = ASRSessionManager(backend, executor=executor, sample_rate=16000)
+    await mgr.on_speech_start()
+    old = backend.streams[0]
+    finalize = asyncio.create_task(mgr.finalize_with_status("vad_end"))
+    while not old.started.is_set():
+        await asyncio.sleep(0.005)
+    finalize.cancel()
+    try:
+        await finalize
+    except asyncio.CancelledError:
+        pass
+    await mgr.cancel("bargein")
+    assert backend.restarted.is_set()
+    new_gen = await mgr.on_speech_start()
+    assert new_gen == 2
+    new = backend.streams[1]
+    await mgr.accept_audio(b"\0\0" * 64)
+    old.release.set()
+    await asyncio.sleep(0.1)
+    assert not old.cancel_entered.is_set()
+    assert not old.overlap
+    assert new is not old
+    executor.shutdown(wait=True)
+
+
+@run_async
+async def test_failed_restart_keeps_old_mutex_until_native_op_returns():
+    """Restart failure must not publish a lock that bypasses old native work."""
+    backend = _FailedRestartBackend()
+    executor = ThreadPoolExecutor(max_workers=2)
+    mgr = ASRSessionManager(backend, executor=executor, sample_rate=16000)
+    await mgr.on_speech_start()
+    old = backend.streams[0]
+    finalize = asyncio.create_task(mgr.finalize_with_status("vad_end"))
+    while not old.started.is_set():
+        await asyncio.sleep(0.005)
+    finalize.cancel()
+    try:
+        await finalize
+    except asyncio.CancelledError:
+        pass
+    await mgr.cancel("bargein")
+    new_start = asyncio.create_task(mgr.on_speech_start())
+    await asyncio.sleep(0.1)
+    assert not new_start.done()
+    assert len(backend.streams) == 1
+    assert not old.overlap
+    old.release.set()
+    await new_start
+    assert len(backend.streams) == 2
+    executor.shutdown(wait=True)
