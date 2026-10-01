@@ -33,6 +33,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -393,6 +394,9 @@ def _split_tts_text(
     current: list[str] = []
     is_cjk = _contains_cjk(normalized)
     max_overrun = 0 if is_cjk else max(2, min(8, max_chars // 2))
+    # Keep ordinary URL/word atoms intact only within a bounded grace window.
+    # A single unbroken token must not turn into an unbounded native request.
+    atom_limit = max(64, max_chars + max(8, min(24, max_chars // 2)))
     abbreviations = {
         "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "vs.",
         "etc.", "e.g.", "i.e.",
@@ -404,16 +408,63 @@ def _split_tts_text(
             return True
         return any(stripped.endswith(abbrev) for abbrev in abbreviations)
 
+    def continues_latin_atom(buffer: str, remaining: str) -> bool:
+        """Keep a URL/word/number together across the CJK character cap.
+
+        The splitter is character based for CJK, but a mixed utterance can
+        contain ASCII atoms such as ``www.nmc.cn``.  A cap or period inside
+        such an atom would change the request text and, for URLs, can produce
+        two unrelated synthesis requests.  Punctuation is considered part of
+        an atom only when another alphanumeric character follows it.
+        """
+        if not remaining or not re.search(r"[A-Za-z0-9]$", buffer):
+            return False
+        next_ch = remaining[0]
+        if next_ch.isascii() and next_ch.isalnum():
+            return True
+        if next_ch in ")]}":
+            pairs = (("(", ")"), ("[", "]"), ("{", "}"))
+            if any(
+                buffer.count(open_ch) > buffer.count(close_ch)
+                for open_ch, close_ch in pairs
+                if close_ch == next_ch
+            ):
+                return True
+        return bool(re.match(r"^[._:/?&=%+#-]*[A-Za-z0-9]", remaining))
+
     def flush() -> None:
-        part = "".join(current).strip()
+        raw = "".join(current)
+        # Mixed CJK/Latin requests can carry meaningful spaces around an
+        # atomic URL or word. Preserve those boundaries when a cap falls
+        # immediately before/after the atom; pure CJK keeps the historical
+        # boundary trimming behavior.
+        if _contains_cjk(raw) and re.search(r"[A-Za-z0-9]", raw):
+            part = raw
+        else:
+            part = raw.strip()
         current.clear()
         if part:
             segments.append(part)
+
+    def cut_inside_latin_atom(buffer: str, cut: int) -> bool:
+        if cut < 1 or cut + 1 >= len(buffer):
+            return False
+        if buffer[cut] not in "._:/?&=%+#-":
+            return False
+        left = buffer[:cut]
+        right = buffer[cut + 1:]
+        return bool(re.search(r"[A-Za-z0-9]$", left)) and bool(
+            re.match(r"^[._:/?&=%+#-]*[A-Za-z0-9]", right)
+        )
 
     for idx, ch in enumerate(normalized):
         next_ch = normalized[idx + 1] if idx + 1 < len(normalized) else ""
         current.append(ch)
         if ch in hard_breaks:
+            if ch in "!?;":
+                atom_prefix = "".join(current[:-1]).rstrip("._:/?&=%+#-")
+                if continues_latin_atom(atom_prefix, normalized[idx + 1:]):
+                    continue
             if not is_cjk and ch == "." and is_nonterminal_period("".join(current), next_ch):
                 continue
             flush()
@@ -421,7 +472,16 @@ def _split_tts_text(
         current_text = "".join(current).strip()
         if len(current_text) >= max_chars:
             text_so_far = "".join(current)
+            remaining = normalized[idx + 1:]
+            extends_atom = continues_latin_atom(text_so_far, remaining)
+            if text_so_far[-1:] in "._:/?&=%+#-":
+                atom_prefix = text_so_far.rstrip("._:/?&=%+#-")
+                extends_atom = extends_atom or continues_latin_atom(atom_prefix, remaining)
+            if extends_atom and len(text_so_far) < atom_limit:
+                continue
             cut = max(text_so_far.rfind(p) for p in soft_breaks)
+            if cut_inside_latin_atom(text_so_far, cut):
+                cut = -1
             if cut >= max_chars // 3:
                 head = text_so_far[: cut + 1].strip()
                 tail = text_so_far[cut + 1:].lstrip()
@@ -447,7 +507,8 @@ def _split_tts_text(
             for word in words:
                 candidate = " ".join(buf + [word]).strip()
                 if buf and len(candidate) > max_chars:
-                    packed.append(" ".join(buf))
+                    # Keep the normalized separator at a request boundary.
+                    packed.append(" ".join(buf) + " ")
                     buf = [word]
                 else:
                     buf.append(word)

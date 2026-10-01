@@ -53,27 +53,82 @@ _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _MD_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
 _MD_QUOTE_RE = re.compile(r"(?m)^\s{0,3}>\s*")
 _MD_BULLET_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d{1,3}[.)])\s+")
-_MD_EMPHASIS_RE = re.compile(r"\*{1,3}|__")
+_MD_EMPHASIS_RE = re.compile(r"(?<![A-Za-z0-9_*])(\*{1,3}|__)(?=\S)(.*?\S)(?<!\*)\1(?![A-Za-z0-9_*])")
+_BARE_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@:/?-])"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,})"
+    r"(?![A-Za-z0-9_/?&=#@:-])(?!(?:\.[A-Za-z0-9]))"
+)
 # Speakable = at least one letter, digit or CJK codepoint. Anything else is
 # punctuation/markup only and must not reach the backend.
 _SPEAKABLE_RE = re.compile(r"[0-9A-Za-z぀-ヿ一-鿿가-힯]")
 
 
-def _to_speakable(text: str) -> str:
-    """Strip Markdown markup; return "" if nothing speakable remains.
+def _normalize_cjk_domains(text: str, *, language: str | None = None) -> str:
+    """Make bare domains legible in CJK speech without changing characters."""
+    if language not in {"zh", "chinese"} or not re.search(r"[一-鿿]", text):
+        return text
 
-    Returning "" is the signal to drop the fragment entirely rather than
-    hand the backend something it can only answer with silence.
-    """
+    def expand(match: re.Match[str]) -> str:
+        domain = match.group(1)
+        labels = domain.split(".")
+        if len(domain) > 253 or any(len(label) > 63 for label in labels):
+            return domain
+        spoken: list[str] = []
+        for index, label in enumerate(labels):
+            if index:
+                spoken.append(" 点 ")
+            if index == len(labels) - 1 or (label.isascii() and label.isalpha() and len(label) <= 3):
+                spoken.append(" ".join(label))
+            else:
+                spoken.append(label)
+        return "".join(spoken)
+
+    return _BARE_DOMAIN_RE.sub(expand, text)
+
+
+def _to_speakable(text: str, *, language: str | None = None) -> str:
+    """Strip Markdown markup; return "" if nothing speakable remains."""
     if not text:
         return ""
-    s = _MD_FENCE_RE.sub(lambda m: m.group(1) or " ", text)
-    s = _MD_LINK_RE.sub(r"\1", s)
-    s = _MD_HEADING_RE.sub("", s)
-    s = _MD_QUOTE_RE.sub("", s)
-    s = _MD_BULLET_RE.sub("", s)
-    s = _MD_EMPHASIS_RE.sub("", s)
-    s = s.strip()
+
+    # Locate code/fence spans in the original text before touching emphasis.
+    # Delimiters outside those spans may wrap a body that contains inline code;
+    # delimiters inside code remain literal.
+    code_spans = [(m.start(), m.end()) for m in _MD_FENCE_RE.finditer(text)]
+
+    def in_code(pos: int) -> bool:
+        return any(start <= pos < end for start, end in code_spans)
+
+    def emphasis_sub(match: re.Match[str]) -> str:
+        opening = match.start()
+        closing = match.end() - len(match.group(1))
+        if in_code(opening) or in_code(closing):
+            return match.group(0)
+        return match.group(2)
+
+    s = _MD_EMPHASIS_RE.sub(emphasis_sub, text)
+
+    def clean_markup(chunk: str) -> str:
+        chunk = _MD_LINK_RE.sub(r"\1", chunk)
+        chunk = _MD_HEADING_RE.sub("", chunk)
+        chunk = _MD_QUOTE_RE.sub("", chunk)
+        chunk = _MD_BULLET_RE.sub("", chunk)
+        return chunk
+
+    # Remove other structural markup outside code; inline code contributes its
+    # literal body and fenced code remains non-speech, as before.
+    chunks: list[tuple[str, bool]] = []
+    cursor = 0
+    for match in _MD_FENCE_RE.finditer(s):
+        chunks.append((clean_markup(s[cursor:match.start()]), False))
+        chunks.append((match.group(1) if match.group(1) is not None else " ", True))
+        cursor = match.end()
+    chunks.append((clean_markup(s[cursor:]), False))
+    s = "".join(
+        _normalize_cjk_domains(chunk, language=language) if not protected else chunk
+        for chunk, protected in chunks
+    ).strip()
     return s if _SPEAKABLE_RE.search(s) else ""
 
 

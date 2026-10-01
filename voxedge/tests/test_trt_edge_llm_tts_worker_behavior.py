@@ -206,6 +206,45 @@ def test_segments_reuse_fixed_seed():
     assert {r["seed"] for r in be._requests} == {123}
 
 
+def test_cjk_cap_preserves_latin_words_urls_and_numbers():
+    text = "3. **访问权威气象网站**，如中国气象网 (www.nmc.cn) 或国际上的 Weather.com。"
+    parts = _split_tts_text(text, 16, max_chars_cjk=16)
+
+    assert "".join(parts) == text
+    assert any("www.nmc.cn" in part for part in parts)
+    assert any("www.nmc.cn)" in part for part in parts)
+    assert any("Weather.com" in part for part in parts)
+    assert not any("www.nmc." in part and "www.nmc.cn" not in part for part in parts)
+    assert not any("Weathe" in part and "Weather.com" not in part for part in parts)
+
+    number_text = "请播报版本12.5以及编号ABC123。"
+    number_parts = _split_tts_text(number_text, 8, max_chars_cjk=8)
+    assert "".join(number_parts) == number_text
+    assert any("12.5" in part for part in number_parts)
+    assert any("ABC123" in part for part in number_parts)
+
+    url = "请访问https://example.com:8080/path?x=a&y=b以及foo_bar。"
+    url_parts = _split_tts_text(url, 8, max_chars_cjk=8)
+    assert "".join(url_parts) == url
+    assert any("https://example.com:8080/path?x=a&y=b" in part for part in url_parts)
+    assert any("foo_bar" in part for part in url_parts)
+
+
+def test_atom_preservation_is_bounded_for_long_unbroken_tokens():
+    for text, cap in (("a" * 500, 120), ("https://" + "a" * 500 + ".com", 48)):
+        parts = _split_tts_text(text, cap, max_chars_cjk=cap, max_chars_latin=cap)
+        assert "".join(parts) == text
+        assert len(parts) > 1
+        assert max(map(len, parts)) <= max(64, cap + max(8, min(24, cap // 2))) + 1
+
+
+def test_cjk_cap_keeps_reasonable_domain_atom_intact():
+    text = "中" * 47 + "www.nmc.cn"
+    parts = _split_tts_text(text, 48, max_chars_cjk=48)
+    assert "".join(parts) == text
+    assert any("www.nmc.cn" in part for part in parts)
+
+
 def test_base64_chunk_decoded_to_pcm():
     be = _make_streaming_backend(stateful_code2wav=True)
     be._feed_chunks = [
