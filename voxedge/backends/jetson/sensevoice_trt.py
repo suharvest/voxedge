@@ -82,6 +82,19 @@ _LANGUAGE_MAP = {
     "zh": "zh", "zh-cn": "zh", "zh-tw": "zh", "en": "en", "en-us": "en",
     "en-gb": "en", "ja": "ja", "ko": "ko",
 }
+_SENSEVOICE_LANGUAGE_TAGS = {
+    "<|zh|>": "zh",
+    "<|en|>": "en",
+    "<|ja|>": "ja",
+    "<|ko|>": "ko",
+    "<|yue|>": "yue",
+}
+# Observed in the real SenseVoice CTC header alongside the language marker.
+# Keep this allowlist narrow: other language-shaped special tokens remain
+# ambiguous and must not be treated as detected languages.
+_SENSEVOICE_NON_LANGUAGE_HEADER_TAGS = {"<|SAD|>"}
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
+_LANGUAGE_TAG_RE = re.compile(r"<\|[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?\|>")
 
 
 def _map_language(language: str) -> str:
@@ -330,8 +343,12 @@ class SenseVoiceTRTBackend(ASRBackend):
         logits = self._infer(speech, valid)
         if logits is None:
             return TranscriptionResult(text="", language=reported, meta={})
+        text, detected = self._ctc_decode_with_language(logits, valid)
+        requested_language = (language or "auto").strip().lower() or "auto"
+        if requested_language == "auto" and detected is not None:
+            reported = detected
         return TranscriptionResult(
-            text=self._ctc_decode(logits, valid), language=reported, meta={}
+            text=text, language=reported, meta={}
         )
 
     def _infer(self, speech: np.ndarray, valid: Optional[int] = None):
@@ -447,6 +464,12 @@ class SenseVoiceTRTBackend(ASRBackend):
         return sp_in[None], valid
 
     def _ctc_decode(self, logits: np.ndarray, valid: int) -> str:
+        text, _ = self._ctc_decode_with_language(logits, valid)
+        return text
+
+    def _ctc_decode_with_language(
+        self, logits: np.ndarray, valid: int
+    ) -> tuple[str, Optional[str]]:
         ids = logits.argmax(-1).tolist()[:valid]
         collapsed = []
         prev = -1
@@ -455,9 +478,31 @@ class SenseVoiceTRTBackend(ASRBackend):
                 collapsed.append(x)
             prev = x
         pieces = [self._sp.id_to_piece(i) for i in collapsed if 0 <= i < self._sp.get_piece_size()]
+        leading_specials = []
+        for piece in pieces:
+            if not _SPECIAL_TOKEN_RE.fullmatch(piece):
+                break
+            leading_specials.append(piece)
+        language_tags = [
+            _SENSEVOICE_LANGUAGE_TAGS[piece]
+            for piece in leading_specials
+            if piece in _SENSEVOICE_LANGUAGE_TAGS
+        ]
+        unknown_language_tags = [
+            piece
+            for piece in leading_specials
+            if _LANGUAGE_TAG_RE.fullmatch(piece)
+            and piece not in _SENSEVOICE_NON_LANGUAGE_HEADER_TAGS
+            and piece not in _SENSEVOICE_LANGUAGE_TAGS
+        ]
+        detected = (
+            language_tags[0]
+            if len(language_tags) == 1 and not unknown_language_tags
+            else None
+        )
         text = "".join(pieces).replace("▁", " ")
         text = re.sub(r"<\|[^|]*\|>", "", text)
-        return text.strip()
+        return text.strip(), detected
 
     @staticmethod
     def _decode_audio(audio_bytes: bytes) -> np.ndarray:
