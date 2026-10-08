@@ -70,6 +70,18 @@ def test_unsupported_language_is_refused_at_construction():
                          vocab_dir="z", language="fr")
 
 
+def test_legacy_decoder_is_the_default_and_trt_requires_both_plans():
+    cfg = WhisperASRConfig(
+        encoder_kind="tensorrt", encoder_path="x", decoder_dir="y", vocab_dir="z"
+    )
+    assert cfg.decoder_kind == "onnx_cpu"
+    with pytest.raises(ValueError, match="prefill and step"):
+        WhisperASRConfig(
+            encoder_kind="tensorrt", encoder_path="x", decoder_dir="y", vocab_dir="z",
+            decoder_kind="tensorrt", decoder_prefill_path="prefill.plan",
+        )
+
+
 @pytest.mark.parametrize("cutoff", [5.0, 4.99999, 4.95])
 def test_a_cutoff_that_leaves_no_usable_audio_is_refused(cutoff):
     """Checked in SAMPLES, not seconds.
@@ -196,6 +208,189 @@ def test_empty_audio_returns_empty_without_touching_the_encoder():
     r = be.transcribe_array(np.zeros(0, dtype=np.float32))
     assert r.text == "" and r.meta["chunks"] == 0
     assert be._encoder.calls == []
+
+
+def test_trt_decoder_path_consumes_borrowed_device_hidden_without_d2h():
+    cfg = WhisperASRConfig(
+        encoder_kind="tensorrt", encoder_path="x", decoder_dir="y", vocab_dir="z",
+        decoder_kind="tensorrt", decoder_prefill_path="prefill.plan",
+        decoder_step_path="step.plan",
+    )
+    be = WhisperASR(cfg)
+
+    class _DeviceEncoder:
+        def run(self, _mel):
+            raise AssertionError("GPU decoder path must not call encoder.run/D2H")
+
+        def run_device(self, _mel):
+            return (1234, (1, 1500, 512), np.dtype(np.float32), self)
+
+        def close(self):
+            pass
+
+    class _DeviceDecoder(_FakeDecoder):
+        def decode(self, enc, vocab, language, *, audio_s, max_new=None):
+            assert enc[0:3] == (1234, (1, 1500, 512), np.dtype(np.float32))
+            return "device", [1.0]
+
+    be._encoder = _DeviceEncoder()
+    be._decoder = _DeviceDecoder(["unused"])
+    be._filters = np.zeros((80, 201), dtype=np.float32)
+    be._vocab = {}
+    assert be.transcribe_array(_speech(1.0, np.random.default_rng(8))).text == "device"
+
+
+def _fake_trt_decoder_for_validation():
+    from voxedge.backends.whisper.decoder import TensorRTKVDecoder
+
+    class _Engine:
+        def __init__(self, shapes, inputs):
+            self.shapes = shapes
+            self.inputs = set(inputs)
+
+        def get_tensor_shape(self, name):
+            return self.shapes[name]
+
+    class _Wrapper:
+        def __init__(self, shapes, inputs):
+            self.names = list(shapes)
+            self.is_input = {name: name in inputs for name in shapes}
+            self.dtype = {name: (np.int64 if name == "input_ids" else np.float32) for name in shapes}
+            self.engine = _Engine(shapes, inputs)
+
+        def profile_shape(self, _name):
+            if ".encoder." in _name:
+                return ((1, 8, 1500, 64), (1, 8, 1500, 64), (1, 8, 1500, 64))
+            return ((1, 8, 4, 64), (1, 8, 128, 64), (1, 8, 447, 64))
+
+    pre = {
+        "input_ids": (1, -1),
+        "encoder_hidden_states": (1, -1, 512),
+        "logits": (1, -1, 51865),
+        "present.0.decoder.key": (1, 8, -1, 64),
+        "present.0.decoder.value": (1, 8, -1, 64),
+        "present.0.encoder.key": (1, 8, -1, 64),
+        "present.0.encoder.value": (1, 8, -1, 64),
+    }
+    step = {
+        "input_ids": (1, 1),
+        "past_key_values.0.decoder.key": (1, 8, -1, 64),
+        "past_key_values.0.decoder.value": (1, 8, -1, 64),
+        "past_key_values.0.encoder.key": (1, 8, -1, 64),
+        "past_key_values.0.encoder.value": (1, 8, -1, 64),
+        "logits": (1, 1, 51865),
+        "present.0.decoder.key": (1, 8, -1, 64),
+        "present.0.decoder.value": (1, 8, -1, 64),
+    }
+    dec = TensorRTKVDecoder.__new__(TensorRTKVDecoder)
+    dec._prefill = _Wrapper(pre, {"input_ids", "encoder_hidden_states"})
+    dec._step = _Wrapper(step, set(step) - {"logits", "present.0.decoder.key", "present.0.decoder.value"})
+    dec._layers = [0]
+    dec._max_positions = 448
+    return dec
+
+
+def test_trt_decoder_validates_io_dtype_and_dynamic_profile_bounds():
+    dec = _fake_trt_decoder_for_validation()
+    dec._validate_io()
+    with pytest.raises(TypeError, match="dtype"):
+        dec._validate_encoder_view((1, 1500, 512), np.float16)
+    with pytest.raises(RuntimeError, match="shape"):
+        dec._validate_encoder_view((1, 1500, 256), np.float32)
+    dec._profile_max = 447
+    dec._check_past_length(4)
+    dec._check_past_length(447)
+    with pytest.raises(RuntimeError, match="overflow"):
+        dec._check_past_length(448)
+    dec._step.dtype["past_key_values.0.encoder.value"] = np.float16
+    with pytest.raises(RuntimeError, match="cross-KV dtype"):
+        dec._validate_io()
+
+    dec = _fake_trt_decoder_for_validation()
+    dec._step.profile_shape = lambda _name: ((1, 8, 5, 64), (1, 8, 128, 64), (1, 8, 447, 64))
+    with pytest.raises(RuntimeError, match="past 4..447"):
+        dec._validate_io()
+
+
+def test_trt_decoder_reuses_kv_buffers_and_frees_each_pointer_once():
+    from voxedge.backends.whisper.decoder import TensorRTKVDecoder
+
+    class _Errors:
+        cudaSuccess = 0
+
+    class _Cuda:
+        cudaError_t = _Errors
+
+        def __init__(self):
+            self.next = 100
+            self.allocs = []
+            self.frees = []
+
+        def cudaMalloc(self, size):
+            ptr = self.next
+            self.next += 1
+            self.allocs.append((ptr, size))
+            return 0, ptr
+
+        def cudaFree(self, ptr):
+            self.frees.append(ptr)
+            return 0
+
+    dec = TensorRTKVDecoder.__new__(TensorRTKVDecoder)
+    dec._cudart = _Cuda()
+    dec._owned = []
+    dec._layers = [0, 1]
+    dec._kv = {}
+    dec._kv_bytes = 0
+    first = dec._ensure_kv_buffers(64)
+    allocated = len(dec._owned)
+    assert len(first) == 4
+    assert dec._ensure_kv_buffers(64) is first
+    assert len(dec._owned) == allocated
+    second = dec._ensure_kv_buffers(128)
+    assert second is dec._kv and len(dec._owned) == allocated
+    for ptr in list(dec._owned):
+        dec._free_owned(ptr)
+    assert sorted(dec._cudart.frees) == sorted(ptr for ptr, _ in dec._cudart.allocs)
+    dec._free_owned(100)
+    assert dec._cudart.frees.count(100) == 1
+
+
+def test_trt_encoder_device_view_reports_engine_output_dtype():
+    from voxedge.backends.whisper.encoders import TensorRTEncoder
+
+    class _Ctx:
+        def set_input_shape(self, *_):
+            pass
+
+        def get_tensor_shape(self, _):
+            return (1, 1500, 512)
+
+        def set_tensor_address(self, *_):
+            pass
+
+        def execute_async_v3(self, *_):
+            return True
+
+    class _Pool:
+        def stream_handle(self):
+            return 1
+
+        def copy_htod(self, *_):
+            pass
+
+        def synchronize(self):
+            pass
+
+    enc = TensorRTEncoder.__new__(TensorRTEncoder)
+    enc._in_name, enc._out_name, enc._in_rank = "mel", "hidden", 3
+    enc._in_dtype, enc._out_dtype = np.dtype(np.float32), np.dtype(np.float16)
+    enc._ctx, enc._pool, enc._bufs = _Ctx(), _Pool(), {}
+    enc._sizes = (0, 0)
+    # Allocate calls are not relevant to the dtype contract; use stable fake pointers.
+    enc._pool.allocate = lambda size: 11 if not enc._bufs else 22
+    ptr, shape, dtype, owner = enc.run_device(np.zeros((80, 3000), dtype=np.float32))
+    assert (ptr, shape, dtype, owner) == (22, (1, 1500, 512), np.dtype(np.float16), enc)
 
 
 # ── joining ─────────────────────────────────────────────────────────────

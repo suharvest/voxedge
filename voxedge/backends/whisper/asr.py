@@ -29,7 +29,7 @@ from voxedge.capabilities.speaker_embedding import decode_audio_to_16k_mono
 from voxedge.text.degenerate import collapse_repetition, collapse_segment_repeats
 from voxedge.text.join import join_segments
 
-from .decoder import OnnxKVDecoder, detokenize, read_vocab
+from .decoder import OnnxKVDecoder, TensorRTKVDecoder, detokenize, read_vocab
 from .encoders import build_encoder
 from .frontend import SAMPLE_RATE, load_mel_filters, log_mel
 
@@ -65,6 +65,9 @@ class WhisperASRConfig:
     encoder_path: str
     decoder_dir: str                     # optimum ONNX export (2 graphs)
     vocab_dir: str                       # vocab_en.txt / vocab_zh.txt / mel filters
+    decoder_kind: str = "onnx_cpu"       # "onnx_cpu" | "tensorrt"
+    decoder_prefill_path: Optional[str] = None
+    decoder_step_path: Optional[str] = None
     window_s: float = 10.0
     language: str = "en"
     #: Hailo's boundary guard: crop this much off the window before padding
@@ -147,6 +150,13 @@ class WhisperASRConfig:
             if self.max_new_tokens < 1:
                 raise ValueError(
                     f"whisper: max_new_tokens must be >= 1, got {self.max_new_tokens}"
+                )
+        if self.decoder_kind not in ("onnx_cpu", "tensorrt"):
+            raise ValueError(f"whisper: unknown decoder_kind {self.decoder_kind!r}")
+        if self.decoder_kind == "tensorrt":
+            if not self.decoder_prefill_path or not self.decoder_step_path:
+                raise ValueError(
+                    "whisper: tensorrt decoder requires prefill and step plan paths"
                 )
         # Compare in SAMPLES, not seconds: a cutoff of 4.99999 against a 5 s
         # window is "less than" by the float check and still leaves zero
@@ -247,12 +257,20 @@ class WhisperASR(ASRBackend):
             vocab_dir = Path(cfg.vocab_dir)
             filters = load_mel_filters(vocab_dir / "mel_80_filters.txt")
             vocab = read_vocab(vocab_dir / f"vocab_{cfg.language}.txt")
-            decoder = OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
             # Construction inside the try as well: a plan with one I/O tensor
             # raises partway through __init__, and the half-built object holds a
             # device handle that nothing else will release.
+            decoder = None
             encoder = None
             try:
+                decoder = (
+                    OnnxKVDecoder(cfg.decoder_dir, cfg.decoder_threads)
+                    if cfg.decoder_kind == "onnx_cpu"
+                    else TensorRTKVDecoder(
+                        cfg.decoder_prefill_path,
+                        cfg.decoder_step_path,
+                    )
+                )
                 encoder = build_encoder(
                     cfg.encoder_kind,
                     cfg.encoder_path,
@@ -264,14 +282,16 @@ class WhisperASR(ASRBackend):
                     # First inference on every one of these runtimes pays a one-off
                     # setup cost (JIT, memory pool, engine context). Paying it here
                     # keeps it out of the first user utterance's TTFT.
-                    encoder.run(
-                        log_mel(
-                            np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
-                            filters,
-                            cfg.window_s,
-                            cfg.padding_cutoff_s,
-                        )
+                    warmup_mel = log_mel(
+                        np.zeros(int(cfg.window_s * SAMPLE_RATE), dtype=np.float32),
+                        filters,
+                        cfg.window_s,
+                        cfg.padding_cutoff_s,
                     )
+                    if cfg.decoder_kind == "tensorrt":
+                        encoder.run_device(warmup_mel)
+                    else:
+                        encoder.run(warmup_mel)
             except Exception:
                 # Release the accelerator handle; on Hailo it is the whole device,
                 # and holding it would block the next attempt as well.
@@ -280,19 +300,26 @@ class WhisperASR(ASRBackend):
                         encoder.close()
                     except Exception:
                         logger.exception("whisper: encoder close after failure raised")
+                if decoder is not None and hasattr(decoder, "close"):
+                    try:
+                        decoder.close()
+                    except Exception:
+                        logger.exception("whisper: decoder close after failure raised")
                 raise
 
             self._filters, self._vocab = filters, vocab
             self._decoder, self._encoder = decoder, encoder
             logger.info(
-                "whisper: %s encoder @%.1fs window, CPU KV decoder, lang=%s",
-                cfg.encoder_kind, cfg.window_s, cfg.language,
+                "whisper: %s encoder @%.1fs window, %s decoder, lang=%s",
+                cfg.encoder_kind, cfg.window_s, cfg.decoder_kind, cfg.language,
             )
 
     def unload(self) -> None:
         # Same lock as transcribe_array: hot reload closes the encoder handle a
         # queued request is about to use.
         with self._lock:
+            if self._decoder is not None and hasattr(self._decoder, "close"):
+                self._decoder.close()
             if self._encoder is not None:
                 self._encoder.close()
             self._encoder = None
@@ -398,7 +425,10 @@ class WhisperASR(ASRBackend):
         for chunk in chunks:
             mel = log_mel(chunk, self._filters, cfg.window_s, cfg.padding_cutoff_s)
             te = time.perf_counter()
-            enc_out = self._encoder.run(mel)
+            if cfg.decoder_kind == "tensorrt":
+                enc_out = self._encoder.run_device(mel)
+            else:
+                enc_out = self._encoder.run(mel)
             enc_ms += (time.perf_counter() - te) * 1000
             td = time.perf_counter()
             raw, token_times = self._decoder.decode(

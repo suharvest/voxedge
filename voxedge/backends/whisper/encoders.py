@@ -24,6 +24,15 @@ class Encoder(ABC):
     def run(self, mel: np.ndarray) -> np.ndarray:
         ...
 
+    def run_device(self, mel: np.ndarray):
+        """Return ``(ptr, shape, dtype, owner)`` for a borrowed device output.
+
+        The pointer is valid only until the next run or ``close()`` on the
+        owner.  Implementations must synchronize before returning it.  CPU and
+        NPU encoders intentionally do not provide this path.
+        """
+        raise RuntimeError(f"{type(self).__name__} has no device-resident output")
+
     def close(self) -> None:
         ...
 
@@ -175,44 +184,88 @@ class TensorRTEncoder(Encoder):
         self._dev: dict[str, int] = {}
         self._bufs: dict[str, int] = {}
         self._sizes: tuple[int, int] = (0, 0)
+        self._in_name = self._out_name = None
+        self._in_rank = None
+        self._in_dtype = self._out_dtype = None
 
-        import tensorrt as trt
+        try:
+            import tensorrt as trt
 
-        from voxedge.backends.jetson._util import CudaMemoryPool, arena_size_bytes
+            from voxedge.backends.jetson._util import CudaMemoryPool, arena_size_bytes
 
-        self.window_s = window_s
-        # The Logger and Runtime must OUTLIVE the engine and its execution
-        # context — NVIDIA's lifetime contract. Building the engine from a
-        # temporary `trt.Runtime(...)` leaves both destroyed by the end of the
-        # statement, and everything after that is undefined behaviour that
-        # happens to work until it does not.
-        self._logger = trt.Logger(trt.Logger.WARNING)
-        self._runtime = trt.Runtime(self._logger)
-        with open(plan_path, "rb") as f:
-            self._engine = self._runtime.deserialize_cuda_engine(f.read())
-        if self._engine is None:
-            raise RuntimeError(f"failed to deserialize {plan_path}")
-        self._ctx = self._engine.create_execution_context()
-        self._in_name = self._engine.get_tensor_name(0)
-        self._out_name = self._engine.get_tensor_name(1)
-        self._in_rank = len(self._engine.get_tensor_shape(self._in_name))
-        # Shared with the other Jetson backends: owns the stream, checks every
-        # cudaError_t, and bump-allocates from one arena instead of a cudaMalloc
-        # per call. The encoder's two buffers are fixed-size once the window is
-        # fixed, so the arena is reset (not freed) between calls.
-        self._pool = CudaMemoryPool(arena_size_bytes(arena_size_mb))
+            self.window_s = window_s
+            # The Logger and Runtime must OUTLIVE the engine and its execution
+            # context — NVIDIA's lifetime contract. Building the engine from a
+            # temporary ``trt.Runtime(...)`` leaves both destroyed by the end
+            # of the statement, and everything after that is undefined.
+            self._logger = trt.Logger(trt.Logger.WARNING)
+            self._runtime = trt.Runtime(self._logger)
+            with open(plan_path, "rb") as f:
+                self._engine = self._runtime.deserialize_cuda_engine(f.read())
+            if self._engine is None:
+                raise RuntimeError(f"failed to deserialize {plan_path}")
+            self._ctx = self._engine.create_execution_context()
+            if self._ctx is None:
+                raise RuntimeError(f"failed to create execution context for {plan_path}")
+            names = [self._engine.get_tensor_name(i) for i in range(self._engine.num_io_tensors)]
+            inputs = [n for n in names if self._engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT]
+            outputs = [n for n in names if self._engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT]
+            if len(inputs) != 1 or len(outputs) != 1:
+                raise RuntimeError(f"whisper encoder expects one input/output, got {inputs}/{outputs}")
+            self._in_name, self._out_name = inputs[0], outputs[0]
+            self._in_rank = len(self._engine.get_tensor_shape(self._in_name))
+            if self._in_rank not in (3, 4):
+                raise RuntimeError(f"whisper encoder input must be rank 3 or 4, got {self._in_rank}")
+            self._in_dtype = np.dtype(trt.nptype(self._engine.get_tensor_dtype(self._in_name)))
+            self._out_dtype = np.dtype(trt.nptype(self._engine.get_tensor_dtype(self._out_name)))
+            # Shared with the other Jetson backends: owns the stream, checks every
+            # cudaError_t, and bump-allocates from one arena instead of a cudaMalloc
+            # per call. The encoder's two buffers are fixed-size once the window is
+            # fixed, so the arena is reset (not freed) between calls.
+            self._pool = CudaMemoryPool(arena_size_bytes(arena_size_mb))
+        except Exception:
+            self.close()
+            raise
 
     def run(self, mel: np.ndarray) -> np.ndarray:
+        ptr, shape, dtype, _owner = self.run_device(mel)
+        out = np.empty(shape, dtype=dtype)
+        self._pool.copy_dtoh(ptr, out)
+        return out
+
+    def run_device(self, mel: np.ndarray):
+        """Run without D2H and return a borrowed output pointer.
+
+        ``owner`` is returned deliberately: callers must keep it alive and
+        consume the pointer before the next encoder run.  The pool owns the
+        allocation and the decoder must never free it.
+        """
         inp = mel[None, :, :]
         if self._in_rank == 4:
             inp = inp[:, :, None, :]
-        inp = np.ascontiguousarray(inp, dtype=np.float32)
-        self._ctx.set_input_shape(self._in_name, inp.shape)
-        out = np.empty(tuple(self._ctx.get_tensor_shape(self._out_name)), dtype=np.float32)
+        inp = np.ascontiguousarray(inp, dtype=self._in_dtype)
+        if self._ctx.set_input_shape(self._in_name, inp.shape) is False:
+            raise RuntimeError("whisper encoder: TRT set_input_shape returned False")
+        raw_shape = tuple(self._ctx.get_tensor_shape(self._out_name))
+        if not raw_shape or any(
+            isinstance(dim, (bool, np.bool_))
+            or not isinstance(dim, (int, np.integer))
+            or int(dim) <= 0
+            for dim in raw_shape
+        ):
+            raise RuntimeError(f"whisper encoder: invalid concrete output shape {raw_shape}")
+        out_shape = tuple(int(dim) for dim in raw_shape)
+        out = np.empty(out_shape, dtype=self._out_dtype)
 
         if not self._bufs:
-            self._bufs[self._in_name] = self._pool.allocate(inp.nbytes)
-            self._bufs[self._out_name] = self._pool.allocate(out.nbytes)
+            input_ptr = self._pool.allocate(inp.nbytes)
+            self._bufs[self._in_name] = input_ptr
+            try:
+                output_ptr = self._pool.allocate(out.nbytes)
+            except Exception:
+                self._bufs.clear()
+                raise
+            self._bufs[self._out_name] = output_ptr
             self._sizes = (inp.nbytes, out.nbytes)
         elif (inp.nbytes, out.nbytes) != self._sizes:
             # The mel is always padded to the full window, so this is constant
@@ -223,13 +276,19 @@ class TensorRTEncoder(Encoder):
                 f"{(inp.nbytes, out.nbytes)}; window_s must match the engine"
             )
         self._pool.copy_htod(inp, self._bufs[self._in_name])
-        self._ctx.set_tensor_address(self._in_name, self._bufs[self._in_name])
-        self._ctx.set_tensor_address(self._out_name, self._bufs[self._out_name])
+        if self._ctx.set_tensor_address(self._in_name, self._bufs[self._in_name]) is False:
+            raise RuntimeError("whisper encoder: TRT input set_tensor_address returned False")
+        if self._ctx.set_tensor_address(self._out_name, self._bufs[self._out_name]) is False:
+            raise RuntimeError("whisper encoder: TRT output set_tensor_address returned False")
         if not self._ctx.execute_async_v3(self._pool.stream_handle()):
             raise RuntimeError("whisper encoder: TRT execute_async_v3 returned False")
         self._pool.synchronize()
-        self._pool.copy_dtoh(self._bufs[self._out_name], out)
-        return out
+        return (
+            int(self._bufs[self._out_name]),
+            out_shape,
+            out.dtype,
+            self,
+        )
 
     def close(self) -> None:
         """Release everything, in reverse construction order, exactly once.
