@@ -35,6 +35,14 @@ EMBEDDING_DIM = 192
 _TARGET_SR = 16000
 
 
+class EmbeddingInputError(ValueError):
+    """The requested audio cannot be represented by the CAM++ profile."""
+
+
+class EmbeddingBackendError(RuntimeError):
+    """The CAM++ TensorRT backend is unavailable or failed during inference."""
+
+
 class EmbeddingExtractor(ABC):
     """Produce one L2-normalized speaker embedding per utterance."""
 
@@ -100,20 +108,36 @@ class JetsonCampplusTRT(EmbeddingExtractor):
     """CAM++ via a resident TensorRT engine (dynamic time profile).
 
     Engine I/O: input ``[1, T, 80]`` fbank → output ``[1, 192]`` embedding.
-    Lazy, thread-safe, sticky on hard failure; ``extract`` never raises.
+    The default mode is lazy and preserves the historical ``None`` on failure.
+    ``strict=True`` makes initialization and inference failures explicit.
     """
 
-    def __init__(self, engine_path: str, min_frames: int = 40):
+    def __init__(self, engine_path: str, min_frames: int = 40, *, strict: bool = False):
         self._engine_path = engine_path
         self._min_frames = min_frames
+        self._strict = strict
         self._lock = threading.Lock()
         self._engine = None
         self._ctx = None
+        self._logger = None
+        self._runtime = None
         self._in_name = None
         self._out_name = None
         self._trt = None
         self._cudart = None
+        self._frame_bounds = None
         self._failed = False
+
+        if strict and min_frames < 1:
+            raise ValueError("min_frames must be positive")
+        if strict:
+            try:
+                import kaldi_native_fbank  # noqa: F401
+            except Exception as exc:
+                raise EmbeddingBackendError(
+                    "strict CAM++ requires kaldi_native_fbank"
+                ) from exc
+            self._ensure()
 
     def _ck(self, ret):
         err = ret[0] if isinstance(ret, tuple) else ret
@@ -135,75 +159,218 @@ class JetsonCampplusTRT(EmbeddingExtractor):
                 import tensorrt as trt
                 from cuda import cudart
 
+                # Runtime and Logger must outlive the engine and execution
+                # context (see the Whisper TRT encoder lifecycle).
                 logger_trt = trt.Logger(trt.Logger.WARNING)
-                with open(self._engine_path, "rb") as f, trt.Runtime(logger_trt) as rt:
-                    engine = rt.deserialize_cuda_engine(f.read())
+                runtime = trt.Runtime(logger_trt)
+                with open(self._engine_path, "rb") as f:
+                    engine = runtime.deserialize_cuda_engine(f.read())
                 if engine is None:
-                    raise RuntimeError("deserialize_cuda_engine returned None")
+                    raise EmbeddingBackendError("deserialize_cuda_engine returned None")
                 ctx = engine.create_execution_context()
-                in_name = out_name = None
+                if ctx is None:
+                    raise EmbeddingBackendError("failed to create CAM++ execution context")
+                inputs, outputs = [], []
                 for i in range(engine.num_io_tensors):
                     nm = engine.get_tensor_name(i)
-                    if engine.get_tensor_mode(nm) == trt.TensorIOMode.INPUT:
-                        in_name = nm
-                    else:
-                        out_name = nm
+                    mode = engine.get_tensor_mode(nm)
+                    if mode == trt.TensorIOMode.INPUT:
+                        inputs.append(nm)
+                    elif mode == trt.TensorIOMode.OUTPUT:
+                        outputs.append(nm)
+                if self._strict and (len(inputs) != 1 or len(outputs) != 1):
+                    raise EmbeddingBackendError(
+                        f"CAM++ expects one input/output, got {inputs}/{outputs}"
+                    )
+                if not inputs or not outputs:
+                    raise EmbeddingBackendError("CAM++ engine has no input/output tensors")
+                in_name, out_name = inputs[0], outputs[0]
+                if self._strict:
+                    in_shape = tuple(engine.get_tensor_shape(in_name))
+                    out_shape = tuple(engine.get_tensor_shape(out_name))
+                    if len(in_shape) != 3 or in_shape[0] != 1 or in_shape[2] != 80:
+                        raise EmbeddingBackendError(
+                            f"CAM++ input must be [1,T,80], got {in_shape}"
+                        )
+                    if len(out_shape) != 2 or out_shape[0] != 1 or out_shape[1] != EMBEDDING_DIM:
+                        raise EmbeddingBackendError(
+                            f"CAM++ output must be [1,192], got {out_shape}"
+                        )
+                    in_dtype = np.dtype(trt.nptype(engine.get_tensor_dtype(in_name)))
+                    out_dtype = np.dtype(trt.nptype(engine.get_tensor_dtype(out_name)))
+                    if in_dtype != np.dtype(np.float32) or out_dtype != np.dtype(np.float32):
+                        raise EmbeddingBackendError(
+                            f"CAM++ tensors must be float32, got {in_dtype}/{out_dtype}"
+                        )
+                    min_t, max_t = self._profile_bounds(engine, in_name, in_shape)
+                    if min_t > max_t:
+                        raise EmbeddingBackendError(f"invalid CAM++ frame profile {min_t}..{max_t}")
+                    if self._min_frames > max_t:
+                        raise EmbeddingBackendError(
+                            f"min_frames={self._min_frames} exceeds CAM++ profile max T={max_t}"
+                        )
+                else:
+                    # Metadata is best-effort in legacy mode: an old engine
+                    # lacking profile introspection must keep its None-on-
+                    # failure behavior.
+                    try:
+                        min_t, max_t = self._profile_bounds(
+                            engine, in_name, tuple(engine.get_tensor_shape(in_name))
+                        )
+                    except Exception:
+                        min_t, max_t = self._min_frames, None
                 self._trt, self._cudart = trt, cudart
+                self._logger, self._runtime = logger_trt, runtime
                 self._engine, self._ctx = engine, ctx
                 self._in_name, self._out_name = in_name, out_name
+                self._frame_bounds = (max(min_t, self._min_frames), max_t)
                 logger.info("JetsonCampplusTRT loaded (%s, in=%s out=%s).",
                             self._engine_path, in_name, out_name)
-            except Exception:
+            except Exception as exc:
                 self._failed = True
                 logger.exception("Failed to load CAM++ TRT engine; disabled.")
+                if self._strict:
+                    if isinstance(exc, EmbeddingBackendError):
+                        raise
+                    raise EmbeddingBackendError("failed to initialize CAM++ TRT backend") from exc
                 return False
         return True
 
-    def ready(self) -> bool:
+    @staticmethod
+    def _profile_bounds(engine, in_name, in_shape):
+        time_dim = in_shape[1]
+        if time_dim > 0:
+            return int(time_dim), int(time_dim)
+        try:
+            profile = engine.get_tensor_profile_shape(in_name, 0)
+        except Exception as exc:
+            raise EmbeddingBackendError("CAM++ dynamic input has no readable profile") from exc
+        if not isinstance(profile, (tuple, list)) or len(profile) != 3:
+            raise EmbeddingBackendError(f"invalid CAM++ profile for {in_name}: {profile!r}")
+        mins, _, maxs = (tuple(x) for x in profile)
+        if (len(mins) != 3 or len(maxs) != 3 or
+                mins[0] != 1 or maxs[0] != 1 or mins[2] != 80 or maxs[2] != 80):
+            raise EmbeddingBackendError(f"invalid CAM++ profile shapes: {profile!r}")
+        min_t, max_t = int(mins[1]), int(maxs[1])
+        if min_t < 1 or max_t < min_t:
+            raise EmbeddingBackendError(f"invalid CAM++ profile T bounds: {min_t}..{max_t}")
+        return min_t, max_t
+
+    @property
+    def is_ready(self) -> bool:
         return self._ensure()
 
+    def ready(self) -> bool:
+        """Compatibility alias retained for existing callers."""
+        return self.is_ready
+
+    @property
+    def frame_bounds(self):
+        self._ensure()
+        return self._frame_bounds
+
     def _infer(self, feat: np.ndarray) -> np.ndarray:
-        cudart = self._cudart
-        ctx = self._ctx
-        ctx.set_input_shape(self._in_name, tuple(feat.shape))
-        out_shape = tuple(ctx.get_tensor_shape(self._out_name))
-        inp = np.ascontiguousarray(feat, dtype=np.float32)
-        out = np.empty(out_shape, dtype=np.float32)
-        d_in = self._ck(cudart.cudaMalloc(inp.nbytes))
-        d_out = self._ck(cudart.cudaMalloc(out.nbytes))
-        stream = self._ck(cudart.cudaStreamCreate())
-        try:
-            self._ck(cudart.cudaMemcpyAsync(
-                d_in, inp.ctypes.data, inp.nbytes,
-                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, stream))
-            ctx.set_tensor_address(self._in_name, int(d_in))
-            ctx.set_tensor_address(self._out_name, int(d_out))
-            if not ctx.execute_async_v3(stream):
-                raise RuntimeError("execute_async_v3 failed")
-            self._ck(cudart.cudaMemcpyAsync(
-                out.ctypes.data, d_out, out.nbytes,
-                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, stream))
-            self._ck(cudart.cudaStreamSynchronize(stream))
-        finally:
-            cudart.cudaFree(d_in)
-            cudart.cudaFree(d_out)
-            cudart.cudaStreamDestroy(stream)
-        return out.reshape(-1).astype(np.float32)
+        with self._lock:
+            cudart = self._cudart
+            ctx = self._ctx
+            shape_result = ctx.set_input_shape(self._in_name, tuple(feat.shape))
+            if shape_result is False:
+                raise EmbeddingBackendError(
+                    f"CAM++ rejected input shape {tuple(feat.shape)}"
+                )
+            out_shape = tuple(ctx.get_tensor_shape(self._out_name))
+            if self._strict and out_shape != (1, EMBEDDING_DIM):
+                raise EmbeddingBackendError(f"CAM++ resolved output shape is {out_shape}")
+            inp = np.ascontiguousarray(feat, dtype=np.float32)
+            out = np.empty(out_shape, dtype=np.float32)
+            d_in = d_out = stream = None
+            primary_error = None
+            try:
+                d_in = self._ck(cudart.cudaMalloc(inp.nbytes))
+                d_out = self._ck(cudart.cudaMalloc(out.nbytes))
+                stream = self._ck(cudart.cudaStreamCreate())
+                if d_in is None or d_out is None or stream is None:
+                    raise EmbeddingBackendError("CUDA allocation returned no handle")
+                self._ck(cudart.cudaMemcpyAsync(
+                    d_in, inp.ctypes.data, inp.nbytes,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, stream))
+                if ctx.set_tensor_address(self._in_name, int(d_in)) is False:
+                    raise EmbeddingBackendError("CAM++ rejected input tensor address")
+                if ctx.set_tensor_address(self._out_name, int(d_out)) is False:
+                    raise EmbeddingBackendError("CAM++ rejected output tensor address")
+                if not ctx.execute_async_v3(stream):
+                    raise EmbeddingBackendError("execute_async_v3 failed")
+                self._ck(cudart.cudaMemcpyAsync(
+                    out.ctypes.data, d_out, out.nbytes,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, stream))
+                self._ck(cudart.cudaStreamSynchronize(stream))
+            except BaseException as exc:
+                primary_error = exc
+            finally:
+                cleanup_errors = []
+                for resource, release in (
+                    (d_in, cudart.cudaFree),
+                    (d_out, cudart.cudaFree),
+                    (stream, cudart.cudaStreamDestroy),
+                ):
+                    if resource is not None:
+                        try:
+                            self._ck(release(resource))
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                if primary_error is None and cleanup_errors:
+                    raise EmbeddingBackendError(
+                        "CAM++ CUDA resource cleanup failed"
+                    ) from cleanup_errors[0]
+            if primary_error is not None:
+                raise primary_error
+            return out.reshape(-1).astype(np.float32)
 
     def extract(self, audio: np.ndarray, sr: int) -> "np.ndarray | None":
         if not self._ensure():
             return None
-        if audio is None or len(audio) == 0:
-            return None
         try:
-            feat = compute_fbank(np.asarray(audio, dtype=np.float32), sr)
-            if feat.shape[0] < self._min_frames:
-                return None
+            if audio is None:
+                raise EmbeddingInputError("CAM++ received empty audio")
+            samples = np.asarray(audio, dtype=np.float32)
+            if samples.ndim != 1:
+                raise EmbeddingInputError(
+                    f"CAM++ audio must be a mono 1-D array, got shape {samples.shape}"
+                )
+            if samples.size == 0:
+                raise EmbeddingInputError("CAM++ received empty audio")
+            feat = compute_fbank(samples, sr)
+            if feat.ndim != 2 or feat.shape[1] != 80:
+                raise EmbeddingBackendError(f"CAM++ fbank must be [T,80], got {feat.shape}")
+            min_t, max_t = self._frame_bounds or (self._min_frames, None)
+            if feat.shape[0] < min_t:
+                raise EmbeddingInputError(
+                    f"CAM++ input has frameT={feat.shape[0]}, below minimum frameT={min_t}"
+                )
+            if max_t is not None and feat.shape[0] > max_t:
+                raise EmbeddingInputError(
+                    f"CAM++ input has frameT={feat.shape[0]}, above maximum frameT={max_t}"
+                )
             emb = self._infer(feat[None])          # [1,T,80] -> [192]
-            norm = float(np.linalg.norm(emb))
-            if norm > 0:
-                emb = emb / norm
+            if self._strict:
+                if emb.shape != (EMBEDDING_DIM,) or not np.all(np.isfinite(emb)):
+                    raise EmbeddingBackendError("CAM++ output must be finite with shape [192]")
+                norm = float(np.linalg.norm(emb.astype(np.float64)))
+                if not np.isfinite(norm) or norm <= 0:
+                    raise EmbeddingBackendError("CAM++ output has invalid norm")
+                emb = (emb.astype(np.float64) / norm).astype(np.float32)
+                post_norm = float(np.linalg.norm(emb.astype(np.float64)))
+                if not np.isfinite(post_norm) or not np.isclose(post_norm, 1.0, rtol=1e-5, atol=1e-5):
+                    raise EmbeddingBackendError("CAM++ output is not unit-normalized")
+            else:
+                norm = float(np.linalg.norm(emb))
+                if norm > 0:
+                    emb = emb / norm
             return emb
-        except Exception:
+        except Exception as exc:
+            if self._strict:
+                if isinstance(exc, (EmbeddingInputError, EmbeddingBackendError)):
+                    raise
+                raise EmbeddingBackendError("CAM++ inference failed") from exc
             logger.exception("JetsonCampplusTRT.extract failed.")
             return None
