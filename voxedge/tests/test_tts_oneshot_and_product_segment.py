@@ -100,6 +100,7 @@ def test_one_shot_passes_code_predictor_and_sampling(monkeypatch):
     assert captured["args"][cp_idx] == "/models/code_predictor"
     req = captured["input"]["requests"][0]
     inp = captured["input"]
+    assert req["messages"] == [{"role": "assistant", "content": "你好"}]
     assert inp["talker_top_k"] == 50
     assert inp["talker_top_p"] == 1.0
     assert inp["predictor_top_k"] == 50

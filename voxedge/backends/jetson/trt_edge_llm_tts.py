@@ -1319,7 +1319,7 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
         input_data = {
             "requests": [
                 {
-                    "messages": [{"role": "user", "content": text}],
+                    "messages": [{"role": "assistant", "content": text}],
                     "speaker": "",
                 }
             ],
