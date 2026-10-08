@@ -38,6 +38,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -47,7 +48,7 @@ import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -84,6 +85,7 @@ logger = logging.getLogger(__name__)
 #   EDGE_LLM_ASR_MEL_TENSOR_NAME        → mel_tensor_name ("mel")
 #   EDGE_LLM_ASR_MAX_MEL_FRAMES         → max_mel_frames (6000)
 #   EDGE_LLM_ASR_MAX_CONCURRENT          → max_slots (1)   ← N>1 gates --max_slots
+#   EDGE_LLM_ASR_REQUIRE_IFB            → require_ifb (False) ← v011 IFB ready provenance
 #   EDGE_LLM_ASR_STREAM_MODE            → stream_mode ("accumulate")
 #   EDGE_LLM_ASR_STREAM_CHUNK_SEC       → stream_chunk_sec (0.5)
 #   EDGE_LLM_ASR_STREAM_UNFIXED_CHUNKS  → stream_unfixed_chunks (2)
@@ -127,6 +129,16 @@ class TRTEdgeLLMASRConfig:
     # Slot-pool admission ceiling. Default 1 == legacy single-session. N>1
     # gates ``--max_slots`` (main fix b1cb1a5 — preserved).
     max_slots: int = 1
+    # v011 IFB ready-provenance gate. When True, after the worker's actual
+    # ``ready`` event the backend additionally requires ``ifb is True``,
+    # integer (bool NOT accepted) ``max_slots``/``gpu_slots`` equal to the
+    # configured slots, and ``engine_max_batch_size >= configured slots``.
+    # Missing/false/mismatch rejects startup with detail — the backend never
+    # marks itself ready nor claims capacity on failure. Deliberately NOT
+    # gated on ``max_slots > 1``: a v010 legacy IFB-less pool with
+    # max_slots=2 remains valid when this is False (default), which
+    # preserves every legacy B1/B2 pool path.
+    require_ifb: bool = False
 
     stream_mode: str = "accumulate"
     stream_chunk_sec: float = 0.5
@@ -292,6 +304,416 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         self._worker_stderr_tail: deque[str] = deque(maxlen=80)
         self._max_slots: int = max(1, int(self._config.max_slots))
         self._wio: Optional[WorkerIO] = None
+        # IFB telemetry provenance (v011): latest worker health snapshot plus a
+        # bounded trace ring, both guarded by one lock. Never contains audio
+        # payloads — only small worker-emitted dicts. Identity counters here are
+        # observational provenance, NOT the official in-window mid-flight proof.
+        self._diag_lock = threading.Lock()
+        self._latest_ifb_health: Optional[dict] = None
+        self._ifb_traces: deque = deque(maxlen=64)
+        self._last_health_log_at = 0.0
+        # PIDs whose stderr has a dedicated drainer thread (launch path) — a
+        # second reader on the same TextIO would race and split lines.
+        self._stderr_drain_pids: set = set()
+        # Per-worker failure marker (v2): set when a request failed against a
+        # worker that is STILL PROVEN LIVE (`poll() is None`) — a broken pipe /
+        # missing response is not proof the process exited. While set, requests
+        # reject explicitly and no respawn is attempted over the live process.
+        # Reset only on an owned successful fresh launch or a confirmed retired
+        # exit. ``_worker_failed_reason`` is diagnostic only.
+        self._worker_failed = False
+        self._worker_failed_reason: Optional[str] = None
+        # Pending stdin-close bookkeeping (v2/v3): keyed by id(stdin), maps to
+        # the SHARED operation record (retained stdin, done Event, outcome
+        # state) set when the ONE owned close thread for that stdin completes.
+        # Guarantees a repeated survivor restart never starts a second close
+        # thread against the same stdin (no duplicate close ownership), and
+        # every caller reads the SAME actual close outcome (exception with
+        # closed=False is EOF=False, never claimed from thread completion).
+        self._stdin_close_lock = threading.Lock()
+        self._stdin_close_pending: dict[int, tuple] = {}
+        # Survivor reader-ownership markers (v3). Both maps are keyed by the
+        # id() of the ACTUAL object and retain that object as (part of) the
+        # value, so the id cannot be reused by another object while the
+        # operation is active. ``_stdout_drain_pending`` guarantees exactly
+        # ONE reader of each actual stdout stream across ready-rejection
+        # teardowns and repeated failed restarts (a survivor keeps its WIO,
+        # and a stream with a pending teardown drainer never gets a second
+        # one). ``_wio_close_pending`` guarantees at most ONE WorkerIO.close
+        # thread per ACTUAL WIO object across repeated failed restarts.
+        self._ownership_lock = threading.Lock()
+        self._stdout_drain_pending: dict[int, object] = {}
+        self._wio_close_pending: dict[int, tuple] = {}
+
+    # -- worker teardown (no-KILL contract) ----------------------------------
+
+    @staticmethod
+    def _drain_to_void(stream) -> None:
+        """Actively consume a pipe until EOF so a child blocked writing to a
+        FULL pipe can still exit — without this, the EOF wait below can block
+        forever on a worker that fills its stdout/stderr buffer."""
+        try:
+            for _ in stream:
+                pass
+        except Exception:
+            pass
+
+    def _start_stdout_drain_once(
+        self, worker: subprocess.Popen, *, deadline_monotonic: Optional[float] = None
+    ) -> None:
+        """Start the ONE owned stdout drainer for this ACTUAL stdout stream, or
+        do nothing if an earlier drainer still owns it. The actual stream is
+        retained in the pending map so its id() cannot be reused while the
+        operation is active; ownership is released only when the drain thread
+        finishes (EOF or stream error). If a shared absolute deadline is given
+        and has already expired, NO thread is started and NO pending marker is
+        left behind (no permanently-pending phantom operation)."""
+        stream = worker.stdout
+        if stream is None or getattr(stream, "closed", False):
+            return
+        key = id(stream)
+        with self._ownership_lock:
+            if key in self._stdout_drain_pending:
+                # An earlier drainer still owns this actual stream; a second
+                # reader would race and split lines.
+                return
+            # Deadline recheck AFTER the leaf lock, BEFORE starting any new
+            # thread: expiry adds no new thread and leaves no pending marker.
+            if (
+                deadline_monotonic is not None
+                and float(deadline_monotonic) - time.monotonic() <= 0.0
+            ):
+                return
+            self._stdout_drain_pending[key] = stream  # retain: no id reuse
+        threading.Thread(
+            target=self._drain_stdout_owned,
+            args=(stream, key),
+            name="asr-worker-teardown-drain-stdout",
+            daemon=True,
+        ).start()
+
+    def _drain_stdout_owned(self, stream, key: int) -> None:
+        try:
+            self._drain_to_void(stream)
+        finally:
+            with self._ownership_lock:
+                if self._stdout_drain_pending.get(key) is stream:
+                    del self._stdout_drain_pending[key]
+
+    def _wio_close_bounded(
+        self,
+        wio,
+        *,
+        budget_s: float,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Bounded WorkerIO.close() ATTEMPT. At most ONE close operation exists
+        per ACTUAL WIO object: the pending map stores the retained WIO, the
+        done Event AND the SHARED outcome state together, so every caller —
+        including one that reuses an operation whose thread raised AFTER an
+        earlier caller's wait already timed out — consults the SAME actual
+        outcome instead of a per-caller error flag. The actual WIO is retained
+        so its id() cannot be reused while the operation is active. A completed
+        FAILED attempt may be retried (the entry is removed on completion), but
+        while pending it is never duplicated.
+
+        Returns True iff close() COMPLETED without raising. WorkerIO.close()
+        success is the close ATTEMPT completing — it is NOT stdin-EOF proof
+        (stdin EOF is separately attempted on the wrapper); thread completion
+        alone NEVER proves anything. A shared absolute ``deadline_monotonic``
+        (from restart) caps the relative ``budget_s``: the allowed end is
+        min(entry+budget, shared deadline) and expiry adds no new thread/wait.
+        The wrapper's stdin.close() remains the sole stdin closer (v2)."""
+        budget = float(budget_s)
+        if budget <= 0.0:
+            return False
+        key = id(wio)
+        allowed_end = time.monotonic() + budget
+        if deadline_monotonic is not None:
+            allowed_end = min(allowed_end, float(deadline_monotonic))
+        with self._ownership_lock:
+            entry = self._wio_close_pending.get(key)
+            first = entry is None
+            if first:
+                # Deadline recheck AFTER the leaf lock, BEFORE starting any
+                # new thread: expiry starts nothing and leaves NO pending
+                # marker behind (no phantom operation).
+                if allowed_end - time.monotonic() <= 0.0:
+                    return False
+                done: threading.Event = threading.Event()
+                outcome = {"state": "pending"}  # SHARED operation outcome
+                self._wio_close_pending[key] = (wio, done, outcome)
+            else:
+                done, outcome = entry[1], entry[2]
+        if first:
+
+            def _close():
+                try:
+                    wio.close()
+                    outcome["state"] = "ok"
+                except Exception:
+                    logger.debug(
+                        "WorkerIO.close() during restart raised", exc_info=True
+                    )
+                    outcome["state"] = "error"
+                finally:
+                    done.set()
+
+            threading.Thread(
+                target=_close,
+                name="asr-restart-wio-close",
+                daemon=True,
+            ).start()
+        remaining = allowed_end - time.monotonic()
+        completed = bool(remaining > 0.0) and done.wait(remaining)
+        if completed:
+            # The close operation ENDED (completed cleanly or raised) — it can
+            # no longer be pending against this WIO.
+            with self._ownership_lock:
+                pending = self._wio_close_pending.get(key)
+                if pending is not None and pending[0] is wio:
+                    del self._wio_close_pending[key]
+        if not completed:
+            # Still pending when the allowed end passed (or no time left): no
+            # claim either way about the outcome beyond "not completed here".
+            return False
+        if outcome["state"] != "ok":
+            logger.warning(
+                "ASR WorkerIO.close() RAISED during restart (shared operation "
+                "outcome); the close thread ended but this is the close "
+                "ATTEMPT failing, NOT proof or disproof of stdin EOF"
+            )
+            return False
+        return True
+
+    def _close_stdin_eof(
+        self,
+        worker: subprocess.Popen,
+        *,
+        budget_s: float = 1.0,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Bounded stdin EOF **attempt** (no raw-fd close, no dup2 parking).
+
+        Lock-chain diagnosis (2026-10-03): ``WorkerIO.request``/``send_request``
+        write+flush INSIDE ``_stdin_lock`` — a flush blocked on a full pipe
+        (native not reading) holds that lock; ``WorkerIO.close`` acquires the
+        same lock WITHOUT a timeout; and ``TextIOWrapper.close()`` itself
+        flushes buffered bytes, which is a blocking write into a full pipe.
+        So a bare ``stdin.close()`` (or a synchronous ``wio.close()``) can hang
+        forever and ``Popen.wait`` timeouts never bound it.
+
+        v2 ownership rule: the ``TextIOWrapper`` is the ONLY owner allowed to
+        close its own fd. We NEVER call ``os.close(fd)`` on it and NEVER
+        ``dup2`` over it — either would let a later (blocked) wrapper flush or
+        close touch an unrelated fd number that the OS reused. Instead we run
+        the wrapper's own ``close()`` in a single bounded daemon thread and
+        report honestly:
+
+          * return True  — the wrapper close completed inside the allowed end
+            (min(entry + ``budget_s``, shared deadline)) AND the wrapper's own
+            ``closed`` flag is actually set (EOF delivered);
+          * return False — close was still blocked when the allowed end passed,
+            OR the wrapper close() RAISED (thread completion alone NEVER
+            proves EOF: an exception with ``closed`` still False means NO EOF,
+            and that failure outcome belongs to the SHARED operation, so
+            reused callers see it too). The pending close keeps running and
+            unwinds only when the child exits and drains the pipe; the caller
+            proceeds to the bounded OWN TERM using the reserved budget and does
+            NOT claim EOF was delivered. A completed FAILED attempt may be
+            retried; while pending it is never duplicated.
+
+        At most ONE close thread exists per stdin: a repeated survivor restart
+        reuses the pending event. If the budget is already exhausted (<=0) no
+        thread is started and no wait is added — the current closed state is
+        reported as-is.
+        """
+        stdin = worker.stdin
+        if stdin is None or getattr(stdin, "closed", False):
+            return True
+        budget = float(budget_s)
+        if budget <= 0.0:
+            # Expired budget: add NO thread and NO wait.
+            return False
+        allowed_end = time.monotonic() + budget
+        if deadline_monotonic is not None:
+            allowed_end = min(allowed_end, float(deadline_monotonic))
+        key = id(stdin)
+        with self._stdin_close_lock:
+            entry = self._stdin_close_pending.get(key)
+            first = entry is None
+            if first:
+                # Deadline recheck AFTER the leaf lock, BEFORE starting any
+                # new thread: expiry starts nothing and leaves NO pending
+                # marker behind (no phantom operation).
+                if allowed_end - time.monotonic() <= 0.0:
+                    return False
+                done: threading.Event = threading.Event()
+                outcome = {"state": "pending"}  # SHARED operation outcome
+                # Retain the actual stdin wrapper with the operation so its
+                # id() cannot be reused while the close is active.
+                self._stdin_close_pending[key] = (stdin, done, outcome)
+            else:
+                done, outcome = entry[1], entry[2]
+        if first:
+
+            def _close():
+                try:
+                    stdin.close()
+                    # Actual closed-flag proof, not thread completion: only a
+                    # wrapper that reports itself closed delivered EOF.
+                    outcome["state"] = (
+                        "ok" if getattr(stdin, "closed", False) else "error"
+                    )
+                except Exception:
+                    logger.debug(
+                        "owned-worker stdin close raised", exc_info=True
+                    )
+                    outcome["state"] = "error"
+                finally:
+                    done.set()
+                    with self._stdin_close_lock:
+                        pending = self._stdin_close_pending.get(key)
+                        if pending is not None and pending[0] is stdin:
+                            del self._stdin_close_pending[key]
+
+            threading.Thread(
+                target=_close,
+                name="asr-owned-stdin-close",
+                daemon=True,
+            ).start()
+        remaining = allowed_end - time.monotonic()
+        completed = bool(remaining > 0.0) and done.wait(remaining)
+        if not completed:
+            # Blocked flush (or expired shared slice): the ONE owned wrapper
+            # close() thread is stuck writing to a full pipe. We do NOT
+            # fabricate EOF via raw fd manipulation; we report the attempt as
+            # NOT completed and let the caller proceed to its bounded owned
+            # TERM. The pending close thread stays the sole owner of that
+            # stdin and will complete when the child exits and drains.
+            logger.warning(
+                "ASR owned-worker stdin close() not completed within the "
+                "allowed %.2fs; EOF ATTEMPT NOT completed (no raw-fd close "
+                "performed); continuing to bounded owned TERM",
+                max(0.0, time.monotonic() - (allowed_end - budget)),
+            )
+            return False
+        if outcome["state"] == "ok":
+            return True
+        # Thread ENDED but the actual result is failure (close raised, or the
+        # wrapper does not report itself closed). Report the ACTUAL outcome of
+        # the SHARED operation: EOF is NOT claimed.
+        logger.warning(
+            "ASR owned-worker stdin close attempt FAILED (exception or "
+            "closed flag not set); EOF NOT claimed from thread completion alone"
+        )
+        return False
+
+    def _shutdown_owned_worker(
+        self,
+        worker: subprocess.Popen,
+        *,
+        deadline_s: float = 15.0,
+        deadline_monotonic: Optional[float] = None,
+        stdout_has_reader: bool = False,
+    ) -> bool:
+        """Bounded no-KILL teardown of a Popen THIS call owns.
+
+        Sequence: stdin EOF ATTEMPT → bounded true-wait → terminate (SIGTERM to
+        the child only, never kill/killpg, never a group signal to the
+        inherited parent PGID) → bounded wait. ONE shared budget (default 15 s,
+        not 15+15): the EOF phase gets at most 1 s or the remaining budget,
+        whichever is smaller, and the EOF true-wait gets the first 2/3 of the
+        budget so the owned-terminate wait always has the remaining ~1/3
+        reserve. NO minimum floor is applied: once the (absolute) deadline has
+        expired, this returns the CURRENT poll result immediately, adding no
+        thread, wait, or signal. Returns True iff the process is observed
+        exited within the deadline; on False the caller keeps the Popen
+        reference (survivor) so a respawn cannot be layered over a live worker.
+
+        BUDGET KINDS: ``deadline_monotonic`` (absolute, preferred — passed by
+        ``restart_worker`` so the budget covers lock acquisition too) or the
+        legacy relative ``deadline_s`` (default 15 s) from which an absolute
+        deadline is derived. Public/legacy callers stay compatible.
+
+        Drain ownership: stdout is drained here ONLY when no WorkerIO reader
+        thread owns it (restart passes ``stdout_has_reader=True`` — that
+        thread keeps consuming stdout until EOF even after ``close()``), and
+        stderr only when the launch path's dedicated drainer is not already
+        consuming it (``_stderr_drain_pids``). Two readers on the same TextIO
+        would race and split lines. Only this worker's stdin is closed (by its
+        own wrapper, in a bounded thread) — never an unbounded close on a pipe
+        another thread may hold.
+        """
+        now = time.monotonic()
+        deadline = (
+            float(deadline_monotonic)
+            if deadline_monotonic is not None
+            else now + float(deadline_s)
+        )
+        if deadline - now <= 0.0:
+            # Expired budget: report the CURRENT liveness without adding any
+            # thread, wait, or signal.
+            return worker.poll() is not None
+        total = deadline - now
+        eof_deadline = now + total * (2.0 / 3.0)
+        # Budget recheck immediately before creating ANY helper thread: if the
+        # deadline expired getting here, no drain/stdin thread is started.
+        if deadline - time.monotonic() <= 0.0:
+            return worker.poll() is not None
+        # Active draining first: prevents an EOF-wait block on a full pipe —
+        # but only for streams this call uniquely owns. stdout ownership is
+        # tracked per ACTUAL stream (_stdout_drain_pending), so exactly ONE
+        # reader exists across ready-rejection teardowns and repeated failed
+        # restarts of the same survivor. The shared absolute deadline is
+        # passed down so no helper thread is created after expiry.
+        if not stdout_has_reader:
+            self._start_stdout_drain_once(worker, deadline_monotonic=deadline)
+        if (
+            worker.pid not in self._stderr_drain_pids
+            and worker.stderr is not None
+            and not getattr(worker.stderr, "closed", False)
+        ):
+            # Deadline recheck immediately before creating the stderr helper:
+            # expiry adds no new thread.
+            if deadline - time.monotonic() <= 0.0:
+                return worker.poll() is not None
+            threading.Thread(
+                target=self._drain_to_void,
+                args=(worker.stderr,),
+                name="asr-worker-teardown-drain-stderr",
+                daemon=True,
+            ).start()
+        # Prompt the wrapper to close stdin; the wait is bounded by the SAME
+        # deadline. When stdin is not already closed, the wrapper's own
+        # close() thread is the sole closer — no raw fd / dup2 here.
+        if worker.stdin is not None and not getattr(worker.stdin, "closed", False):
+            eof_budget = min(1.0, max(0.0, eof_deadline - time.monotonic()))
+            try:
+                self._close_stdin_eof(
+                    worker, budget_s=eof_budget, deadline_monotonic=deadline
+                )
+            except Exception:
+                logger.debug("owned stdin EOF attempt raised", exc_info=True)
+        try:
+            worker.wait(timeout=max(0.0, eof_deadline - time.monotonic()))
+            return True
+        except subprocess.TimeoutExpired:
+            pass
+        # Budget recheck immediately before OWN TERM: if the EOF wait returned
+        # at/after the shared deadline, do NOT send TERM after expiry — report
+        # the current liveness and keep the Popen owned fail-closed.
+        if deadline - time.monotonic() <= 0.0:
+            return worker.poll() is not None
+        try:
+            worker.terminate()
+        except Exception:
+            logger.debug("owned-worker terminate raised", exc_info=True)
+        try:
+            worker.wait(timeout=max(0.0, deadline - time.monotonic()))
+            return True
+        except subprocess.TimeoutExpired:
+            return False
 
     # -- ASRBackend interface ------------------------------------------------
 
@@ -340,7 +762,8 @@ class TRTEdgeLLMASRBackend(ASRBackend):
 
         logger.info("ASR backend preload OK (config=%s)", self._config)
         if self._use_worker():
-            self._ensure_worker()
+            with self._worker_lock:
+                self._ensure_worker()
         self._ready = True
         if self._use_worker():
             self._warm_worker()
@@ -451,7 +874,19 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         return "\n".join(self._worker_stderr_tail)
 
     def _ensure_worker(self) -> None:
+        """Launch the resident worker if none is live.
+
+        LIFECYCLE CONTRACT: the caller MUST hold ``self._worker_lock``. This
+        method mutates ``self._worker`` / ``self._wio`` and must never be
+        invoked concurrently with ``restart_worker`` (which also holds
+        ``_worker_lock`` for its whole teardown). Keeping the launch under the
+        same lock that restart uses is what prevents a second process from
+        being spawned during a teardown.
+        """
         if self._worker is not None and self._worker.poll() is None:
+            # A live Popen stays referenced. If it is a failed-ready survivor
+            # (_wio is None) we still must NOT respawn over it; the request
+            # paths reject explicitly when the pair is unusable.
             return
         cmd = [
             self._config.worker_binary,
@@ -485,31 +920,261 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             name="trt-edgellm-asr-stderr",
             daemon=True,
         ).start()
+        self._stderr_drain_pids.add(self._worker.pid)
         assert self._worker.stdout is not None
         ready_line = self._worker.stdout.readline()
+        worker = self._worker
+        failure: Optional[str] = None
+        ready: dict = {}
         if not ready_line:
-            stderr = self._stderr_tail_text()
-            raise RuntimeError(f"ASR worker failed to start: {stderr}")
-        ready = json.loads(ready_line)
-        if ready.get("event") != "ready":
-            raise RuntimeError(f"ASR worker did not become ready: {ready}")
+            failure = (
+                "ASR worker failed to start (EOF before ready): "
+                + self._stderr_tail_text()
+            )
+        else:
+            try:
+                ready = json.loads(ready_line)
+            except Exception as exc:
+                failure = (
+                    f"ASR worker ready line is not valid JSON: "
+                    f"{ready_line[:200]!r} ({exc})"
+                )
+            if failure is None and (
+                not isinstance(ready, dict) or ready.get("event") != "ready"
+            ):
+                failure = f"ASR worker did not become ready: {ready}"
+            if failure is None and self._config.require_ifb:
+                rejection = self._ifb_ready_rejection(
+                    ready, required_slots=max(1, int(self._config.max_slots))
+                )
+                if rejection is not None:
+                    failure = f"ASR worker ready IFB provenance rejected: {rejection}"
+        if failure is not None:
+            # Bounded OWN cleanup of the worker this call just launched:
+            # stdin EOF → bounded true-wait → owned terminate → bounded wait.
+            # Never kill/killpg; no signals to the inherited parent PGID.
+            # stdout has NO WorkerIO reader yet (backend owns it); the launch
+            # path's stderr drainer already owns stderr.
+            exited = self._shutdown_owned_worker(
+                worker, stdout_has_reader=False
+            )
+            # Previous ready state must NEVER survive a launch/ready failure.
+            self._ready = False
+            if exited:
+                # Confirmed retired: clear the Popen AND any stale WIO so the
+                # pair invariant is local.
+                self._worker = None
+                self._wio = None
+                self._worker_failed = False
+                self._worker_failed_reason = None
+            else:
+                # Survivor: keep the Popen reference so _ensure_worker cannot
+                # respawn a second worker over the still-live one; there is no
+                # WIO here (launch path), but the teardown's stdout drain
+                # ownership is retained in _stdout_drain_pending so a later
+                # restart of this survivor cannot start a second stdout
+                # reader. Mark unusable so requests reject explicitly.
+                self._wio = None
+                self._worker_failed = True
+                self._worker_failed_reason = f"ready handshake failed: {failure}"
+                logger.error(
+                    "ASR worker ready handshake failed and worker pid=%s "
+                    "survived EOF+TERM within the shared deadline; keeping the "
+                    "reference to prevent respawn",
+                    worker.pid,
+                )
+            raise RuntimeError(failure)
+        # Successful owned launch: reset stale engine diagnostics so no health
+        # from a previous worker process leaks into this one's provenance.
+        with self._diag_lock:
+            self._latest_ifb_health = None
+            self._ifb_traces.clear()
+            self._last_health_log_at = 0.0
         self._worker_ready_meta = ready
         self._max_slots = max(1, int(self._config.max_slots))
+        # A successful owned fresh launch is the ONLY place (besides a
+        # confirmed retired exit) that clears the per-worker failure marker.
+        self._worker_failed = False
+        self._worker_failed_reason = None
         # NB: ``_ensure_worker`` reads the worker's initial ``ready`` line
         # itself (above) BEFORE handing stdout to the WorkerIO reader thread.
-        self._wio = WorkerIO(self._worker, concurrency=self._max_slots)
+        self._wio = WorkerIO(
+            self._worker,
+            concurrency=self._max_slots,
+            telemetry_callback=self._on_worker_telemetry,
+        )
 
-    def _worker_request(self, input_data: dict) -> dict:
-        """Send one streaming protocol line to the worker, return its single reply."""
+    @staticmethod
+    def _ifb_ready_rejection(
+        ready: dict, *, required_slots: int
+    ) -> Optional[str]:
+        """Opt-in v011 ready-provenance validation. Returns a rejection detail
+        string, or None when the ready event proves IFB capability for the
+        configured slot count. Bool is NOT accepted as an integer value."""
+        if ready.get("ifb") is not True:
+            return f"ready.ifb must be true, got {ready.get('ifb')!r}"
+        for key in ("max_slots", "gpu_slots"):
+            value = ready.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return (
+                    f"ready.{key} must be an integer (bool not accepted), "
+                    f"got {value!r}"
+                )
+            if value != required_slots:
+                return f"ready.{key}={value} != configured slots {required_slots}"
+        batch = ready.get("engine_max_batch_size")
+        if isinstance(batch, bool) or not isinstance(batch, int):
+            return (
+                "ready.engine_max_batch_size must be an integer, "
+                f"got {batch!r}"
+            )
+        if batch < required_slots:
+            return (
+                f"ready.engine_max_batch_size={batch} < configured slots "
+                f"{required_slots}"
+            )
+        return None
+
+    def _on_worker_telemetry(self, event: dict) -> None:
+        """WorkerIO telemetry sink: cache latest IFB health + bounded traces.
+
+        The NATIVE worker emits telemetry with the canonical ``type`` key
+        (qwen3_asr_worker lifecycle health_final:
+        ``{"type":"asr_ifb_health",...}``); ``event`` is a compat alias.
+        Rate-bounded, audio-free logging carries the ACTUAL native stall
+        counter keys (stalls_founder_only / stalls_guided /
+        stalls_incompatible / stalls_no_capacity) plus admitted_mid_flight —
+        there is no single ``stalls`` key in the source. Exceptions never
+        propagate into the WorkerIO reader (they are isolated there too).
+        """
+        kind = event.get("type") or event.get("event")
+        with self._diag_lock:
+            if kind == "asr_ifb_health":
+                self._latest_ifb_health = dict(event)
+            elif kind == "asr_ifb_trace":
+                self._ifb_traces.append(dict(event))
+        if kind == "asr_ifb_health":
+            now = time.monotonic()
+            with self._diag_lock:
+                due = now - self._last_health_log_at >= 10.0
+                if due:
+                    self._last_health_log_at = now
+            if due:
+                stall_counters = {
+                    key: value
+                    for key, value in sorted(event.items())
+                    if key.startswith("stalls_")
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                }
+                logger.info(
+                    "ASR worker asr_ifb_health: stall_counters=%r "
+                    "admitted_mid_flight=%r resident=%r queued=%r",
+                    stall_counters,
+                    event.get("admitted_mid_flight"),
+                    event.get("resident"),
+                    event.get("queued"),
+                )
+
+    def runtime_diagnostics(self) -> dict:
+        """Additive runtime provenance snapshot (validated ready + latest IFB
+        health + bounded traces). Copies only; no capability override, no HTTP
+        exposure claim — HTTP surfacing is a separate integration task."""
+        with self._diag_lock:
+            health = (
+                dict(self._latest_ifb_health) if self._latest_ifb_health else None
+            )
+            traces = [dict(t) for t in self._ifb_traces]
+        return {
+            "require_ifb": bool(getattr(self._config, "require_ifb", False)),
+            "ready": self._ready,
+            # Live snapshot from the actual owned Popen: a cached ready=True
+            # after the worker died must NOT qualify IFB provenance.
+            "worker_alive": (
+                self._worker.poll() is None
+                if self._worker is not None
+                else None
+            ),
+            "worker_pid": self._worker.pid if self._worker is not None else None,
+            "validated_ready": dict(self._worker_ready_meta),
+            "latest_asr_ifb_health": health,
+            "asr_ifb_traces": traces,
+            "asr_ifb_trace_capacity": 64,
+        }
+
+    def _clear_worker_if_current(self, worker, wio, *, reason: str = "") -> None:
+        """Compare-and-handle the captured ownership pair under the lock.
+
+        A request error (``WorkerExitError`` / broken pipe / no response) is NOT
+        proof that the process exited. So:
+
+          * if the current pair still matches the captured pair AND the captured
+            Popen is PROVEN EXITED (``poll() is not None``), clear BOTH the
+            Popen and its own WorkerIO atomically and reset the failure marker;
+          * if it matches but the Popen is STILL LIVE, retain the Popen AND its
+            WorkerIO reader ownership and mark the worker unusable / not-ready.
+            No respawn is attempted; later requests reject explicitly.
+
+        If the current pair does not match (a newer worker was installed), this
+        is a no-op — an OLDER failure must never mark or discard a newer worker.
+        """
+        with self._worker_lock:
+            if self._worker is worker and self._wio is wio:
+                if worker is not None and worker.poll() is None:
+                    # Still live: keep the pair, fail closed.
+                    self._worker_failed = True
+                    self._worker_failed_reason = reason or "request failed"
+                    self._ready = False
+                else:
+                    # Proven exited (or no worker): drop the pair together.
+                    self._worker = None
+                    self._wio = None
+                    self._worker_ready_meta = {}
+                    self._worker_failed = False
+                    self._worker_failed_reason = None
+
+    def _worker_request(
+        self,
+        input_data: dict,
+        *,
+        expected_cancel: Optional[threading.Event] = None,
+        on_written: Optional["Callable[[], None]"] = None,
+    ) -> dict:
+        """Send one streaming protocol line to the worker, return its single reply.
+
+        ``on_written`` is forwarded to the underlying ``WorkerIO.request`` ONLY
+        when supplied (kept default-off so every existing caller/request is
+        byte-for-byte unchanged). ``expected_cancel`` is a RESPONSE-classification
+        marker only and is deliberately NOT passed to ``WorkerIO.request`` as a
+        ``cancel_event`` — doing so would make WorkerIO emit its own second,
+        autonomous cancel, duplicating the explicit ``_worker_cancel_and_wait``
+        control write.
+        """
         req_event = input_data.get("event") if isinstance(input_data, dict) else None
         req_id = input_data.get("id") if isinstance(input_data, dict) else None
         with self._worker_lock:
             self._ensure_worker()
+            worker = self._worker
             wio = self._wio
-        assert wio is not None
+            failed = self._worker_failed
+            failed_reason = self._worker_failed_reason
+        if worker is None or wio is None or failed:
+            # Explicit rejection, NOT an assert: a failed-ready survivor keeps
+            # a live Popen with no usable WorkerIO, and a failed request against
+            # a still-live worker marks it unusable. Either way no request may
+            # be sent and no respawn is attempted over the live process.
+            stderr = self._stderr_tail_text()
+            raise WorkerExitError(
+                "ASR worker unavailable ("
+                f"{'failed: ' + failed_reason if failed else ('live process without WorkerIO' if worker is not None else 'no worker')}"
+                f"): {stderr}"
+            )
         try:
             output_data: Optional[dict] = None
-            gen = wio.request(input_data)
+            if on_written is None:
+                gen = wio.request(input_data)
+            else:
+                gen = wio.request(input_data, on_written=on_written)
             try:
                 for ev in gen:
                     output_data = ev
@@ -518,20 +1183,40 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 gen.close()
         except _WIOExitError as exc:
             stderr = self._stderr_tail_text()
-            self._worker = None
+            self._clear_worker_if_current(
+                worker, wio, reason=f"worker exited mid-request: {exc}"
+            )
             raise WorkerExitError(
                 f"ASR worker exited before response: {exc}: {stderr}"
             ) from exc
         except (BrokenPipeError, OSError) as exc:
             stderr = self._stderr_tail_text()
-            self._worker = None
+            self._clear_worker_if_current(
+                worker, wio, reason=f"worker stdin broken: {exc}"
+            )
             raise WorkerExitError(
                 f"ASR worker stdin broken (likely killed): {exc}: {stderr}"
             ) from exc
         if output_data is None:
             stderr = self._stderr_tail_text()
-            self._worker = None
+            self._clear_worker_if_current(
+                worker, wio, reason="worker produced no response"
+            )
             raise WorkerExitError(f"ASR worker exited before response: {stderr}")
+        if (
+            expected_cancel is not None
+            and expected_cancel.is_set()
+            and isinstance(req_id, str)
+            and req_id
+            and output_data.get("event") == "cancelled"
+            and output_data.get("ok") is False
+            and output_data.get("id") == req_id
+        ):
+            # Opt-in expected-cancel arm: while a cancel is genuinely requested
+            # for this very request, return the ACTUAL dict to the ordinary
+            # consumer instead of the generic ok=false WorkerProtocolError.
+            # No marker clear, no SID release, no receipt logic beyond this.
+            return output_data
         typed = _classify_worker_response(output_data, request_event=req_event)
         if typed is not None:
             raise typed
@@ -551,39 +1236,236 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             raise WorkerProtocolError(f"ASR worker error: {output_data}")
         return output_data
 
-    def restart_worker(self) -> None:
-        """Forcibly kill the worker subprocess so the next request rebuilds it."""
-        with self._restart_lock:
+    def _worker_cancel_and_wait(self, sid: str, timeout_s: float) -> dict:
+        """Send a native cancel for ``sid`` and return the ACTUAL receipt dict.
+
+        Transport-only foundation (NO stream-state / legacy-cancel migration):
+        this is the backend's thin, ownership-safe wrapper over
+        ``WorkerIO.cancel_and_wait``. It never routes through the ordinary
+        ``_worker_request`` line discipline and never touches the consumer
+        cancellation carve-out (none exists here yet).
+
+        Validation happens BEFORE any stdin write and BEFORE the worker
+        snapshot/lookup, using the SAME canonical rules WorkerIO enforces
+        (non-empty str id; finite, positive, non-bool timeout). The snapshot of
+        ``(_worker, _wio, _worker_failed, _worker_failed_reason)`` is taken
+        under ``self._worker_lock`` and the lock is RELEASED before the WIO
+        call — the blocking cancel/receipt wait must never hold the backend
+        lock. This method NEVER calls ``_ensure_worker`` and NEVER spawns or
+        preloads a worker; an absent/failed/unusable pair is an explicit
+        rejection using the EXISTING ``WorkerExitError`` message pattern.
+
+        The captured pair is passed straight to the ACTUAL ``wio.cancel_and_wait``
+        and the matching native dict is returned verbatim (id/epoch/ok=false) —
+        no dummy ACK and no shape assumptions; WIO guarantees the receipt
+        shape. ``TimeoutError`` / ``ValueError`` / ``RuntimeError``
+        (capacity/duplicate) propagate UNCHANGED and must NOT clear the pair,
+        restart, or mark the worker failed: the worker and its handles remain
+        caller-owned. A genuine worker exit (``WorkerIO`` ``WorkerExitError``)
+        maps to the existing backend ``WorkerExitError`` and is the only case
+        that runs the existing ``_clear_worker_if_current`` compare-and-handle
+        (which itself only clears a PROVEN-exited captured pair); broken stdin
+        (``BrokenPipeError``/``OSError``) follows the same broken-stdin policy
+        as ``_worker_request``. No blanket ``except`` clause is used.
+
+        KNOWN LIMITATION (deliberate, do not overclaim): the underlying
+        ``TextIO.write`` + ``flush`` inside WorkerIO may block for an opaque,
+        OS/pipe-bounded duration. This helper therefore carries NO hard-deadline
+        guarantee for the whole call and MUST be run off the event loop by a
+        caller/supervisor that retains live writers on timeout.
+        """
+        # --- Validate BEFORE any write or worker lookup (reuse WIO rules). ---
+        if not isinstance(sid, str) or not sid:
+            raise ValueError(f"_worker_cancel_and_wait: invalid sid={sid!r}")
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError(
+                f"_worker_cancel_and_wait: invalid timeout_s={timeout_s!r}"
+            )
+
+        # --- Snapshot ownership under the lock, then RELEASE it. ---
+        with self._worker_lock:
             worker = self._worker
-            if worker is None:
-                return
-            self._worker = None
-            self._worker_ready_meta = {}
             wio = self._wio
-            self._wio = None
-            if wio is not None:
-                try:
-                    wio.close()
-                except Exception:
-                    logger.debug("WorkerIO.close() during restart raised", exc_info=True)
+            failed = self._worker_failed
+            failed_reason = self._worker_failed_reason
+
+        if worker is None or wio is None or failed:
+            # Explicit rejection, NOT an assert and NOT a respawn: mirrors
+            # ``_worker_request``; no request is sent over a live-but-unusable
+            # survivor, and no ``_ensure_worker`` is attempted here.
+            stderr = self._stderr_tail_text()
+            raise WorkerExitError(
+                "ASR worker unavailable ("
+                f"{'failed: ' + failed_reason if failed else ('live process without WorkerIO' if worker is not None else 'no worker')}"
+                f"): {stderr}"
+            )
+
+        # Lock is released above; the blocking wait runs uncoupled from it.
+        try:
+            return wio.cancel_and_wait(sid, timeout_s)
+        except _WIOExitError as exc:
+            stderr = self._stderr_tail_text()
+            self._clear_worker_if_current(
+                worker, wio, reason=f"worker exited during cancel: {exc}"
+            )
+            raise WorkerExitError(
+                f"ASR worker exited before cancel receipt: {exc}: {stderr}"
+            ) from exc
+        except TimeoutError:
+            # CRITICAL ORDERING: the builtin ``TimeoutError`` subclasses
+            # ``OSError``, so this arm MUST precede the ``(BrokenPipeError,
+            # OSError)`` arm. A receipt timeout is NOT a broken stdin: it
+            # propagates UNCHANGED and must NEVER clear the pair, mark the
+            # worker failed, or trigger a restart — the worker and its handles
+            # stay caller-owned.
+            raise
+        except (BrokenPipeError, OSError) as exc:
+            stderr = self._stderr_tail_text()
+            self._clear_worker_if_current(
+                worker, wio, reason=f"worker stdin broken during cancel: {exc}"
+            )
+            raise WorkerExitError(
+                f"ASR worker stdin broken during cancel (likely killed): {exc}: {stderr}"
+            ) from exc
+
+    def restart_worker(self) -> None:
+        """Gracefully retire the resident worker (stdin EOF attempt → bounded
+        true-wait → owned terminate → bounded wait; NEVER kill/killpg) so the
+        next request launches a fresh one.
+
+        LOCK ORDER / BUDGET: ONE absolute monotonic 15 s deadline is set BEFORE
+        either lock is acquired. BOTH ``_restart_lock`` and ``_worker_lock`` are
+        acquired with ``acquire(timeout=remaining)`` from that same deadline, so
+        a wedged holder of either lock produces a bounded explicit error instead
+        of an unbounded wait past the budget; on timeout NOTHING about the
+        Popen/WIO ownership is changed. The whole teardown then runs under
+        ``_worker_lock`` (so ``_ensure_worker`` — the only launch site — cannot
+        spawn a second process while the old one terminates), and every close /
+        helper wait shares the SAME absolute deadline (``deadline_monotonic``).
+        ``_worker``/``_wio`` stay referenced until exit is CONFIRMED; the pair
+        is cleared atomically only then.
+        """
+        deadline = time.monotonic() + 15.0
+        acquired_restart = self._restart_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+        if not acquired_restart:
+            raise RuntimeError(
+                "ASR worker restart could not acquire lifecycle restart lock "
+                "within the shared 15s budget; Popen/WorkerIO ownership "
+                "unchanged"
+            )
+        try:
+            acquired_worker = self._worker_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            if not acquired_worker:
+                raise RuntimeError(
+                    "ASR worker restart could not acquire lifecycle worker lock "
+                    "within the shared 15s budget; Popen/WorkerIO ownership "
+                    "unchanged"
+                )
             try:
+                worker = self._worker
+                if worker is None:
+                    return
+                # Ownership markers stay in place through teardown; only
+                # _worker_ready_meta is invalidated up front.
+                self._worker_ready_meta = {}
+                wio = self._wio
+                # If the initial locks consumed the entire shared budget, no
+                # WIO close thread is started at all.
+                if wio is not None and deadline - time.monotonic() > 0.0:
+                    # Bounded by min(1 s, remaining shared budget): the 1 s wait
+                    # is INSIDE the one shutdown budget, not additive. The close
+                    # operation is bound to the ACTUAL WIO object, so a repeated
+                    # failed restart reuses the pending close instead of
+                    # starting another blocked close thread for the same WIO.
+                    wio_wait = min(1.0, deadline - time.monotonic())
+                    if not self._wio_close_bounded(
+                        wio, budget_s=wio_wait, deadline_monotonic=deadline
+                    ):
+                        # A request thread blocked in stdin flush holds
+                        # _stdin_lock; WorkerIO.close() can never finish until
+                        # the pipe drains/child exits. Do NOT wait unboundedly:
+                        # proceed with the bounded owned teardown, which asks the
+                        # wrapper to close stdin (sole closer) and then TERMs.
+                        logger.warning(
+                            "ASR worker restart: WorkerIO.close() did not "
+                            "complete within %.2fs (writer blocked on "
+                            "_stdin_lock with an unread pipe); proceeding with "
+                            "bounded owned teardown",
+                            wio_wait,
+                        )
                 if worker.poll() is None:
-                    try:
-                        worker.kill()
-                    except Exception:
-                        pass
-                    try:
-                        worker.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                for fh in (worker.stdin, worker.stdout, worker.stderr):
-                    try:
-                        if fh is not None and not fh.closed:
-                            fh.close()
-                    except Exception:
-                        pass
-            except Exception as exc:
-                logger.warning("restart_worker: kill failed: %s", exc)
+                    # No-KILL teardown sharing the absolute deadline from
+                    # restart entry (covers lock acquisition, wio close, EOF
+                    # attempt, true-wait and TERM). Drain ownership: wio's
+                    # reader thread keeps consuming stdout until EOF after
+                    # close() — do NOT start a second reader; the launch path's
+                    # stderr drainer likewise still owns stderr
+                    # (_stderr_drain_pids).
+                    exited = self._shutdown_owned_worker(
+                        worker,
+                        deadline_monotonic=deadline,
+                        stdout_has_reader=wio is not None,
+                    )
+                    if not exited:
+                        # Survivor: keep the Popen referenced (so no respawn can
+                        # be layered over it) and RETAIN the actual WorkerIO:
+                        # its reader thread still owns stdout until EOF, and
+                        # dropping the reference here would let a later restart
+                        # pass stdout_has_reader=False and start a SECOND reader
+                        # on the same live pipe. The WIO is merely unusable for
+                        # requests; the failure marker (below) is what makes
+                        # subsequent requests reject explicitly, and a later
+                        # restart reuses the pending WIO-close ownership.
+                        self._worker = worker
+                        self._wio = wio
+                        self._ready = False
+                        self._worker_failed = True
+                        self._worker_failed_reason = (
+                            "restart survivor (EOF attempt + TERM exceeded "
+                            "shared deadline)"
+                        )
+                        logger.error(
+                            "ASR worker restart: pid=%s survived EOF attempt + "
+                            "TERM within the shared deadline; reference kept, "
+                            "ready=False",
+                            worker.pid,
+                        )
+                        raise RuntimeError(
+                            "ASR worker restart failed: worker pid="
+                            f"{worker.pid} survived stdin-EOF attempt + "
+                            "SIGTERM within the shared deadline; reference kept, "
+                            "ready=False"
+                        )
+                # Confirmed exited (or already dead): clear the pair atomically
+                # and reset the failure marker. Stdin EOF was attempted by
+                # _shutdown_owned_worker for a live process; for an already-dead
+                # process there is nothing left to flush. No redundant second
+                # EOF pass — that would add budget outside the shared deadline.
+                # stdout/stderr stay with their drainer threads until EOF.
+                self._worker = None
+                self._wio = None
+                self._worker_failed = False
+                self._worker_failed_reason = None
+            finally:
+                self._worker_lock.release()
+            # Successful owned restart: drop any diagnostics from the discarded
+            # worker so no stale engine health/trace survives into the next
+            # launch.
+            with self._diag_lock:
+                self._latest_ifb_health = None
+                self._ifb_traces.clear()
+                self._last_health_log_at = 0.0
+        finally:
+            self._restart_lock.release()
         logger.info("ASR worker restarted (will respawn on next request)")
 
     def _postprocess_text(self, text: str) -> tuple[str, Optional[str]]:
@@ -612,20 +1494,47 @@ class TRTEdgeLLMASRBackend(ASRBackend):
                 "French", "German", "Italian", "Portuguese", "Russian",
                 "Spanish",
             )
-            for name in known_languages:
-                prefix = f"language {name}"
-                if text.startswith(prefix):
-                    language_detected = name
-                    text = text[len(prefix):].lstrip()
-                    break
-            else:
-                space = text.find(" ", 9)
-                if space > 0:
-                    language_detected = text[9:space]
-                    text = text[space + 1:].lstrip()
+            # 显式 native 解码头标记 '<asr_text>' 是语言标签的硬边界，
+            # 且必须先于 legacy 已知前缀循环判定：完整标记前的头部为空/
+            # 纯空白 => 不发明语言，保留整段输入；头部为非空且无空白的
+            # 单词标签 => 整个 native 标签（已知或未知），正文从精确标记
+            # 处开始。多词头部不当作标签，回退 legacy 处理。
+            marker_pos = text.find("<asr_text>", 9)
+            if marker_pos != -1:
+                header = text[9:marker_pos].strip()
+                if not header:
+                    return text, None
+                if len(header.split()) == 1:
+                    language_detected = header
+                    text = text[marker_pos:]
+            if language_detected is None:
+                for name in known_languages:
+                    prefix = f"language {name}"
+                    if text.startswith(prefix):
+                        language_detected = name
+                        text = text[len(prefix):].lstrip()
+                        break
                 else:
-                    language_detected = text[9:]
-                    text = ""
+                    space = text.find(" ", 9)
+                    if space > 0:
+                        language_detected = text[9:space]
+                        text = text[space + 1:].lstrip()
+                    else:
+                        label = text[9:]
+                        if label.strip():
+                            language_detected = label
+                            text = ""
+                        else:
+                            # 空头标签：不发明语言，保留输入而不是删掉正文。
+                            return text, None
+        # native 解码可能把控制标记原样吐在正文最前面（NX 实测
+        # '{"text":"<asr_text>Concord returned ..."}'）。只剥这一个
+        # 完整的引导标记及其周围的定界空白；正文中间出现的字面
+        # '<asr_text>' 和不完整的 '<asr_' 前缀一律保留。
+        if text:
+            stripped = text.lstrip()
+            if stripped.startswith("<asr_text>"):
+                text = stripped[len("<asr_text>"):].lstrip()
         return text, language_detected
 
     @staticmethod
@@ -703,19 +1612,42 @@ class TRTEdgeLLMASRBackend(ASRBackend):
             })
         with self._worker_lock:
             self._ensure_worker()
+            worker = self._worker
             wio = self._wio
-        assert wio is not None
+            failed = self._worker_failed
+            failed_reason = self._worker_failed_reason
+        if worker is None or wio is None or failed:
+            # Explicit rejection (see _worker_request): a failed-ready survivor,
+            # a failure-marked live worker, or a concurrent teardown leaves no
+            # usable WorkerIO. Never respawn over the live process.
+            raise RuntimeError(
+                "ASR worker unavailable ("
+                f"{'failed: ' + failed_reason if failed else ('live process without WorkerIO' if worker is not None else 'no worker')}"
+                f"): {self._stderr_tail_text()}"
+            )
         t0 = time.time()
+        gen = wio.request(input_data)
         try:
             output_data: dict = {}
-            for ev in wio.request(input_data):
+            for ev in gen:
                 output_data = ev
+                typed = _classify_worker_response(ev)
+                if typed is not None:
+                    raise typed
+                if ev.get("event") not in ("done", "cancelled") and (
+                    ev.get("event") == "error" or ev.get("ok") is False
+                ):
+                    raise WorkerProtocolError(f"ASR worker error: {ev}")
         except _WIOExitError as exc:
             stderr = self._stderr_tail_text()
-            self._worker = None
+            self._clear_worker_if_current(
+                worker, wio, reason=f"worker exited mid-request: {exc}"
+            )
             raise RuntimeError(
                 f"ASR worker exited before response: {exc}: {stderr}"
             ) from exc
+        finally:
+            gen.close()
         elapsed_worker = time.time() - t0
 
         if not output_data.get("ok"):
@@ -1274,12 +2206,294 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         self._detected_language: Optional[str] = None
         self._cancelled = False
         self._closed = False
+        # --- Native stream-cancel state (U2 attempt2) ----------------------
+        # ``_state_lock`` guards ONLY the short cancel/rotation bookkeeping
+        # below. It is NEVER held across worker/stdin IO, waits, transcribe, or
+        # text postprocess.
+        self._state_lock = threading.Lock()
+        # Per-SID BEGIN-WRITTEN barrier. Created by ``_begin_written_event`` and
+        # set EXACTLY once by that SID's ``_begin`` on_written callback (i.e. only
+        # after the native ``begin`` line is actually written+flushed). It is
+        # used ONLY to gate a cancel write behind a provably-known native SID.
+        self._begin_written: dict[str, threading.Event] = {}
+        # Per-SID CANCEL-REQUESTED marker. Created by
+        # ``_cancel_requested_event`` and set ONLY by ``arm_cancel`` /
+        # ``request_cancel``. It is the ``expected_cancel`` marker for ordinary
+        # requests and is NEVER set by a begin. It starts UNSET and is NEVER
+        # cleared once armed (stays set while consumers drain / after receipt).
+        self._cancel_requested: dict[str, threading.Event] = {}
+        # SIDs with an armed cancellation intent.
+        self._cancel_armed_sids: set[str] = set()
+        # Stable per-SID intent record: {sid, requested_at}. Never cleared while
+        # the old SID may still be draining; the old record survives rotation.
+        self._cancel_intent: Optional[dict] = None
+        # ACTUAL matching native receipt applied to exactly one SID.
+        self._cancel_confirm: Optional[dict] = None
+        # Worker exited while an intent was unresolved (distinct from timeout).
+        self._cancel_exit = False
+        # Duplicate-control ownership: True while exactly one request_cancel is
+        # inside the actual helper. Prevents two controls issuing two native
+        # cancels for the same intent. Released when the helper RETURNS
+        # (success or TimeoutError); the intent itself is retained.
+        self._control_inflight = False
+        # Per-SID count of ordinary requests currently in flight (begin/chunk/
+        # end). The old SID's marker/intent is NOT dropped while count != 0.
+        self._inflight_count: dict[str, int] = {}
         self._begin()
 
+    # ------------------------------------------------------------------
+    # Native cancel state helpers (no IO, short-lock only)
+    # ------------------------------------------------------------------
+    def _begin_written_event(self, sid: str) -> threading.Event:
+        """Return (creating if needed) the begin-written barrier for ``sid``."""
+        with self._state_lock:
+            ev = self._begin_written.get(sid)
+            if ev is None:
+                ev = threading.Event()
+                self._begin_written[sid] = ev
+            return ev
+
+    def _cancel_requested_event(self, sid: str) -> threading.Event:
+        """Return (creating if needed) the cancel-requested marker for ``sid``."""
+        with self._state_lock:
+            ev = self._cancel_requested.get(sid)
+            if ev is None:
+                ev = threading.Event()
+                self._cancel_requested[sid] = ev
+            return ev
+
+    def _cancel_armed_for(self, sid: str) -> bool:
+        with self._state_lock:
+            ev = self._cancel_requested.get(sid)
+            return bool(ev is not None and ev.is_set())
+
+    def _inflight_inc(self, sid: str) -> None:
+        with self._state_lock:
+            self._inflight_count[sid] = self._inflight_count.get(sid, 0) + 1
+
+    def _inflight_dec(self, sid: str) -> None:
+        with self._state_lock:
+            n = self._inflight_count.get(sid, 0) - 1
+            if n <= 0:
+                self._inflight_count.pop(sid, None)
+            else:
+                self._inflight_count[sid] = n
+
+    def _inflight_for(self, sid: str) -> int:
+        with self._state_lock:
+            return self._inflight_count.get(sid, 0)
+
+    def _ordinary_request(
+        self, payload: dict, *, on_written=None
+    ) -> dict:
+        """Send one ordinary begin/chunk/end request with in-flight accounting.
+
+        Uses the SID's CANCEL-REQUESTED event (unset until a cancel is armed) as
+        ``expected_cancel``. The in-flight count is incremented before the IO
+        and decremented in ``finally``; NO lock is held over the IO. A cancelled
+        terminal is returned to the caller unchanged (which must suppress normal
+        state writes). ``on_written`` is forwarded to the backend ONLY for the
+        begin request (sets the begin-written barrier).
+        """
+        sid = payload.get("id")
+        if isinstance(sid, str) and sid:
+            self._inflight_inc(sid)
+            marker = self._cancel_requested_event(sid)
+        else:
+            marker = None
+        try:
+            if on_written is None:
+                return self._backend._worker_request(
+                    payload, expected_cancel=marker
+                )
+            return self._backend._worker_request(
+                payload, expected_cancel=marker, on_written=on_written
+            )
+        finally:
+            if isinstance(sid, str) and sid:
+                self._inflight_dec(sid)
+
+    def _record_cancel_receipt(self, sid: str, receipt: dict) -> None:
+        """Record an ACTUAL matching cancelled terminal for an ARMED ``sid`` only.
+
+        An unarmed / non-matching ``cancelled`` event must NOT fabricate an
+        intent or a confirmation — it propagates ``WorkerProtocolError`` instead.
+        """
+        if not (
+            isinstance(receipt, dict)
+            and receipt.get("event") == "cancelled"
+            and receipt.get("ok") is False
+            and receipt.get("id") == sid
+        ):
+            raise WorkerProtocolError(
+                f"non-matching cancelled receipt for sid={sid!r}: {receipt!r}"
+            )
+        with self._state_lock:
+            ev = self._cancel_requested.get(sid)
+            if ev is None or not ev.is_set():
+                raise WorkerProtocolError(
+                    f"cancelled receipt for UNArmED sid={sid!r}: {receipt!r}"
+                )
+            self._cancel_armed_sids.add(sid)
+            if self._cancel_intent is None or self._cancel_intent.get("sid") != sid:
+                # Do NOT overwrite a live intent for another SID.
+                if self._cancel_intent is None:
+                    self._cancel_intent = {
+                        "sid": sid,
+                        "requested_at": time.monotonic(),
+                    }
+            if (
+                self._cancel_confirm is None
+                or self._cancel_confirm.get("sid") != sid
+            ):
+                self._cancel_confirm = {
+                    "sid": sid,
+                    "epoch": receipt.get("epoch"),
+                    "receipt": receipt,
+                }
+
+    def arm_cancel(self) -> str:
+        """Non-blocking, IO-free: capture the CURRENT SID and arm its cancel.
+
+        Sets ONLY the SID's cancel-requested marker (never the begin-written
+        barrier). Called by the caller BEFORE it schedules the blocking control
+        job, so the intent is visible to the ordinary consumer immediately.
+        Returns the captured SID. Never clears an existing intent.
+        """
+        with self._state_lock:
+            sid = self._session_id
+            ev = self._cancel_requested.get(sid)
+            if ev is None:
+                ev = threading.Event()
+                self._cancel_requested[sid] = ev
+            ev.set()
+            self._cancel_armed_sids.add(sid)
+            if self._cancel_intent is None:
+                self._cancel_intent = {
+                    "sid": sid,
+                    "requested_at": time.monotonic(),
+                }
+            return sid
+
+    def request_cancel(self, timeout_s: float) -> dict:
+        """Actually cancel the captured SID; return the ACTUAL native receipt.
+
+        Validation of ``timeout_s`` happens BEFORE any state change or write.
+        Arms the current SID if not already armed, waits (inclusive, one
+        absolute monotonic deadline) for that SID's BEGIN-WRITTEN barrier, then
+        runs the ACTUAL backend ``_worker_cancel_and_wait`` with the REMAINING
+        budget. If a matching receipt was already confirmed for this SID, the
+        retained actual receipt is returned WITHOUT writing a duplicate cancel.
+
+        Failure semantics (deliberately distinct):
+          * ``TimeoutError``: control-inflight released, intent stays armed, NO
+            confirmed receipt, stream NOT closed, NO restart/pool.
+          * ``WorkerExitError``: ``_cancel_exit`` set, NO ACK.
+        """
+        # --- Validate BEFORE changing state / writing anything. ---
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError(
+                f"request_cancel: invalid timeout_s={timeout_s!r}"
+            )
+        deadline = time.monotonic() + float(timeout_s)
+
+        # --- Capture/arm the intent under the short lock, then RELEASE it. ---
+        with self._state_lock:
+            intent = self._cancel_intent
+            if intent is None:
+                sid = self._session_id
+                ev = self._cancel_requested.get(sid)
+                if ev is None:
+                    ev = threading.Event()
+                    self._cancel_requested[sid] = ev
+                ev.set()
+                self._cancel_armed_sids.add(sid)
+                intent = {"sid": sid, "requested_at": time.monotonic()}
+                self._cancel_intent = intent
+            captured_sid = intent["sid"]
+            # Idempotence: an already-confirmed SID returns the retained receipt
+            # (never a duplicate cancel write to an already-released SID).
+            if (
+                self._cancel_confirm is not None
+                and self._cancel_confirm.get("sid") == captured_sid
+            ):
+                return self._cancel_confirm["receipt"]
+            if self._control_inflight:
+                raise RuntimeError(
+                    "request_cancel: duplicate control for "
+                    f"sid={captured_sid!r} already in flight"
+                )
+            self._control_inflight = True
+            begin_ev = self._begin_written.get(captured_sid)
+            if begin_ev is None:
+                begin_ev = threading.Event()
+                self._begin_written[captured_sid] = begin_ev
+
+        # --- Begin-written barrier: one absolute deadline, remaining budget. ---
+        remaining = deadline - time.monotonic()
+        if remaining > 0 and not begin_ev.is_set():
+            begin_ev.wait(remaining)
+        remaining = deadline - time.monotonic()
+        # No assumed wake / no early false: re-check the ACTUAL barrier and the
+        # ACTUAL remaining budget after the wait.
+        if not begin_ev.is_set() or remaining <= 0:
+            with self._state_lock:
+                self._control_inflight = False
+            raise TimeoutError(
+                f"request_cancel: begin-write barrier not satisfied for "
+                f"sid={captured_sid!r} within budget"
+            )
+
+        # --- ACTUAL native cancel for the CAPTURED SID (never current SID). ---
+        try:
+            receipt = self._backend._worker_cancel_and_wait(captured_sid, remaining)
+        except TimeoutError:
+            # The helper RETURNED: release duplicate-control ownership, but
+            # keep the intent armed (no confirm, no closed, no restart).
+            with self._state_lock:
+                self._control_inflight = False
+            raise
+        except WorkerExitError:
+            with self._state_lock:
+                self._control_inflight = False
+                self._cancel_exit = True
+            raise
+        except BaseException:
+            with self._state_lock:
+                self._control_inflight = False
+            raise
+
+        # --- Validate the receipt shape even for a fake backend. ---
+        if not isinstance(receipt, dict) or not (
+            receipt.get("event") == "cancelled"
+            and receipt.get("ok") is False
+            and receipt.get("id") == captured_sid
+        ):
+            with self._state_lock:
+                self._control_inflight = False
+            raise WorkerProtocolError(
+                "request_cancel: non-matching cancelled receipt for "
+                f"sid={captured_sid!r}: {receipt!r}"
+            )
+        self._record_cancel_receipt(captured_sid, receipt)
+        with self._state_lock:
+            self._control_inflight = False
+        return receipt
+
     def _begin(self) -> None:
+        # Capture the SID for THIS begin; the on_written callback must set the
+        # captured SID's BEGIN-WRITTEN barrier, and the ordinary request uses the
+        # SEPARATE cancel-requested marker (unset until a cancel is armed).
+        sid = self._session_id
+        begin_ev = self._begin_written_event(sid)
         ev = {
             "event": "begin",
-            "id": self._session_id,
+            "id": sid,
             "sample_rate": self._sample_rate,
             "chunk_size_sec": float(self._backend._config.stream_chunk_sec),
             "unfixed_chunk_num": int(self._backend._config.stream_unfixed_chunks),
@@ -1288,45 +2502,75 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         }
         if self._language and self._language != "auto":
             ev["force_language"] = self._language
-        resp = self._backend._worker_request(ev)
+        resp = self._ordinary_request(ev, on_written=begin_ev.set)
+        # The begin gate only needs the write barrier, which on_written sets.
+        if resp.get("event") == "cancelled":
+            # A begin can itself observe an armed cancel; record it (this
+            # validates the arm), mutate nothing, and let callers see it.
+            self._record_cancel_receipt(sid, resp)
+            return
         if resp.get("event") != "begin_ack":
             raise RuntimeError(f"ASR streaming worker begin failed: {resp}")
 
     def _send_chunk(self, *, last: bool) -> dict:
+        sid = self._session_id
         pcm = np.asarray(self._audio_accum, dtype="<f4")
         pcm_b64 = base64.b64encode(pcm.tobytes()).decode("ascii")
-        resp = self._backend._worker_request({
-            "event": "chunk",
-            "id": self._session_id,
-            "pcm_b64": pcm_b64,
-            "audio_sec": len(self._audio_accum) / self._sample_rate,
-            "last": last,
-        })
+        resp = self._ordinary_request(
+            {
+                "event": "chunk",
+                "id": sid,
+                "pcm_b64": pcm_b64,
+                "audio_sec": len(self._audio_accum) / self._sample_rate,
+                "last": last,
+            }
+        )
         event = resp.get("event")
-        if event == "segment_rotation":
-            carry_samples = int(float(resp.get("carryover_sec", 1.0)) * self._sample_rate)
-            if carry_samples > 0 and len(self._audio_accum) > carry_samples:
-                self._audio_accum = self._audio_accum[-carry_samples:].copy()
+        if event == "cancelled":
+            # Control outcome, NEVER a normal partial/final write. Signal the
+            # state machine only; mutate NO text/_closed/_audio state.
+            self._record_cancel_receipt(sid, resp)
             return resp
+        # Prepare any expensive text computation OUTSIDE the lock.
+        prepared = None
         if event == "partial":
-            # partial 只剥语言前缀，不做退化塌缩：partial 会随音频增长反复重算，
-            # 一旦某一帧重复份数刚好越过门槛就会突然缩短，下一帧新词进来覆盖率
-            # 跌回门槛以下又恢复全文，字幕会来回抖。退化的判定留给 final。
             stripped, lang = self._backend._strip_language_prefix(
                 resp.get("text", "") or ""
             )
-            self._partial_text = stripped.strip()
-            if lang:
-                self._detected_language = lang
-            return resp
-        if event == "final":
+            prepared = (stripped.strip(), lang)
+        elif event == "final":
             stripped, lang = self._backend._postprocess_text(resp.get("text", "") or "")
-            self._final_text = stripped.strip()
-            if lang:
-                self._detected_language = lang
-            self._closed = True
-            return resp
-        raise RuntimeError(f"unexpected ASR streaming worker event: {resp}")
+            prepared = (stripped.strip(), lang)
+        elif event == "segment_rotation":
+            carry_samples = int(float(resp.get("carryover_sec", 1.0)) * self._sample_rate)
+            prepared = carry_samples
+        else:
+            raise RuntimeError(f"unexpected ASR streaming worker event: {resp}")
+
+        # Guard AND normal state mutation share the SAME short state lock, and
+        # are linearized against arm_cancel. No IO / waits / postprocess below.
+        with self._state_lock:
+            if self._session_id != sid:
+                return resp
+            ev = self._cancel_requested.get(sid)
+            if ev is not None and ev.is_set():
+                return resp
+            if event == "segment_rotation":
+                carry_samples = prepared
+                if carry_samples > 0 and len(self._audio_accum) > carry_samples:
+                    self._audio_accum = self._audio_accum[-carry_samples:].copy()
+            elif event == "partial":
+                stripped, lang = prepared
+                self._partial_text = stripped
+                if lang:
+                    self._detected_language = lang
+            elif event == "final":
+                stripped, lang = prepared
+                self._final_text = stripped
+                if lang:
+                    self._detected_language = lang
+                self._closed = True
+        return resp
 
     def _join_committed(self, tail: str) -> str:
         """Concatenate text committed from earlier rotated segments with the
@@ -1343,10 +2587,12 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         the engine KV cap. Clean cut — no audio carryover — so there is no
         boundary re-transcription / duplication (the trade-off is a possible
         word split at the cut, far better than the current total failure)."""
+        old_sid = self._session_id
         resp = self._send_chunk(last=True)  # normally 'final' -> sets _final_text
         # Robustness: if the worker returns 'segment_rotation' for this forced
         # finalize (instead of 'final'), _final_text is NOT set — fall back to
         # the latest partial so this segment's text is not silently dropped.
+        # Compute the text OUTSIDE the lock (collapse_repetition is not trivial).
         if resp.get("event") == "final":
             seg = (self._final_text or "").strip()
         else:
@@ -1355,22 +2601,37 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             # _committed_text，就得在这里补上塌缩，否则长音频轮转时退化文本
             # 会绕过守卫。
             seg = self._collapse_if_promoted((self._partial_text or "").strip())
-        if seg:
-            self._committed_text = (
-                (self._committed_text + " " + seg).strip()
-                if self._committed_text else seg
-            )
-        # Clean cut + fresh worker session (resets the worker-side KV cache).
-        self._audio_accum = np.zeros(0, dtype=np.float32)
-        self._samples_since_hop = 0
-        self._partial_text = ""
-        self._final_text = ""
-        self._closed = False
-        self._session_id = uuid.uuid4().hex
+
+        # Linearize the commit/reset/SID switch under the lock, checking the
+        # CAPTURED old SID and the cancel marker atomically. If a cancel was
+        # armed during the blocked final, leave committed text UNCHANGED and do
+        # NOT launch a new SID. No IO below.
+        new_sid: Optional[str] = None
+        with self._state_lock:
+            if self._session_id != old_sid:
+                return
+            ev = self._cancel_requested.get(old_sid)
+            if ev is not None and ev.is_set():
+                return
+            if seg:
+                self._committed_text = (
+                    (self._committed_text + " " + seg).strip()
+                    if self._committed_text else seg
+                )
+            self._audio_accum = np.zeros(0, dtype=np.float32)
+            self._samples_since_hop = 0
+            self._partial_text = ""
+            self._final_text = ""
+            self._closed = False
+            new_sid = uuid.uuid4().hex
+            self._session_id = new_sid
+        # IO (begin) is issued OUTSIDE the lock, for the SID we committed.
         self._begin()
 
     def accept_waveform(self, sample_rate: int, samples: np.ndarray) -> None:
         if self._cancelled or self._closed:
+            return
+        if self._cancel_armed_for(self._session_id):
             return
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
@@ -1401,6 +2662,8 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
     def finalize(self) -> tuple[str, Optional[str]]:
         if self._cancelled or self._closed:
             return self._join_committed(self._final_text), self._detected_language
+        if self._cancel_armed_for(self._session_id):
+            return self._join_committed(self._final_text), self._detected_language
         try:
             return self._finalize_inner()
         finally:
@@ -1412,11 +2675,24 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
             self.close()
 
     def _finalize_inner(self) -> tuple[str, Optional[str]]:
+        sid = self._session_id
         if len(self._audio_accum) == 0:
-            self._backend._worker_request({"event": "end", "id": self._session_id})
-            self._closed = True
+            if self._cancel_armed_for(sid):
+                return self._join_committed(self._final_text), self._detected_language
+            resp = self._ordinary_request({"event": "end", "id": sid})
+            if resp.get("event") == "cancelled":
+                self._record_cancel_receipt(sid, resp)
+                return self._join_committed(self._final_text), self._detected_language
+            with self._state_lock:
+                if self._session_id == sid:
+                    self._closed = True
             return self._join_committed(""), self._detected_language
         self._send_chunk(last=True)
+        # Late final after an armed cancel must suppress text writes AND the
+        # offline rescue: _send_chunk already refused to mutate _final_text, so
+        # return whatever was committed before the cancel without rescuing.
+        if self._cancel_armed_for(sid):
+            return self._join_committed(self._final_text), self._detected_language
         text = self._join_committed(self._final_text)
         # Empty-final rescue (2026-06-14): the streaming worker withholds up to
         # ``unfixed_token_num`` trailing tokens; a SHORT utterance whose entire
@@ -1481,20 +2757,57 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         并调用它 —— 但这个流类此前没有 ``close``，getattr 拿到 None，整段兜底
         形同虚设。ws 在 finalize 之外的任何路径结束（客户端先断、异常、取消）
         都会让槽位永久泄漏。
+
+        U2 attempt2 收尾语义:
+          * 已收到 ACTUAL matching cancelled receipt 的 SID: native 已同步
+            releaseSession — 直接标记逻辑 native 关闭，**不发 end**（未知 SID
+            的 end 是白白阻塞 ordinary consumer 等待一个永不到来的 terminal）。
+            这只是逻辑 native 关闭，不声称 writer/thread/GPU 已完成。
+          * 已武装但未确认的取消: 不发 end，也不置 ``_closed``。
+          * 未取消: 发带该 SID cancel 标记的 end；end 失败不得在 finally 里
+            假装已关闭，保留 ``_closed=False``。
         """
         if self._closed:
             return
-        try:
-            self._backend._worker_request(
-                {"event": "end", "id": self._session_id}
+        with self._state_lock:
+            sid = self._session_id
+            intent = self._cancel_intent
+            confirm = self._cancel_confirm
+            exit_seen = self._cancel_exit
+        if confirm is not None and confirm.get("sid") == sid:
+            # Confirmed native receipt == native SID release. No redundant end.
+            with self._state_lock:
+                if self._session_id == sid:
+                    self._closed = True
+            return
+        if (
+            intent is not None
+            and intent.get("sid") == sid
+            and not exit_seen
+        ):
+            logger.warning(
+                "ASR stream close: cancellation for session %s unconfirmed; "
+                "NOT marking closed / NOT sending end (slot release left to "
+                "the retained caller/control job)",
+                sid,
             )
+            return
+        try:
+            resp = self._ordinary_request({"event": "end", "id": sid})
+            if resp.get("event") == "cancelled":
+                # Actual cancelled terminal: control outcome, no normal closing.
+                self._record_cancel_receipt(sid, resp)
+                return
         except Exception:
             logging.getLogger(__name__).warning(
                 "ASR stream close: end event failed; worker slot may leak",
                 exc_info=True,
             )
-        finally:
-            self._closed = True
+            # Do NOT mark closed falsely; the slot is NOT proven released.
+            return
+        with self._state_lock:
+            if self._session_id == sid:
+                self._closed = True
 
     def _collapse_if_promoted(self, seg: str) -> str:
         """partial 被晋升为 final / 提交为定稿时补做退化塌缩。
@@ -1515,39 +2828,16 @@ class _TRTEdgeLLMStreamingASRStream(ASRStream):
         return seg
 
     def cancel_and_finalize(self) -> None:
-        # 与轮转兜底同理：partial 刻意不塌缩，一旦被晋升为 final 就得补上，
-        # 否则退化文本从这条路径绕过守卫。
-        self._final_text = self._collapse_if_promoted(self._partial_text)
-        self._cancelled = True
-        # Send the `end` event but bound the wait to 500ms; if the worker is
-        # unresponsive raise WorkerExitError so the caller can restart_worker().
-        import concurrent.futures as _cf
+        """Legacy hard-cancel entrypoint — delegate to ACTUAL native cancel.
 
-        pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-cancel")
-        try:
-            fut = pool.submit(
-                self._backend._worker_request,
-                {"event": "end", "id": self._session_id},
-            )
-            try:
-                fut.result(timeout=0.5)
-            except _cf.TimeoutError:
-                self._closed = True
-                pool.shutdown(wait=False)
-                raise WorkerExitError(
-                    f"ASR worker did not ack 'end' for session {self._session_id} within 500ms"
-                )
-            except WorkerProtocolError:
-                self._closed = True
-                raise
-            except Exception:
-                pass
-            self._closed = True
-        finally:
-            try:
-                pool.shutdown(wait=False)
-            except Exception:
-                pass
+        This is the ``ASRStream.cancel()`` alias target used by the session
+        manager. It NO LONGER promotes the partial into a fake final, NO LONGER
+        creates an unretained one-shot executor, and NO LONGER maps a wait
+        timeout to ``WorkerExitError`` (a ``TimeoutError`` here is exactly a
+        timeout: intent armed, no confirmation, no closed, no restart). It
+        delegates to ``request_cancel`` with the historical 0.5s bound.
+        """
+        self.request_cancel(0.5)
 
     def get_partial(self) -> tuple[str, bool]:
         if self._closed:
@@ -1722,6 +3012,7 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMASRConfig:
             env.get("EDGE_LLM_ASR_MAX_MEL_FRAMES", str(manifest.get("max_mel_frames", 6000)))
         ),
         max_slots=max(1, int(max_slots_raw)),
+        require_ifb=_env_bool("EDGE_LLM_ASR_REQUIRE_IFB", False),
         stream_mode=env.get(
             "EDGE_LLM_ASR_STREAM_MODE", manifest.get("stream_mode", "accumulate")
         ),
