@@ -68,6 +68,10 @@ logger = logging.getLogger(__name__)
 #   EDGE_LLM_TTS_CP_DIR                              → code_predictor_dir
 #   EDGE_LLM_TTS_TOKENIZER_DIR                       → tokenizer_dir
 #   EDGE_LLM_TTS_CODE2WAV_DIR                        → code2wav_dir
+#   EDGE_LLM_TTS_CLONE_ENCODER_DIR                   → clone_encoder_dir (v0.11 worker)
+#   EDGE_LLM_TTS_CHECKPOINT_DIR                      → checkpoint_dir (v0.11 worker)
+#   EDGE_LLM_TTS_REFERENCE_TMP_DIR                   → reference_tmp_dir (reference staging)
+#   EDGE_LLM_TTS_CP_SPEC_VERIFY_SIZE                 → cp_spec_verify_size (v0.11 worker)
 #   QWEN3_SPEAKER_ENCODER                            → speaker_encoder
 #   OVS_TTS_MODEL_ID                                → model_id ("trt_edgellm")
 #   OVS_TTS_BACKEND/EDGE_LLM_TTS_BACKEND            → backend_mode ("edgellm_worker")
@@ -135,6 +139,10 @@ class TRTEdgeLLMTTSConfig:
     code_predictor_dir: str = ""
     tokenizer_dir: str = ""
     code2wav_dir: str = ""
+    clone_encoder_dir: str = ""
+    checkpoint_dir: str = ""
+    reference_tmp_dir: str = ""
+    cp_spec_verify_size: Optional[int] = None
     speaker_encoder: str = ""
     # Fixed BASE-model speaker conditioning. The Qwen3-TTS *base* checkpoint
     # conditions on an external 1024-d speaker embedding (vs CustomVoice's named
@@ -200,6 +208,13 @@ class TRTEdgeLLMTTSConfig:
 
     def __post_init__(self) -> None:
         self.worker_concurrency = max(1, int(self.worker_concurrency))
+        if self.cp_spec_verify_size is not None:
+            if isinstance(self.cp_spec_verify_size, bool):
+                raise ValueError("cp_spec_verify_size must be an integer")
+            if not isinstance(self.cp_spec_verify_size, int):
+                raise ValueError("cp_spec_verify_size must be an integer")
+            if self.cp_spec_verify_size < 0:
+                raise ValueError("cp_spec_verify_size must be non-negative")
         self.qwen3_runtime_profile = (
             (self.qwen3_runtime_profile or "highperf").strip().lower().replace("-", "_")
         )
@@ -844,6 +859,13 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             flags += ["--qwen3TtsPromptKvCache", self._prompt_kv_cache]
         return flags
 
+    def _v011_worker_enabled(self) -> bool:
+        return bool(
+            self._config.clone_encoder_dir
+            or self._config.checkpoint_dir
+            or self._config.cp_spec_verify_size is not None
+        )
+
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.poll() is None:
             return
@@ -855,7 +877,20 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
             "--tokenizerDir", self._tokenizer_dir,
             "--code2wavEngineDir", self._code2wav_dir,
         ]
-        cmd += self._explicit_kv_flags()
+        if self._v011_worker_enabled():
+            if any((self._talker_backend, self._talker_engine, self._code_predictor_backend,
+                    self._text_projection, self._prompt_kv_cache)):
+                raise ValueError("v0.11 worker cannot combine legacy explicit-KV flags")
+            if self._worker_concurrency != 1:
+                raise ValueError("v0.11 worker requires worker_concurrency=1 until batch support is qualified")
+            if self._config.clone_encoder_dir:
+                cmd += ["--cloneEncoderDir", self._config.clone_encoder_dir]
+            if self._config.checkpoint_dir:
+                cmd += ["--checkpointDir", self._config.checkpoint_dir]
+            if self._config.cp_spec_verify_size is not None:
+                cmd += ["--cpSpecVerifySize", str(self._config.cp_spec_verify_size)]
+        else:
+            cmd += self._explicit_kv_flags()
         # Only emit --max_slots when N>1 (main fix b1cb1a5): at N=1 omit it for
         # legacy single-slot byte-equivalent behavior + back-compat with older
         # worker binaries that reject the unknown flag.
@@ -1408,16 +1443,22 @@ class TRTEdgeLLMTTSBackend(TTSBackend):
     def _resolve_voice_kwargs(self, kwargs: dict) -> dict:
         sid = kwargs.get("speaker_id", kwargs.get("sid"))
         forward = {k: v for k, v in kwargs.items() if k not in ("speaker_id", "sid")}
-        resolved = resolve_speaker_kwargs(self.model_id, speaker_id=sid, **forward)
+        resolved = resolve_speaker_kwargs(
+            self.model_id,
+            allow_embedding=self.supports_voice_cloning,
+            speaker_id=sid,
+            **forward,
+        )
         # BASE model: default to the fixed precomputed speaker embedding when the
         # caller supplied no speaker (no per-request embedding / id / name). A
         # per-request speaker always wins. No-op for CustomVoice (base unset).
         # getattr guard: __new__-constructed test backends skip __init__ where
         # _base_speaker_embedding is set.
         base_speaker_embedding = getattr(self, "_base_speaker_embedding", None)
-        if base_speaker_embedding and not (resolved or {}).get("speaker_embedding") \
+        if self.supports_voice_cloning and base_speaker_embedding and not (resolved or {}).get("speaker_embedding") \
                 and "speaker_embedding" not in kwargs \
-                and not (resolved or {}).get("speaker_id") and "speaker_id" not in kwargs \
+                and not (resolved or {}).get("speaker_id") \
+                and kwargs.get("speaker_id", kwargs.get("sid")) is None \
                 and not (resolved or {}).get("speaker"):
             resolved = dict(resolved or {})
             resolved["speaker_embedding"] = base_speaker_embedding
@@ -1659,6 +1700,20 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMTTSConfig:
         return ""
     base_speaker_embedding_b64 = _resolve_base_spk_embed_b64()
 
+    def _optional_nonnegative_int(name: str) -> Optional[int]:
+        raw = env.get(name)
+        if raw in (None, ""):
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+            raise ValueError(f"{name} must be an integer")
+        try:
+            value = int(raw.strip()) if isinstance(raw, str) else raw
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return value
+
     return TRTEdgeLLMTTSConfig(
         # --- paths (all resolved from passed env dict) ---
         tts_binary=_tts_binary_e(),
@@ -1673,6 +1728,10 @@ def build_config_from_env(env: "dict | None" = None) -> TRTEdgeLLMTTSConfig:
         code_predictor_dir=_resolve_cp_dir_e(),
         tokenizer_dir=_resolve_tokenizer_dir_e(),
         code2wav_dir=_resolve_code2wav_dir_e(),
+        clone_encoder_dir=(env.get("EDGE_LLM_TTS_CLONE_ENCODER_DIR") or "").strip(),
+        checkpoint_dir=(env.get("EDGE_LLM_TTS_CHECKPOINT_DIR") or "").strip(),
+        reference_tmp_dir=(env.get("EDGE_LLM_TTS_REFERENCE_TMP_DIR") or "").strip(),
+        cp_spec_verify_size=_optional_nonnegative_int("EDGE_LLM_TTS_CP_SPEC_VERIFY_SIZE"),
         speaker_encoder=speaker_encoder,
         base_speaker_embedding_b64=base_speaker_embedding_b64,
         # --- identity ---

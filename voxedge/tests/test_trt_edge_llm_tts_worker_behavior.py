@@ -31,6 +31,7 @@ import json
 import queue
 import threading
 import time
+from unittest.mock import patch
 
 from voxedge.backends.jetson.trt_edge_llm_tts import (
     TRTEdgeLLMTTSBackend,
@@ -46,6 +47,101 @@ def _env_backend(**config_kwargs):
     backend = TRTEdgeLLMTTSBackend.__new__(TRTEdgeLLMTTSBackend)
     backend._config = TRTEdgeLLMTTSConfig(**config_kwargs)
     return backend
+
+
+class _LaunchOnlyProc:
+    def __init__(self, argv, **_kwargs):
+        self.argv = argv
+        self.stdin = object()
+        self.stdout = self
+        self.stderr = iter(())
+
+    def readline(self):
+        return '{"event":"ready","max_slots":1}\n'
+
+    def poll(self):
+        return None
+
+
+def _launch_backend(config):
+    backend = TRTEdgeLLMTTSBackend.__new__(TRTEdgeLLMTTSBackend)
+    backend._config = config
+    backend._worker = None
+    backend._talker_dir = config.talker_dir
+    backend._code_predictor_dir = config.code_predictor_dir
+    backend._tokenizer_dir = config.tokenizer_dir
+    backend._code2wav_dir = config.code2wav_dir
+    backend._worker_binary = config.worker_binary
+    backend._talker_backend = config.talker_backend
+    backend._talker_engine = config.talker_engine
+    backend._code_predictor_backend = config.code_predictor_backend
+    backend._text_projection = config.text_projection
+    backend._prompt_kv_cache = config.prompt_kv_cache
+    with patch("voxedge.backends.jetson.trt_edge_llm_tts.subprocess.Popen", _LaunchOnlyProc), \
+         patch("voxedge.backends.jetson.trt_edge_llm_tts.WorkerIO", lambda *_args: object()):
+        backend._ensure_worker()
+    return backend._worker.argv
+
+
+def test_v011_worker_args_and_legacy_argv_are_separate():
+    v011 = TRTEdgeLLMTTSConfig(
+        worker_binary="worker", talker_dir="talker", code_predictor_dir="cp",
+        tokenizer_dir="tok", code2wav_dir="c2w", clone_encoder_dir="clone",
+        checkpoint_dir="checkpoint", cp_spec_verify_size=710,
+    )
+    argv = _launch_backend(v011)
+    assert argv[-6:] == [
+        "--cloneEncoderDir", "clone", "--checkpointDir", "checkpoint",
+        "--cpSpecVerifySize", "710",
+    ]
+    assert "--max_slots" not in argv
+    legacy = TRTEdgeLLMTTSConfig(
+        worker_binary="worker", talker_dir="talker", code_predictor_dir="cp",
+        tokenizer_dir="tok", code2wav_dir="c2w", text_projection="legacy",
+    )
+    legacy_argv = _launch_backend(legacy)
+    assert "--qwen3TtsTextProjection" in legacy_argv
+    assert "--cloneEncoderDir" not in legacy_argv
+
+
+def test_v011_rejects_legacy_flags_and_bad_cp_spec_before_popen():
+    try:
+        TRTEdgeLLMTTSConfig(cp_spec_verify_size="710")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("string cp_spec_verify_size must be rejected")
+    bad = TRTEdgeLLMTTSConfig(
+        worker_binary="worker", clone_encoder_dir="clone", text_projection="legacy",
+    )
+    try:
+        _launch_backend(bad)
+    except ValueError as exc:
+        assert "legacy explicit-KV" in str(exc)
+    else:
+        raise AssertionError("legacy flags must be rejected for v0.11")
+    crowded = TRTEdgeLLMTTSConfig(
+        worker_binary="worker", clone_encoder_dir="clone", worker_concurrency=2,
+    )
+    try:
+        _launch_backend(crowded)
+    except ValueError as exc:
+        assert "worker_concurrency=1" in str(exc)
+    else:
+        raise AssertionError("unqualified v0.11 concurrency must be rejected")
+
+
+def test_v011_cp_spec_env_rejects_bool_float_and_bad_string():
+    from voxedge.backends.jetson.trt_edge_llm_tts import build_config_from_env
+
+    for raw in (True, 1.5, "not-an-int", "-1"):
+        try:
+            build_config_from_env({"EDGE_LLM_TTS_CP_SPEC_VERIFY_SIZE": raw})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid cp spec value accepted: {raw!r}")
+    assert build_config_from_env({"EDGE_LLM_TTS_CP_SPEC_VERIFY_SIZE": "0"}).cp_spec_verify_size == 0
 
 
 def test_worker_env_stateful_defaults():
