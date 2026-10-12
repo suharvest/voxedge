@@ -176,8 +176,28 @@ OVS 提供的 OpenAI 兼容语音接口包括：
 
 ## 状态
 
-voxedge **0.0.9a0** 为当前版本；通过 TensorRT Edge-LLM v0.9.1 验收的 OVS 运行时
-自 2026-08-09 起固定在该版本。
+voxedge **0.0.15a3** 是当前 PyPI 版本。它是 OpenVoiceStream（OVS）TensorRT
+Edge-LLM v0.11 候选 profile 使用的 Python 适配器版本；voxedge 包版本与
+Edge-LLM 运行时版本属于两条独立的发布线。复现该组合时请显式安装固定版本：
+
+```bash
+pip install "voxedge==0.0.15a3"
+```
+
+v0.11 Jetson 集成更新了 Edge-LLM 适配器：IFB health/trace、取消回执、
+有界关闭、TTS assistant turn 顺序、checkpoint 与克隆 encoder 目录配置，
+以及 code-predictor 规格/大小校验。CustomVoice 也会拒绝模型不支持的外部
+音色克隆或录入选项。这些属于 Python 侧适配器与配置契约；TensorRT worker、
+plugin、engine、模型产物、设备 profile 和容器镜像由
+[OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream) 发布并选择。
+
+`pip install voxedge[jetson]` 仍不会安装 Jetson 镜像或上述原生运行时产物。
+Jetson 部署应使用匹配的 OVS v0.11 profile 及其固定产物。本仓库不内置、也不
+发布 Jetson 容器镜像。
+
+0.0.15a3 保留以下 API 兼容性约束：核心支持 Python 3.10 及更高版本，发布包
+已在 CPython 3.10 与 3.12 上检查。原生 GPU 的资格仍由 OVS 与设备证据按部署
+组合判定，不能只由 PyPI 包版本推出。
 
 0.0.9a0 把 sherpa SenseVoice 后端里两个本该由部署方决定、却写死在库里的选择放了出来。
 `use_itn` 原本恒为 `True`；ITN 不只是标点，它还决定数字形态（`9点`/`九点`）、英文大小写，

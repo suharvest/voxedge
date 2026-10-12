@@ -178,8 +178,34 @@ Optional, default-off, stateless add-ons (punctuation, speaker embedding) via sh
 
 ## Status
 
-voxedge **0.0.9a0** is the current release; the qualified TensorRT Edge-LLM
-v0.9.1 OVS runtime pins it as of 2026-08-09.
+voxedge **0.0.15a3** is the current PyPI release. It is the Python adapter
+release used by the OpenVoiceStream (OVS) TensorRT Edge-LLM v0.11 candidate
+profiles; the library version and the Edge-LLM runtime version are separate
+release lines. Install the released library explicitly when reproducing that
+combination:
+
+```bash
+pip install "voxedge==0.0.15a3"
+```
+
+The v0.11 Jetson integration updates the Edge-LLM adapters with IFB health and
+trace hooks, cancellation receipts, bounded shutdown handling, TTS assistant
+turn sequencing, checkpoint and cloned-encoder-directory configuration, and
+code-predictor specification/size validation. CustomVoice also rejects
+voice-clone or enrollment options that its model does not support. These are
+Python-side adapter and configuration contracts; the TensorRT workers,
+plugins, engines, model artifacts, device profiles, and container images are
+published and selected by [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream).
+
+`pip install voxedge[jetson]` still does not install a Jetson image or those
+native/runtime artifacts. Use the matching OVS v0.11 profile and its pinned
+artifacts for a Jetson deployment. This repository does not embed or publish
+the Jetson container image.
+
+0.0.15a3 retains the API compatibility guarantees below. The core supports
+Python 3.10 and newer; the published package has been checked on CPython
+3.10 and 3.12. Native GPU qualification remains deployment-specific and is
+reported by OVS/device evidence rather than by the PyPI package alone.
 
 0.0.9a0 stops the sherpa SenseVoice backend from hardcoding two decisions that
 belong to the deployment. `use_itn` was pinned to `True`; ITN is not merely

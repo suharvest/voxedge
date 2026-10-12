@@ -2,6 +2,12 @@
 
 voxedge 是边缘语音库。**同一套后端 + 引擎，按需叠加** —— 纯转写叠 0，同传叠翻译，agent 才叠 LLM+工具+TTS 的完整闭环。
 
+当前 PyPI 版本为 `0.0.15a3`。如果使用 Jetson 上 OpenVoiceStream 的
+TensorRT Edge-LLM v0.11 候选 profile，请将 voxedge Python 包固定为
+`voxedge==0.0.15a3`，并从 OVS profile 获取匹配的 worker、plugin、engine
+与模型产物。`voxedge[jetson]` 只提供 Python 侧依赖，不包含 Jetson 容器或
+原生 TensorRT 产物；本库与 OVS 的部署版本、镜像版本分别管理。
+
 ## 分层
 
 ```
