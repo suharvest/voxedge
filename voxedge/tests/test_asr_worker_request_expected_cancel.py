@@ -108,7 +108,8 @@ for raw in sys.stdin:
     sid = obj.get("id")
     if sid == "sess-1":
         sys.stdout.write(json.dumps(
-            {"event": "cancelled", "id": "sess-OTHER", "ok": False,
+            {"event": "cancelled", "request_id": "sess-1",
+             "id": "sess-OTHER", "ok": False,
              "epoch": 7}
         ) + "\n")
         sys.stdout.flush()
@@ -254,10 +255,15 @@ def _make_backend(child: _Child):
     backend._worker_ready_meta = {}
     backend._worker_stderr_tail = deque(maxlen=80)
 
-    def _forbidden(*_a, **_k):
-        raise AssertionError("_ensure_worker must NOT be called")
+    real_ensure_worker = backend._ensure_worker
 
-    backend._ensure_worker = _forbidden  # type: ignore[method-assign]
+    def _ready_check_only(*_a, **_k):
+        before = backend._worker
+        real_ensure_worker(*_a, **_k)
+        if backend._worker is not before:
+            raise AssertionError("_ensure_worker spawned a worker in an owned-pair test")
+
+    backend._ensure_worker = _ready_check_only  # type: ignore[method-assign]
     return backend
 
 

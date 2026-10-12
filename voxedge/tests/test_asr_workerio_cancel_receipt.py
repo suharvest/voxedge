@@ -137,6 +137,14 @@ class _AdvancingLock:
     def locked(self) -> bool:
         return self._lock.locked()
 
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+        return False
+
 
 class _NoAdvanceLock:
     """Plain non-advancing wrapper used when the clock is faked globally."""
@@ -154,6 +162,14 @@ class _NoAdvanceLock:
 
     def locked(self) -> bool:
         return self._lock.locked()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+        return False
 
 
 # ── correction 1: late stdin-lock acquisition fails closed ──────────────────

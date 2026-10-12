@@ -865,6 +865,25 @@ class TRTEdgeLLMASRBackend(ASRBackend):
         for line in worker.stderr:
             text = line.rstrip()
             self._worker_stderr_tail.append(text)
+            try:
+                event = json.loads(text)
+            except (TypeError, ValueError):
+                event = None
+            if isinstance(event, dict) and (
+                event.get("type") or event.get("event")
+            ) in ("asr_ifb_health", "asr_ifb_trace"):
+                # The native ASR worker emits these diagnostics on stderr.
+                # Bind delivery to the Popen instance that produced the line;
+                # a late line from a retired worker must not contaminate a new
+                # worker's diagnostic snapshot.
+                try:
+                    with self._worker_lock:
+                        if self._worker is worker:
+                            # Keep the identity check and callback atomic with
+                            # replacement/reset under the lifecycle lock.
+                            self._on_worker_telemetry(event)
+                except Exception:
+                    logger.exception("ASR worker stderr telemetry callback failed")
             if "[JV_MEM]" in text:
                 logger.info("ASR worker: %s", text)
             else:
