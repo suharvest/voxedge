@@ -181,11 +181,12 @@ Edge-LLM v0.11 候选 profile 使用的 Python 适配器版本；voxedge 包版�
 Edge-LLM 运行时版本属于两条独立的发布线。复现该组合时请显式安装固定版本：
 
 ```bash
-pip install "voxedge==0.0.15a3"
+uv venv .venv
+uv pip install --python .venv/bin/python "voxedge==0.0.15a3"
 ```
 
 v0.11 Jetson 集成更新了 Edge-LLM 适配器：IFB health/trace、取消回执、
-有界关闭、TTS assistant turn 顺序、checkpoint 与克隆 encoder 目录配置，
+有界关闭、TTS assistant turn 顺序、`checkpoint_dir` 与 `clone_encoder_dir` 配置，
 以及 code-predictor 规格/大小校验。CustomVoice 也会拒绝模型不支持的外部
 音色克隆或录入选项。这些属于 Python 侧适配器与配置契约；TensorRT worker、
 plugin、engine、模型产物、设备 profile 和容器镜像由

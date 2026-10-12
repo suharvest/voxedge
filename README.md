@@ -185,12 +185,13 @@ release lines. Install the released library explicitly when reproducing that
 combination:
 
 ```bash
-pip install "voxedge==0.0.15a3"
+uv venv .venv
+uv pip install --python .venv/bin/python "voxedge==0.0.15a3"
 ```
 
 The v0.11 Jetson integration updates the Edge-LLM adapters with IFB health and
 trace hooks, cancellation receipts, bounded shutdown handling, TTS assistant
-turn sequencing, checkpoint and cloned-encoder-directory configuration, and
+turn sequencing, `checkpoint_dir` and `clone_encoder_dir` configuration, and
 code-predictor specification/size validation. CustomVoice also rejects
 voice-clone or enrollment options that its model does not support. These are
 Python-side adapter and configuration contracts; the TensorRT workers,
