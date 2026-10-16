@@ -87,6 +87,166 @@ def _normalize_cjk_domains(text: str, *, language: str | None = None) -> str:
     return _BARE_DOMAIN_RE.sub(expand, text)
 
 
+# ── Arabic numerals → what the frontend should say ────────────────────
+# The RK matcha frontend classifies text by script: CJK runs go through the
+# pinyin lexicon, Latin words through espeak-ng, and everything else — which
+# includes every digit — through espeak-ng as well. espeak speaks English, so a
+# Chinese reply carrying "28 度" is synthesized as "twenty-eight 度" and a
+# device id "01-00" as "zero one dash zero zero". Measured with the shipped
+# voice (`espeak-ng -q --ipa`): 28 -> "twˈɛnti ˈeɪt", 01-00 ->
+# "zˈiəɹəʊ wˈɒn dˈaʃ zˈiəɹəʊ zˈiəɹəʊ".
+#
+# The frontend has no language to consult, so the decision belongs here, in the
+# one place that already turns a reply into speakable text. Gated on the same
+# condition as the domain pass above: Chinese output only.
+#
+# Two readings, because a single rule gets one of them wrong. Reading an id as
+# a cardinal turns "01-00" into "一杠零", worse than the English; reading a
+# quantity digit by digit turns "28" into "二八".
+#   quantities / dates / times / money / units   "28 度" -> "二十八 度"
+#   identifiers                                  "01-00" -> "零一零零"
+_CN_DIGITS = "零一二三四五六七八九"
+_CN_UNITS = ("", "十", "百", "千")
+_CN_GROUPS = ("", "万", "亿", "兆")
+
+# Claimed in this order. Each pass replaces digits with Chinese characters, so
+# no later pattern can re-match what an earlier one produced.
+_NUM_TIME_RE = re.compile(r"(?<![\dA-Za-z:.])(\d{1,2}):(\d{2})(?![\dA-Za-z:.])")
+_NUM_DATE_RE = re.compile(
+    r"(?<![\dA-Za-z\-/])(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?![\dA-Za-z\-/])"
+)
+_NUM_YEAR_RE = re.compile(r"(?<![\dA-Za-z])(\d{4})(?=\s*年)")
+_NUM_PERCENT_RE = re.compile(r"(?<![\dA-Za-z.])(\d+(?:\.\d+)?)\s*%(?![\dA-Za-z.])")
+_NUM_DECIMAL_RE = re.compile(r"(?<![\dA-Za-z.])(\d+\.\d+)(?![\dA-Za-z.])")
+# An identifier is dash/underscore/slash-joined digit groups, or a run with a
+# leading zero. Both are things a cardinal reading would mangle.
+_NUM_ID_RE = re.compile(r"(?<![\dA-Za-z])(\d+(?:[-_/]\d+)+|0\d+)(?![\dA-Za-z])")
+_NUM_CARDINAL_RE = re.compile(r"(?<![\dA-Za-z.])(\d+)(?![\dA-Za-z.])")
+
+# Digits that belong to a URL, an email or a bare domain are part of that
+# token and must survive verbatim: "…/path?q=1" is not "…/path?q=一". Split
+# them out the same way the Markdown stripper protects code spans.
+_NUM_PROTECT_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s，。；！？、）】》]+"
+    r"|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
+    r"|(?<![A-Za-z0-9_.@:/?-])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}"
+    r"[A-Za-z0-9_/?&=#@:.\-]*"
+)
+
+
+def _under_ten_thousand(value: int) -> str:
+    """1..9999 -> 一千二百三十四, 1005 -> 一千零五."""
+    out: list[str] = []
+    pending_zero = False
+    for position in (3, 2, 1, 0):
+        digit = (value // 10 ** position) % 10
+        if digit == 0:
+            if out:
+                pending_zero = True
+            continue
+        if pending_zero:
+            out.append(_CN_DIGITS[0])
+            pending_zero = False
+        out.append(_CN_DIGITS[digit])
+        if position:
+            out.append(_CN_UNITS[position])
+    return "".join(out)
+
+
+def _int_to_chinese(value: int) -> str:
+    """0..99999999 spoken the way it is said, not the way it is written.
+
+    18 -> 十八 rather than 一十八; 1005 -> 一千零五; 10001 -> 一万零一.
+    Beyond 亿 the run falls back to digit by digit, which is how such numbers
+    are read aloud anyway.
+    """
+    if value < 0:
+        return "负" + _int_to_chinese(-value)
+    if value == 0:
+        return _CN_DIGITS[0]
+
+    parts: list[str] = []
+    for index in (3, 2, 1, 0):
+        chunk = (value // 10000 ** index) % 10000
+        if not chunk:
+            continue
+        spoken = _under_ten_thousand(chunk)
+        # A group that is neither the leading one nor four digits wide needs a
+        # 零 between it and what came before: 10001 -> 一万零一.
+        if parts and chunk < 1000:
+            spoken = _CN_DIGITS[0] + spoken
+        parts.append(spoken + _CN_GROUPS[index])
+
+    out = "".join(parts)
+    if 10 <= value < 20:
+        out = out[1:]          # 一十八 -> 十八
+    return out
+
+
+def _spoken_digit_run(digits: str) -> str:
+    """Digit by digit, separators dropped: "01-00" -> 零一零零."""
+    return "".join(_CN_DIGITS[int(c)] for c in digits if c.isdigit())
+
+
+def _spoken_decimal(number: str) -> str:
+    whole, _, fraction = number.partition(".")
+    return _int_to_chinese(int(whole)) + "点" + _spoken_digit_run(fraction)
+
+
+def _rewrite_numbers(text: str) -> str:
+    """The numeral passes, in the order that keeps them from overlapping."""
+    text = _NUM_TIME_RE.sub(
+        lambda m: _int_to_chinese(int(m.group(1)))
+        + "点"
+        # 14:05 reads 十四点零五 — a leading zero minute is digit by digit.
+        + (_spoken_digit_run(m.group(2)) if m.group(2).startswith("0")
+           else _int_to_chinese(int(m.group(2)))),
+        text,
+    )
+    text = _NUM_DATE_RE.sub(
+        lambda m: _spoken_digit_run(m.group(1))
+        + "年" + _int_to_chinese(int(m.group(2)))
+        + "月" + _int_to_chinese(int(m.group(3))) + "日",
+        text,
+    )
+    text = _NUM_YEAR_RE.sub(lambda m: _spoken_digit_run(m.group(1)), text)
+    text = _NUM_PERCENT_RE.sub(
+        lambda m: "百分之"
+        + (_spoken_decimal(m.group(1)) if "." in m.group(1)
+           else _int_to_chinese(int(m.group(1)))),
+        text,
+    )
+    text = _NUM_DECIMAL_RE.sub(lambda m: _spoken_decimal(m.group(1)), text)
+    text = _NUM_ID_RE.sub(lambda m: _spoken_digit_run(m.group(1)), text)
+    text = _NUM_CARDINAL_RE.sub(lambda m: _int_to_chinese(int(m.group(1))), text)
+
+    # The dash in 中弘空调-01-00 joins a name to its id, so it reads as one run
+    # rather than being spoken. The matcha frontend drops a bare dash on its
+    # own, but the text handed to a backend should already say what is meant
+    # instead of depending on one frontend's punctuation handling.
+    return re.sub(
+        r"(?<=[一-鿿])[-‐-―](?=[零一二三四五六七八九十])", "", text
+    )
+
+
+def _normalize_spoken_numbers(text: str, *, language: str | None = None) -> str:
+    """Rewrite Arabic numerals for speech. Chinese output only."""
+    if language not in {"zh", "chinese"} or not re.search(r"\d", text):
+        return text
+
+    # Rewrite between the protected spans and never inside them, so a URL or an
+    # address survives the pass unchanged.
+    out: list[str] = []
+    cursor = 0
+    for match in _NUM_PROTECT_RE.finditer(text):
+        out.append(_rewrite_numbers(text[cursor:match.start()]))
+        out.append(match.group(0))
+        cursor = match.end()
+    out.append(_rewrite_numbers(text[cursor:]))
+    return "".join(out)
+
+
 def _to_speakable(text: str, *, language: str | None = None) -> str:
     """Strip Markdown markup; return "" if nothing speakable remains."""
     if not text:
@@ -125,8 +285,14 @@ def _to_speakable(text: str, *, language: str | None = None) -> str:
         chunks.append((match.group(1) if match.group(1) is not None else " ", True))
         cursor = match.end()
     chunks.append((clean_markup(s[cursor:]), False))
+
+    def speakable_chunk(chunk: str) -> str:
+        return _normalize_spoken_numbers(
+            _normalize_cjk_domains(chunk, language=language), language=language
+        )
+
     s = "".join(
-        _normalize_cjk_domains(chunk, language=language) if not protected else chunk
+        speakable_chunk(chunk) if not protected else chunk
         for chunk, protected in chunks
     ).strip()
     return s if _SPEAKABLE_RE.search(s) else ""
